@@ -2,6 +2,8 @@
 
 一款面向办公的纯局域网远程桌面工具。macOS 和 Windows 共用 C++20、Qt 6 Widgets 界面和网络核心。
 
+在 GitHub Releases 可按芯片下载 macOS 或 Windows 的原生包。Mac 在「关于本机」中查看芯片或处理器，Windows 在「设置 → 系统 → 系统信息」中查看系统类型。[下载最新版本](https://github.com/eggleader-zhang/wwmm-remote/releases/latest)
+
 ## 第四批 · 键鼠控制与中文输入（0.4.0）
 
 两端升级到 0.4.0 后，选中已配对的电脑，点「控制桌面」。对方点「允许本次控制」，看到主屏幕后即可操作。Mac 首次作为被控端，需要在「系统设置 → 隐私与安全性」中允许屏幕录制和辅助功能，授权后再请求一次。Windows 支持普通交互桌面，UAC 安全桌面和高权限窗口受系统限制。两端也可以继续选择「查看桌面」。

@@ -1,0 +1,130 @@
+name: Release desktop packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/releases/*.md'
+      - '.github/workflows/release.yml'
+      - 'scripts/release_*.py'
+
+concurrency:
+  group: desktop-releases
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.version.outputs.number }}
+      pending: ${{ steps.version.outputs.pending }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          number=$(sed -nE 's/^project\(WWMMRemote VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' CMakeLists.txt)
+          test -n "$number"
+          test -s "docs/releases/v$number.md"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -r --arg tag "v$number" '.[] | select(.tag_name == $tag and .draft == false) | .id')
+          if [[ -z "$published" ]]; then
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$number is already published." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.pending == 'true'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-26
+          - target: macos-x86_64
+            runner: macos-26-intel
+          - target: windows-x64
+            runner: windows-2022
+            msvc: x64
+          - target: windows-arm64
+            runner: windows-11-arm
+            msvc: arm64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and package macOS
+        if: runner.os == 'macOS'
+        run: python3 scripts/release_package.py "${{ matrix.target }}"
+      - name: Build and package Windows
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%v in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "vs=%%v"
+          call "%vs%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=${{ matrix.msvc }} -host_arch=${{ matrix.msvc }}
+          if errorlevel 1 exit /b 1
+          python scripts\release_package.py "${{ matrix.target }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/${{ needs.version.outputs.number }}/WWMM-Remote-${{ needs.version.outputs.number }}-${{ matrix.target }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          path: packages
+          merge-multiple: true
+      - name: Publish verified downloads
+        working-directory: packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.number }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          notes="../docs/releases/$tag.md"
+          for target in macos-arm64 macos-x86_64 windows-x64 windows-arm64; do
+            test -s "WWMM-Remote-$VERSION-$target.zip"
+          done
+          test "$(find . -name '*.zip' | wc -l)" -eq 4
+          sha256sum *.zip > SHA256SUMS.txt
+          if git rev-parse --verify --quiet "refs/tags/$tag" > /dev/null; then
+            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$GITHUB_SHA"
+          fi
+          releases=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+          existing=$(jq -c --arg tag "$tag" 'add[] | select(.tag_name == $tag)' <<< "$releases")
+          if [[ -z "$existing" ]]; then
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "WWMM Remote $VERSION" --notes-file "$notes"
+          else
+            jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<< "$existing" >/dev/null
+          fi
+          gh release upload "$tag" *.zip SHA256SUMS.txt --clobber
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .assets[] | [.digest, .name] | @tsv' |
+            sort > "$RUNNER_TEMP/uploaded"
+          sha256sum *.zip SHA256SUMS.txt | awk '{ print "sha256:" $1 "\t" $2 }' | sort > "$RUNNER_TEMP/expected"
+          diff -u "$RUNNER_TEMP/expected" "$RUNNER_TEMP/uploaded"
+          gh release edit "$tag" --draft=false --latest --notes-file "$notes"
+          gh release view "$tag" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
