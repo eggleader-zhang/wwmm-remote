@@ -25,15 +25,16 @@ CGEventFlags flagsFor(quint8 mods)
     return f;
 }
 
-CGPoint location(ScreenPoint p)
+CGPoint location(ScreenPoint p, CGDirectDisplayID display)
 {
-    const auto bounds = CGDisplayBounds(CGMainDisplayID());
+    const auto bounds = CGDisplayBounds(display);
     return {bounds.origin.x + p.x * std::max(0., bounds.size.width - 1) / 65535.,
             bounds.origin.y + p.y * std::max(0., bounds.size.height - 1) / 65535.};
 }
 
 class MacInput final : public InputSink {
     CGEventSourceRef source_ = CGEventSourceCreate(kCGEventSourceStatePrivate);
+    CGDirectDisplayID display_;
     quint8 mods_ = 0, buttons_ = 0;
 
     struct Click {
@@ -55,7 +56,7 @@ class MacInput final : public InputSink {
     }
 
   public:
-    MacInput()
+    explicit MacInput(CGDirectDisplayID display) : display_(display)
     {
         if (source_)
             CGEventSourceSetLocalEventsSuppressionInterval(source_, 0);
@@ -143,7 +144,7 @@ class MacInput final : public InputSink {
                                            kCGEventOtherMouseDragged};
         const int t = std::min(index, 2);
         auto type = move ? (buttons_ ? dragged[t] : kCGEventMouseMoved) : (down ? pressed[t] : lifted[t]);
-        auto point = location(p);
+        auto point = location(p, display_);
         auto event = CGEventCreateMouseEvent(source_, type, point, CGMouseButton(index));
         if (!event)
             return false;
@@ -168,7 +169,7 @@ class MacInput final : public InputSink {
         auto event = CGEventCreateScrollWheelEvent(source_, kCGScrollEventUnitPixel, 2, units(y), units(x));
         if (!event)
             return false;
-        CGEventSetLocation(event, location(p));
+        CGEventSetLocation(event, location(p, display_));
         return post(event, flagsFor(mods_));
     }
 };
@@ -182,6 +183,30 @@ CFTypeRef attribute(AXUIElementRef element, CFStringRef name)
 }
 } // namespace
 
+quint64 clipboardRevision()
+{
+    return quint64(NSPasteboard.generalPasteboard.changeCount);
+}
+
+void watchDesktopPower(QObject *context, std::function<void(bool)> callback)
+{
+    auto center = NSWorkspace.sharedWorkspace.notificationCenter;
+    auto add = [center, callback](NSNotificationName name, bool awake) {
+        return [center addObserverForName:name
+                                   object:nil
+                                    queue:NSOperationQueue.mainQueue
+                               usingBlock:^(NSNotification *) {
+                                 callback(awake);
+                               }];
+    };
+    auto sleep = add(NSWorkspaceWillSleepNotification, false);
+    auto wake = add(NSWorkspaceDidWakeNotification, true);
+    QObject::connect(context, &QObject::destroyed, [center, sleep, wake] {
+        [center removeObserver:sleep];
+        [center removeObserver:wake];
+    });
+}
+
 bool allowRemoteInput(QString &reason)
 {
     NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt : @YES};
@@ -191,9 +216,9 @@ bool allowRemoteInput(QString &reason)
     return false;
 }
 
-std::unique_ptr<InputSink> createInputSink()
+std::unique_ptr<InputSink> createInputSink(quint64 display)
 {
-    return std::make_unique<MacInput>();
+    return std::make_unique<MacInput>(display ? CGDirectDisplayID(display) : CGMainDisplayID());
 }
 
 InputFocus focusedInputKind()

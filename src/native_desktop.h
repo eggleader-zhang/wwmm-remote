@@ -1,4 +1,5 @@
 #pragma once
+#include "desktop_display.h"
 #include <QByteArray>
 #include <QString>
 #include <chrono>
@@ -24,6 +25,8 @@ class DesktopCapture
 public:
     virtual ~DesktopCapture() = default;
     virtual void refresh() = 0;
+
+    virtual void inputActivity() {}
     virtual void setBitrate(int bitsPerSecond) = 0;
 };
 class DesktopPlayer
@@ -32,6 +35,7 @@ public:
     virtual ~DesktopPlayer() = default;
     virtual void push(const QByteArray &annexB, quint32 timestamp) = 0;
 };
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError failure);
+
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError failure, quint64 display = 0);
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr nativeView, PresentedFrame presented, MediaError failure);
 } // namespace wwmm

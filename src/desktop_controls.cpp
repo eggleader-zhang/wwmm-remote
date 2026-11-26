@@ -1,6 +1,9 @@
 #include "desktop_controls.h"
 #include "desktop_viewer.h"
 #include "input_window.h"
+#include "transfer_bar.h"
+#include <QScreen>
+#include <QVBoxLayout>
 #include "video_packets.h"
 #include <QApplication>
 #include <QHBoxLayout>
@@ -49,8 +52,10 @@ struct DesktopControls::Callbacks {
 DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
     : QWidget(parent), session_(session)
 {
-    auto *row = new QHBoxLayout(this);
-    row->setContentsMargins(0, 0, 0, 0);
+    column_ = new QVBoxLayout(this);
+    column_->setContentsMargins(0, 0, 0, 0);
+    auto *row = new QHBoxLayout;
+    column_->addLayout(row);
     label_ = new QLabel(this);
     label_->setTextFormat(Qt::PlainText);
     label_->setWordWrap(true);
@@ -75,6 +80,41 @@ DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
     });
     connect(stop_, &QPushButton::clicked, this, [this] { session_.stop(); });
     connect(&session, &DesktopSession::changed, this, &DesktopControls::updateState);
+    connect(&session, &DesktopSession::displaySwitched, this, &DesktopControls::switchDisplay);
+    connect(&session, &DesktopSession::displaysChanged, this, [this] {
+        if (viewer_)
+            viewer_->setDisplays(session_.displays(), session_.displayId());
+    });
+    connect(&session, &DesktopSession::beforePaste, this, [this] {
+        if (transfer_)
+            transfer_->pollClipboard();
+    });
+    topology_.setSingleShot(true);
+    topology_.setInterval(120);
+    auto topologyChanged = [this] {
+        if (session_.state() == DesktopSession::Sharing)
+            topology_.start();
+    };
+    auto watchScreen = [this, topologyChanged](QScreen *screen) {
+        connect(screen, &QScreen::geometryChanged, this, topologyChanged);
+        connect(screen, &QScreen::physicalDotsPerInchChanged, this, topologyChanged);
+        connect(screen, &QScreen::orientationChanged, this, topologyChanged);
+        topologyChanged();
+    };
+    for (auto *screen : QGuiApplication::screens())
+        watchScreen(screen);
+    connect(qApp, &QGuiApplication::screenAdded, this, watchScreen);
+    connect(qApp, &QGuiApplication::screenRemoved, this, topologyChanged);
+    connect(qApp, &QGuiApplication::primaryScreenChanged, this, topologyChanged);
+    connect(&topology_, &QTimer::timeout, this, [this] { session_.updateHostDisplays(desktopDisplays()); });
+    settleMotion_.setSingleShot(true);
+    settleMotion_.setInterval(180);
+    connect(&settleMotion_, &QTimer::timeout, this, [this] {
+        if (capture_ && (!lastPolish_.isValid() || lastPolish_.elapsed() > 600)) {
+            lastPolish_.start();
+            capture_->refresh();
+        }
+    });
     connect(&session, &DesktopSession::frame, this, [this](const QByteArray &frame, quint32 time) {
         if (player_) {
             if (session_.interactive() && !viewer_->inputSurface()->hasPictureSize())
@@ -90,6 +130,19 @@ DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
             session_.stop(tr("系统未能执行远程输入。请确认输入权限并返回普通桌面后重试。"));
             return;
         }
+        if (capture_ && (event.kind == InputKind::KeyDown || event.kind == InputKind::Text ||
+                         event.kind == InputKind::Wheel || event.kind == InputKind::ButtonDown))
+            capture_->inputActivity();
+        if (transfer_ && session_.dataLink().clipboardEnabled() && event.kind == InputKind::KeyDown &&
+            (event.letter == 'C' || event.letter == 'X') && (event.mods & 0x99))
+            QTimer::singleShot(16, transfer_, &TransferBar::pollClipboard);
+        if (event.kind == InputKind::ButtonDown)
+            dragging_ = true;
+        if (event.kind == InputKind::Wheel || (dragging_ && event.kind == InputKind::Move) ||
+            event.kind == InputKind::ButtonUp)
+            settleMotion_.start();
+        if (event.kind == InputKind::ButtonUp || event.kind == InputKind::Reset)
+            dragging_ = false;
         if (event.kind == InputKind::ButtonUp || event.kind == InputKind::SwitchApp)
             QTimer::singleShot(15, this, &DesktopControls::refreshInputFocus);
     });
@@ -113,9 +166,11 @@ DesktopControls::~DesktopControls()
     endMedia();
 }
 
-void DesktopControls::endMedia()
+void DesktopControls::retireMedia()
 {
     focusTimer_->stop();
+    settleMotion_.stop();
+    dragging_ = false;
     input_.reset();
     inputSink_.reset();
     focusPending_ = false;
@@ -127,6 +182,14 @@ void DesktopControls::endMedia()
     capture_.reset();
     player_.reset();
     callbacks_.reset();
+}
+
+void DesktopControls::endMedia()
+{
+    retireMedia();
+    topology_.stop();
+    delete transfer_;
+    transfer_ = nullptr;
     if (viewer_) {
         viewer_->disconnect(this);
         viewer_->inputSurface()->disconnect(this);
@@ -156,11 +219,14 @@ void DesktopControls::updateState()
         label_->setText(tr("正在验证设备身份…"));
         break;
     case DesktopSession::Waiting:
-        label_->setText((control ? tr("等待 %1 同意控制主屏幕…") : tr("等待 %1 同意查看主屏幕…")).arg(name));
+        label_->setText(tr("等待 %1 同意桌面请求…").arg(name));
         break;
     case DesktopSession::Requested: {
         label_->setText(
-            (control ? tr("%1 请求查看你的主屏幕，并使用键盘和鼠标。") : tr("%1 请求查看你的主屏幕。"))
+            (session_.extended()
+                 ? (control ? tr("%1 请求查看和切换显示器、使用键鼠。文件需逐次接收，剪贴板需双方开启。")
+                            : tr("%1 请求查看桌面并切换显示器。"))
+                 : (control ? tr("%1 请求查看主屏幕并使用键鼠。") : tr("%1 请求查看主屏幕。")))
                 .arg(name));
         for (QWidget *parent = parentWidget(); parent; parent = parent->parentWidget())
             if (auto *tabs = qobject_cast<QTabWidget *>(parent)) {
@@ -171,20 +237,60 @@ void DesktopControls::updateState()
         break;
     }
     case DesktopSession::Sharing:
+        if (control && session_.extended())
+            addTransferBar();
+        session_.updateHostDisplays(desktopDisplays());
+        break;
+    case DesktopSession::Viewing:
+        label_->setText((control ? tr("正在控制 %1 的桌面。") : tr("正在查看 %1 的桌面。")).arg(name));
+        openViewer();
+        if (control && session_.extended())
+            addTransferBar();
+        if (!session_.extended())
+            startPlayer();
+        break;
+    }
+}
+
+void DesktopControls::addTransferBar()
+{
+    auto &data = session_.dataLink();
+    transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this);
+    if (viewer_) {
+        viewer_->addTools(transfer_);
+        connect(viewer_, &DesktopViewer::fileDropped, &data, &SessionData::offerFile);
+        connect(&data, &SessionData::changed, viewer_, [this] {
+            auto &link = session_.dataLink();
+            if (viewer_)
+                viewer_->allowFileDrops(link.ready() && link.fileState() == SessionData::NoFile);
+        });
+    } else
+        column_->addWidget(transfer_);
+}
+
+void DesktopControls::switchDisplay()
+{
+    retireMedia();
+    if (session_.state() == DesktopSession::Sharing) {
+        QString name;
+        for (const auto &d : session_.displays())
+            if (d.id == session_.displayId())
+                name = d.name;
         label_->setText(
-            (control ? tr("%1 正在控制你的主屏幕和键鼠。") : tr("正在向 %1 共享主屏幕（只读）。")).arg(name));
+            tr("%1 正在%2 %3")
+                .arg(session_.peerName(), session_.interactive() ? tr("控制") : tr("查看"), name));
         startCapture();
-        if (control) {
-            inputSink_ = createInputSink();
+        if (session_.interactive()) {
+            inputSink_ = createInputSink(session_.displayId());
             input_ = std::make_unique<HostInput>(session_.peerOS(), localOS(), *inputSink_);
             focusTimer_->start();
             refreshInputFocus();
         }
-        break;
-    case DesktopSession::Viewing:
-        label_->setText((control ? tr("正在控制 %1 的主屏幕。") : tr("正在查看 %1 的主屏幕。")).arg(name));
-        openViewer();
-        break;
+    } else if (viewer_) {
+        viewer_->inputSurface()->changeDisplay();
+        viewer_->setDisplays(session_.displays(), session_.displayId());
+        viewer_->setStatus(tr("正在切换显示器…"));
+        startPlayer();
     }
 }
 
@@ -234,15 +340,28 @@ void DesktopControls::startCapture()
                 ui->session_.sendFrame(std::move(data), stamp, key);
             });
         },
-        Callbacks::error(gate));
+        [gate](QString error) {
+            Callbacks::post(gate, [gate, error](DesktopControls *ui) {
+                QTimer::singleShot(280, ui, [ui, gate, error] {
+                    if (ui->callbacks_ != gate)
+                        return;
+                    const auto displays = desktopDisplays();
+                    if (ui->session_.extended() && displays != ui->session_.displays())
+                        ui->session_.updateHostDisplays(displays, true);
+                    else
+                        ui->session_.stop(error);
+                });
+            });
+        },
+        session_.displayId());
 }
 
 void DesktopControls::openViewer()
 {
-    auto gate = callbacks_ = std::make_shared<Callbacks>(this);
     const bool control = session_.interactive();
     viewer_ = new DesktopViewer(this, control);
     viewer_->setWindowTitle((control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(session_.peerName()));
+    connect(viewer_, &DesktopViewer::displayRequested, &session_, &DesktopSession::chooseDisplay);
     if (control) {
         auto *surface = viewer_->inputSurface();
         auto *resized = new QTimer(viewer_);
@@ -250,8 +369,8 @@ void DesktopControls::openViewer()
         auto resizeFinished = [resized] { resized->start(60); };
         connect(surface, &QWindow::widthChanged, resized, resizeFinished);
         connect(surface, &QWindow::heightChanged, resized, resizeFinished);
-        connect(resized, &QTimer::timeout, this, [this, gate] {
-            if (callbacks_ == gate && !gate->firstPicture)
+        connect(resized, &QTimer::timeout, this, [this] {
+            if (callbacks_ && !callbacks_->firstPicture)
                 session_.refreshVideo();
         });
         connect(surface, &InputWindow::input, this, [this](const InputEvent &e) { session_.sendInput(e); });
@@ -265,8 +384,9 @@ void DesktopControls::openViewer()
     auto *timer = new QTimer(viewer_);
     timer->setInterval(1000);
     const auto mode = control ? tr("控制") : tr("只读");
-    connect(timer, &QTimer::timeout, viewer_, [this, gate, mode, shown = false]() mutable {
-        if (!viewer_ || callbacks_ != gate)
+    connect(timer, &QTimer::timeout, viewer_, [this, mode, shown = false]() mutable {
+        auto gate = callbacks_;
+        if (!viewer_ || !gate)
             return;
         if (!viewer_->isMinimized() && gate->receivedStamp &&
             qint32(*gate->receivedStamp - gate->displayedStamp.load()) != 0 && gate->presented.load() == 0)
@@ -282,13 +402,22 @@ void DesktopControls::openViewer()
     viewer_->show();
     if (control)
         viewer_->focusVideo();
+}
+
+void DesktopControls::startPlayer()
+{
+    auto gate = callbacks_ = std::make_shared<Callbacks>(this);
     player_ = playDesktop(
         viewer_->videoView(),
-        [gate, control](quint32 stamp) {
+        [gate](quint32 stamp) {
             gate->displayedStamp = stamp;
             ++gate->presented;
-            if (control && gate->firstPicture.exchange(false))
-                Callbacks::post(gate, [](DesktopControls *ui) { ui->viewer_->inputSurface()->presented(); });
+            if (gate->firstPicture.exchange(false))
+                Callbacks::post(gate, [](DesktopControls *ui) {
+                    ui->session_.picturePresented();
+                    if (ui->viewer_ && ui->session_.interactive())
+                        ui->viewer_->inputSurface()->presented();
+                });
         },
         Callbacks::error(gate));
 }

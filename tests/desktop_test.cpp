@@ -1,4 +1,5 @@
 #include "desktop_session.h"
+#include "native_desktop.h"
 #include "video_packets.h"
 #include "video_link.h"
 #include <QCoreApplication>
@@ -480,6 +481,59 @@ class DesktopTest final : public QObject
         viewer.session.sendInput(key);
         QCOMPARE(received.size(), 5);
     }
+
+    void officeSession()
+    {
+        Node viewer, host;
+        host.trust(viewer);
+        viewer.trust(host);
+        auto peer = host.target();
+        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = true;
+        viewer.session.view(peer, true);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        auto &sender = viewer.session.dataLink();
+        auto &receiver = host.session.dataLink();
+        QVERIFY(!receiver.ready());
+        host.session.accept();
+        host.session.updateHostDisplays({{1, "Main", {1920, 1080}, true}, {2, "Side", {1080, 1920}, false}});
+        QTRY_VERIFY(sender.ready() && receiver.ready());
+        QTRY_COMPARE(viewer.session.displayId(), 1u);
+        QSignalSpy frames(&viewer.session, &DesktopSession::frame);
+        host.session.sendFrame(fixture(), rtpTime(videoClockUs()), true);
+        QTRY_COMPARE(frames.size(), 1);
+        viewer.session.picturePresented();
+        viewer.session.chooseDisplay(2);
+        QTRY_COMPARE(viewer.session.displayId(), 2u);
+
+        QSignalSpy copies(&host.session.dataLink(), &SessionData::clipboardText);
+        sender.enableClipboard(true);
+        QVERIFY(!sender.clipboardEnabled());
+        receiver.enableClipboard(true);
+        QTRY_VERIFY(sender.clipboardEnabled() && receiver.clipboardEnabled());
+        const auto cells = QStringLiteral("项目\t负责人\n入账\t陈").repeated(1800);
+        sender.copyText(cells);
+        QTRY_COMPARE(copies.size(), 1);
+        QCOMPARE(copies.first().first().toString(), cells);
+        QTRY_VERIFY(!sender.clipboardPending());
+
+        const auto path = viewer.dir.filePath("meeting.txt");
+        QFile source(path);
+        const auto bytes = cells.toUtf8();
+        QVERIFY(source.open(QIODevice::WriteOnly));
+        QCOMPARE(source.write(bytes), bytes.size());
+        source.close();
+        sender.offerFile(path);
+        QTRY_COMPARE(receiver.fileState(), SessionData::Offered);
+        const auto saved = host.dir.filePath("received.txt");
+        receiver.acceptFile(saved);
+        QTRY_COMPARE(sender.fileState(), SessionData::NoFile);
+        QFile result(saved);
+        QVERIFY(result.open(QIODevice::ReadOnly));
+        QCOMPARE(result.readAll(), bytes);
+        host.session.stop();
+        QTRY_VERIFY(!sender.ready() && viewer.session.state() == DesktopSession::Idle);
+    }
+
     void noTrustNoScreen()
     {
         Node a, b, c;

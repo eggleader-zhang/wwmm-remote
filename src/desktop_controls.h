@@ -6,9 +6,11 @@
 class QLabel;
 class QPushButton;
 class QTimer;
+class QVBoxLayout;
 
 namespace wwmm {
 class DesktopViewer;
+class TransferBar;
 
 class DesktopControls final : public QWidget {
   public:
@@ -20,10 +22,16 @@ class DesktopControls final : public QWidget {
     void updateState();
     void startCapture();
     void openViewer();
+    void switchDisplay();
+    void startPlayer();
+    void retireMedia();
+    void addTransferBar();
     void endMedia();
     void refreshInputFocus();
     DesktopSession &session_;
     QLabel *label_;
+    QVBoxLayout *column_;
+    TransferBar *transfer_ = nullptr;
     QPushButton *yes_, *stop_;
     DesktopViewer *viewer_ = nullptr;
     std::shared_ptr<Callbacks> callbacks_;
@@ -32,6 +40,9 @@ class DesktopControls final : public QWidget {
     std::unique_ptr<InputSink> inputSink_;
     std::unique_ptr<HostInput> input_;
     QTimer *focusTimer_;
+    QTimer settleMotion_, topology_;
+    QElapsedTimer lastPolish_;
+    bool dragging_ = false;
     std::optional<InputFocus> lastFocus_;
     bool focusPending_ = false;
 };

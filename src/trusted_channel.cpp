@@ -1,12 +1,14 @@
 #include "trusted_channel.h"
 #include <QTimer>
+#include <QtEndian>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 
 namespace wwmm
 {
-TrustedChannel::TrustedChannel(QTcpSocket *socket, DeviceStore &store, QByteArray expected, QObject *parent)
-    : QObject(parent), socket_(socket), store_(store), expected_(std::move(expected))
+TrustedChannel::TrustedChannel(QTcpSocket *socket, DeviceStore &store, QByteArray expected, QObject *parent,
+                               Mode mode)
+    : QObject(parent), socket_(socket), store_(store), expected_(std::move(expected)), mode_(mode)
 {
     socket->setParent(this);
     socket->setReadBufferSize(32768);
@@ -59,11 +61,11 @@ void TrustedChannel::start()
     SSL_set_bio(tls_.get(), in.release(), out.release());
     SSL_set_app_data(tls_.get(), this);
     socket_->setSocketOption(QAbstractSocket::LowDelayOption, 1);
-    if (expected_.isEmpty())
+    if (mode_ == Mode::DataServer || (mode_ == Mode::Control && expected_.isEmpty()))
         SSL_set_accept_state(tls_.get());
     else {
         SSL_set_connect_state(tls_.get());
-        if (socket_->write("WMV3", 4) != 4)
+        if (mode_ == Mode::Control && socket_->write("WMV3", 4) != 4)
             return stop(tr("无法发送桌面请求。"));
     }
     pump();
@@ -75,7 +77,8 @@ bool TrustedChannel::flush()
     char block[4096];
     while (BIO_pending(out)) {
         int n = BIO_read(out, block, sizeof(block));
-        if (n <= 0 || socket_->bytesToWrite() > 32768 || socket_->write(block, n) != n)
+        if (n <= 0 || socket_->bytesToWrite() > (mode_ == Mode::Control ? 32768 : 98304) ||
+            socket_->write(block, n) != n)
             return false;
     }
     return true;
@@ -107,7 +110,8 @@ void TrustedChannel::pump()
         ready_ = true;
         emit authenticated();
     }
-    char buf[128];
+    char buf[4096];
+    const int prefix = mode_ == Mode::Control ? 1 : 2;
     while (!ended_) {
         ERR_clear_error();
         int n = SSL_read(tls_.get(), buf, sizeof(buf));
@@ -117,14 +121,14 @@ void TrustedChannel::pump()
             return;
         }
         clear_.append(buf, n);
-        while (!clear_.isEmpty() && !ended_) {
-            const int len = quint8(clear_[0]);
-            if (len == 0)
+        while (clear_.size() >= prefix && !ended_) {
+            const int len = prefix == 1 ? quint8(clear_[0]) : qFromBigEndian<quint16>(clear_.constData());
+            if (len == 0 || len > maxDataFrame)
                 return stop(tr("桌面协议消息无效。"));
-            if (clear_.size() <= len)
+            if (clear_.size() < prefix + len)
                 break;
-            const auto frame = clear_.mid(1, len);
-            clear_.remove(0, len + 1);
+            const auto frame = clear_.mid(prefix, len);
+            clear_.remove(0, prefix + len);
             emit message(frame);
         }
     }
@@ -132,9 +136,12 @@ void TrustedChannel::pump()
 
 bool TrustedChannel::send(const QByteArray &message)
 {
-    if (!ready_ || ended_ || message.isEmpty() || message.size() > 255)
+    if (!ready_ || ended_ || message.isEmpty() ||
+        message.size() > (mode_ == Mode::Control ? 255 : maxDataFrame))
         return false;
-    QByteArray data(1, char(message.size()));
+    QByteArray data(mode_ == Mode::Control ? 1 : 2, char(message.size()));
+    if (mode_ != Mode::Control)
+        qToBigEndian(quint16(message.size()), data.data());
     data += message;
     if (SSL_write(tls_.get(), data.constData(), int(data.size())) != data.size() || !flush())
         return false;

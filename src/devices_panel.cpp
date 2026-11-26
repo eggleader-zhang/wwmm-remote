@@ -1,5 +1,7 @@
 #include "devices_panel.h"
 #include "desktop_controls.h"
+#include <QSettings>
+#include <QSet>
 #include <QApplication>
 #include <QCheckBox>
 #include <QGroupBox>
@@ -141,7 +143,16 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     nearLayout->addLayout(pairRow);
     layout->addWidget(near, 2);
 
-    auto *trusted = new QGroupBox(tr("本机信任的设备"), this);
+    const auto recentSetting =
+        QStringLiteral("desktop/recent/") + QString::fromLatin1(store.publicKey().toHex());
+    auto recent = std::make_shared<QStringList>(QSettings().value(recentSetting).toStringList().mid(0, 5));
+    auto lastMode = [recent](const QByteArray &key) -> QChar {
+        for (const auto &record : *recent)
+            if (record.size() == 65 && record.mid(1).toLatin1() == key.toHex())
+                return record.at(0);
+        return {};
+    };
+    auto *trusted = new QGroupBox(tr("已配对设备 · 最近使用优先"), this);
     auto *trustedLayout = new QVBoxLayout(trusted);
     auto *saved = new QListWidget(trusted);
     saved->setObjectName("trustedDevices");
@@ -149,7 +160,12 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     auto *forget = new QPushButton(tr("撤销本机信任"), trusted);
     forget->setObjectName("forgetDevice");
     trustedLayout->addWidget(saved);
-    trustedLayout->addWidget(forget, 0, Qt::AlignRight);
+    auto *reconnect = new QPushButton(tr("重新连接"), trusted);
+    auto *savedActions = new QHBoxLayout;
+    savedActions->addWidget(reconnect);
+    savedActions->addStretch();
+    savedActions->addWidget(forget);
+    trustedLayout->addLayout(savedActions);
     layout->addWidget(trusted, 1);
     auto *status = label(this);
     status->setObjectName("pairStatus");
@@ -173,6 +189,16 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         });
         const bool capable = peer != devices.cend() && peer->readonlyDesktop;
         const bool available = desktop->state() == DesktopSession::Idle && capable && store.peers().contains(selectedKey);
+        const auto savedKey = selected(saved);
+        const auto mode = lastMode(savedKey);
+        const auto online =
+            std::find_if(devices.cbegin(), devices.cend(), [&](const auto &d) { return d.key == savedKey; });
+        const bool reconnectable = mode != QChar{} && desktop->state() == DesktopSession::Idle &&
+                                   store.peers().contains(savedKey) && online != devices.cend() &&
+                                   online->readonlyDesktop && (mode != u'c' || online->keyboardMouse);
+        reconnect->setEnabled(reconnectable);
+        reconnect->setToolTip(reconnectable ? tr("使用上次的模式重新请求本次授权")
+                                            : tr("最近使用的设备上线后可重新连接"));
         view->setEnabled(available);
         control->setEnabled(available && peer->keyboardMouse);
         control->setToolTip(capable && peer->keyboardMouse ? tr("请求使用对方的键盘和鼠标")
@@ -221,15 +247,67 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         info->setVisible(!info->text().isEmpty());
         buttons();
     };
-    auto refreshSaved = [=, &store] {
+    auto refreshSaved = [=, &store, &discovery] {
         const auto was = selected(saved);
         saved->clear();
-        for (auto it = store.peers().begin(); it != store.peers().end(); ++it)
-            addDevice(saved, tr("%1 · %2").arg(it.value(), fingerprint(it.key())), it.key(), was);
+        const auto before = *recent;
+        recent->removeIf([&store](const QString &record) {
+            return record.size() != 65 || (record[0] != u'c' && record[0] != u'v') ||
+                   !store.peers().contains(QByteArray::fromHex(record.mid(1).toLatin1()));
+        });
+        if (*recent != before)
+            QSettings().setValue(recentSetting, *recent);
+        QSet<QByteArray> online;
+        for (const auto &d : discovery.devices())
+            online.insert(d.key);
+        QList<QByteArray> keys;
+        for (const auto &record : *recent)
+            keys.append(QByteArray::fromHex(record.mid(1).toLatin1()));
+        for (auto it = store.peers().cbegin(); it != store.peers().cend(); ++it)
+            if (!keys.contains(it.key()))
+                keys.append(it.key());
+        for (const auto &key : keys)
+            addDevice(saved,
+                      tr("%1 · %2 · %3")
+                          .arg(store.peers().value(key), online.contains(key) ? tr("在线") : tr("离线"),
+                               fingerprint(key)),
+                      key, was);
+        if (!saved->currentItem() && !recent->isEmpty())
+            saved->setCurrentRow(0);
         buttons();
     };
     connect(desktop, &DesktopSession::notice, status, &QLabel::setText);
-    connect(desktop, &DesktopSession::changed, this, buttons);
+    connect(desktop, &DesktopSession::changed, this, [=] {
+        if (desktop->state() == DesktopSession::Viewing) {
+            const auto key = QString::fromLatin1(desktop->peerKey().toHex());
+            recent->removeIf([&key](const QString &r) { return r.mid(1) == key; });
+            recent->prepend((desktop->interactive() ? QStringLiteral("c") : QStringLiteral("v")) + key);
+            if (recent->size() > 5)
+                recent->removeLast();
+            QSettings().setValue(recentSetting, *recent);
+            refreshSaved();
+        }
+        buttons();
+    });
+    connect(reconnect, &QPushButton::clicked, this, [=, &discovery, &store] {
+        const auto key = selected(saved);
+        const auto mode = lastMode(key);
+        if (!store.peers().contains(key) || mode.isNull())
+            return;
+        for (const auto &d : discovery.devices())
+            if (d.key == key && d.readonlyDesktop) {
+                desktop->view(d, mode == u'c');
+                break;
+            }
+    });
+    watchDesktopPower(this, [desktop, status, &probe, &discovery](bool awake) {
+        desktop->stop(QObject::tr("电脑已休眠，本次桌面授权已结束。"));
+        if (awake) {
+            probe.refresh();
+            discovery.restart();
+            status->setText(QObject::tr("已唤醒。最近用过的电脑上线后，可以重新连接。"));
+        }
+    });
     auto requestDesktop = [=, &discovery](bool withInput) {
         for (const auto &peer : discovery.devices())
             if (peer.key == selected(nearby)) {
@@ -242,6 +320,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     connect(&probe, &LanProbe::endpointsChanged, this, buttons);
     connect(&probe, &LanProbe::receivingChanged, this, buttons);
     connect(&discovery, &Discovery::changed, this, refreshNearby);
+    connect(&discovery, &Discovery::changed, this, refreshSaved);
     connect(&store, &DeviceStore::changed, this, refreshSaved);
     connect(&store, &DeviceStore::openFinished, status, [status](const QString &error) {
         if (!error.isEmpty())

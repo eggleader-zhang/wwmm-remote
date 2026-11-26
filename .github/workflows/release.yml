@@ -10,6 +10,8 @@ on:
       - 'scripts/release_*.py'
       - 'CMakeLists.txt'
       - 'cmake/*.cmake'
+      - 'src/**'
+      - 'platform/**'
 
 concurrency:
   group: desktop-releases
@@ -80,10 +82,27 @@ jobs:
           call "%vs%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=${{ matrix.msvc }} -host_arch=${{ matrix.msvc }}
           if errorlevel 1 exit /b 1
           python scripts\release_package.py "${{ matrix.target }}"
+      - name: Sign macOS package
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: python3 scripts/release_sign.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
+      - name: Sign Windows package
+        if: runner.os == 'Windows'
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: python scripts/release_sign.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: package-${{ matrix.target }}
-          path: dist/${{ needs.version.outputs.number }}/WWMM-Remote-${{ needs.version.outputs.number }}-${{ matrix.target }}.zip
+          path: |
+            dist/${{ needs.version.outputs.number }}/WWMM-Remote-${{ needs.version.outputs.number }}-${{ matrix.target }}.zip
+            dist/${{ needs.version.outputs.number }}/signing-${{ matrix.target }}.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
@@ -110,9 +129,13 @@ jobs:
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          notes="../docs/releases/$tag.md"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cp "../docs/releases/$tag.md" "$notes"
+          printf '\n## 发布签名\n\n' >> "$notes"
           for target in macos-arm64 macos-x86_64 windows-x64 windows-arm64; do
             test -s "WWMM-Remote-$VERSION-$target.zip"
+            test -s "signing-$target.txt"
+            cat "signing-$target.txt" >> "$notes"
           done
           test "$(find . -name '*.zip' | wc -l)" -eq 4
           sha256sum *.zip > SHA256SUMS.txt

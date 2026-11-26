@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS deployment target")
 endif()
-project(WWMMRemote VERSION 0.4.0 LANGUAGES C CXX)
+project(WWMMRemote VERSION 1.0.0 LANGUAGES C CXX)
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -27,7 +27,8 @@ add_library(wwmm_lan STATIC
     src/pair_session.cpp src/pair_session.h
     src/pairing.cpp src/pairing.h
     src/trusted_channel.cpp src/trusted_channel.h
-    src/desktop_session.cpp src/desktop_session.h
+    src/desktop_session.cpp src/desktop_session.h src/desktop_display.h
+    src/session_data.cpp src/session_data.h src/session_displays.cpp
     src/desktop_input.cpp src/desktop_input.h src/input_keys.cpp
     src/video_packets.cpp src/video_packets.h
     src/video_link.cpp src/video_link.h
@@ -44,7 +45,7 @@ endif()
 
 add_library(wwmm_widgets STATIC src/main_window.cpp src/main_window.h src/devices_panel.cpp src/devices_panel.h
     src/desktop_controls.cpp src/desktop_controls.h src/desktop_viewer.cpp src/desktop_viewer.h
-    src/input_window.cpp src/input_window.h)
+    src/input_window.cpp src/input_window.h src/transfer_bar.cpp src/transfer_bar.h)
 target_link_libraries(wwmm_widgets PUBLIC wwmm_lan Qt6::Widgets)
 if(APPLE)
     enable_language(OBJCXX)

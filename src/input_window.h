@@ -19,6 +19,9 @@ class InputWindow final : public QWindow {
     bool hasPictureSize() const { return !picture_.isEmpty(); }
 
     void presented();
+    void changeDisplay();
+
+    void allowFileDrops(bool allow) { fileDrops_ = allow; }
     void setInputFocus(InputFocus kind);
 
     QObject *focusObject() const override { return const_cast<InputWindow *>(this); }
@@ -27,6 +30,7 @@ class InputWindow final : public QWindow {
     void input(const wwmm::InputEvent &event);
     void preeditChanged(const QString &text);
     void firstPictureShown();
+    void fileDropped(const QString &path);
 
   protected:
     bool event(QEvent *event) override;
@@ -42,6 +46,7 @@ class InputWindow final : public QWindow {
     bool acceptsText() const { return interactive_ && ready_ && focused_ && focus_ == InputFocus::Text; }
 
     bool interactive_, ready_ = false, focused_ = false, composing_ = false, resetting_ = false;
+    bool fileDrops_ = false;
     InputFocus focus_ = InputFocus::Raw;
     QSize picture_;
     quint8 mods_ = 0, buttons_ = 0;

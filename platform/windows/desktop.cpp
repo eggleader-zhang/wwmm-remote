@@ -92,12 +92,14 @@ struct Gpu {
     ComPtr<ID3D11VideoProcessorEnumerator> modes;
     ComPtr<ID3D11VideoProcessor> processor;
     QSize inSize, outSize;
-    explicit Gpu(bool capturing)
+
+    explicit Gpu(bool capturing, quint64 display = 0)
     {
         check(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI 初始化失败");
         ComPtr<IDXGIAdapter1> selected;
         if (capturing) {
-            const auto primary = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+            const auto monitor = display ? reinterpret_cast<HMONITOR>(quintptr(display))
+                                         : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
             for (UINT a = 0; !selected; ++a) {
                 ComPtr<IDXGIAdapter1> adapter;
                 auto hr = factory->EnumAdapters1(a, &adapter);
@@ -112,8 +114,8 @@ struct Gpu {
                     check(hr, "枚举显示输出失败");
                     DXGI_OUTPUT_DESC info{};
                     if (SUCCEEDED(candidate->GetDesc(&info)) && info.AttachedToDesktop &&
-                        info.Monitor == primary) {
-                        check(candidate.As(&output), "主显示器不支持 DXGI 桌面复制");
+                        info.Monitor == monitor) {
+                        check(candidate.As(&output), "所选显示器不支持 DXGI 桌面复制");
                         selected = adapter;
                         screen = info;
                         break;
@@ -121,7 +123,7 @@ struct Gpu {
                 }
             }
             if (!selected)
-                throw Failure{QStringLiteral("找不到当前用户的主显示器。")};
+                throw Failure{QStringLiteral("所选显示器已断开。")};
         }
         check(D3D11CreateDevice(selected.Get(), selected ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
                                 nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -460,13 +462,15 @@ class WinCapture final : public DesktopCapture
 {
     EncodedFrame output_;
     MediaError failure_;
+    quint64 display_;
     std::atomic_bool stopped_{false}, refresh_{true};
     std::atomic_int requestedRate_{0};
+    std::atomic<qint64> responsiveUntil_{0};
     std::thread thread_;
     void run()
     {
         Runtime runtime;
-        Gpu gpu(true);
+        Gpu gpu(true, display_);
         ComPtr<IDXGIOutputDuplication> dup;
         check(gpu.output->DuplicateOutput(gpu.device.Get(), &dup), "无法复制当前用户的桌面");
         auto rect = gpu.screen.DesktopCoordinates;
@@ -512,7 +516,8 @@ class WinCapture final : public DesktopCapture
             ComPtr<IDXGIResource> resource;
             DXGI_OUTDUPL_FRAME_INFO info{};
             const bool idle = next && !dirty && !refresh_.load() && videoClockUs() - next > 100000;
-            auto hr = dup->AcquireNextFrame(idle ? 32 : 4, &info, &resource);
+            const bool responding = videoClockUs() < responsiveUntil_.load(std::memory_order_relaxed);
+            auto hr = dup->AcquireNextFrame(responding ? 1 : (idle ? 32 : 4), &info, &resource);
             if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
                 check(hr, "当前桌面或显示器已改变，请重新共享");
                 struct ReleaseFrame {
@@ -570,8 +575,8 @@ class WinCapture final : public DesktopCapture
     }
 
   public:
-    WinCapture(EncodedFrame output, MediaError failure)
-        : output_(std::move(output)), failure_(std::move(failure)), thread_([this] {
+    WinCapture(EncodedFrame output, MediaError failure, quint64 display)
+        : output_(std::move(output)), failure_(std::move(failure)), display_(display), thread_([this] {
               try {
                   run();
               } catch (const Failure &failure) {
@@ -583,6 +588,11 @@ class WinCapture final : public DesktopCapture
     }
     void setBitrate(int rate) override { requestedRate_ = rate; }
     void refresh() override { refresh_ = true; }
+
+    void inputActivity() override
+    {
+        responsiveUntil_.store(videoClockUs() + 110000, std::memory_order_relaxed);
+    }
     ~WinCapture() override
     {
         stopped_ = true;
@@ -777,9 +787,37 @@ class WinPlayer final : public DesktopPlayer
     }
 };
 } // namespace
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error)
+
+namespace {
+BOOL CALLBACK collectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM param)
 {
-    return std::make_unique<WinCapture>(std::move(output), std::move(error));
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        auto name = QString::fromWCharArray(info.szDevice);
+        if (EnumDisplayDevicesW(info.szDevice, 0, &device, 0) && device.DeviceString[0])
+            name = QString::fromWCharArray(device.DeviceString);
+        auto r = info.rcMonitor;
+        reinterpret_cast<QList<DesktopDisplay> *>(param)->append(
+            {quintptr(monitor), name, QSize(int(r.right - r.left), int(r.bottom - r.top)),
+             bool(info.dwFlags & MONITORINFOF_PRIMARY)});
+    }
+    return TRUE;
+}
+} // namespace
+
+QList<DesktopDisplay> desktopDisplays()
+{
+    QList<DesktopDisplay> displays;
+    EnumDisplayMonitors(nullptr, nullptr, collectMonitor, reinterpret_cast<LPARAM>(&displays));
+    return displays;
+}
+
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display)
+{
+    return std::make_unique<WinCapture>(std::move(output), std::move(error), display);
 }
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr view, PresentedFrame present, MediaError failure)
 {

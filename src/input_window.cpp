@@ -1,4 +1,6 @@
 #include "input_window.h"
+#include "transfer_bar.h"
+#include <QDragEnterEvent>
 #include <QGuiApplication>
 #include <QInputMethod>
 #include <QInputMethodEvent>
@@ -168,6 +170,13 @@ void InputWindow::presented()
     emit firstPictureShown();
 }
 
+void InputWindow::changeDisplay()
+{
+    resetInput();
+    ready_ = false;
+    picture_ = {};
+}
+
 void InputWindow::cancelPreedit()
 {
     resetting_ = true;
@@ -331,6 +340,17 @@ bool InputWindow::wheel(QWheelEvent *w)
 
 bool InputWindow::event(QEvent *ev)
 {
+    if (fileDrops_ &&
+        (ev->type() == QEvent::DragEnter || ev->type() == QEvent::DragMove || ev->type() == QEvent::Drop)) {
+        auto *drop = static_cast<QDropEvent *>(ev);
+        const auto path = droppedFile(drop->mimeData());
+        if (!path.isEmpty()) {
+            drop->acceptProposedAction();
+            if (ev->type() == QEvent::Drop)
+                emit fileDropped(path);
+            return true;
+        }
+    }
     if (!interactive_)
         return QWindow::event(ev);
     if (ev->type() == QEvent::InputMethodQuery) {

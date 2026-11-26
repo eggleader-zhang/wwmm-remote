@@ -19,7 +19,9 @@ namespace wwmm
 struct MacCaptureState : std::enable_shared_from_this<MacCaptureState> {
     EncodedFrame output;
     MediaError failure;
-    dispatch_queue_t queue = dispatch_queue_create("dev.wwmm.capture", DISPATCH_QUEUE_SERIAL);
+    dispatch_queue_t queue = dispatch_queue_create(
+        "dev.wwmm.capture",
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     SCStream *stream = nil;
     WWMMScreenOutput *sink = nil;
     std::unique_ptr<MacVideoEncoder> encoder;
@@ -67,7 +69,7 @@ class MacCapture final : public DesktopCapture
     std::shared_ptr<MacCaptureState> s_ = std::make_shared<MacCaptureState>();
 
   public:
-    MacCapture(EncodedFrame output, MediaError failure)
+    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected)
     {
         auto s = s_;
         s->output = std::move(output);
@@ -87,12 +89,12 @@ class MacCapture final : public DesktopCapture
                                          }
                                          SCDisplay *display = nil;
                                          for (SCDisplay *d in content.displays)
-                                             if (d.displayID == CGMainDisplayID()) {
+                                             if (d.displayID == selected) {
                                                  display = d;
                                                  break;
                                              }
                                          if (!display) {
-                                             s->failure(QStringLiteral("找不到当前主显示器。"));
+                                             s->failure(QStringLiteral("所选显示器已断开。"));
                                              return;
                                          }
                                          auto filter = [[SCContentFilter alloc] initWithDisplay:display
@@ -175,9 +177,27 @@ class MacCapture final : public DesktopCapture
         });
     }
 };
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error)
+
+QList<DesktopDisplay> desktopDisplays()
 {
-    return std::make_unique<MacCapture>(std::move(output), std::move(error));
+    QList<DesktopDisplay> displays;
+    for (NSScreen *screen in NSScreen.screens) {
+        auto id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
+        if (!id || CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay)
+            continue;
+        const auto rect = screen.frame;
+        displays.append({id, QString::fromNSString(screen.localizedName),
+                         QSize(qRound(rect.size.width * screen.backingScaleFactor),
+                               qRound(rect.size.height * screen.backingScaleFactor)),
+                         id == CGMainDisplayID()});
+    }
+    return displays;
+}
+
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display)
+{
+    return std::make_unique<MacCapture>(std::move(output), std::move(error),
+                                        display ? CGDirectDisplayID(display) : CGMainDisplayID());
 }
 } // namespace wwmm
 @implementation WWMMScreenOutput

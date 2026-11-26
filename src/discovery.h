@@ -19,6 +19,7 @@ struct NearbyDevice {
     LanAddress link;
     bool readonlyDesktop = false;
     bool keyboardMouse = false;
+    bool extendedDesktop = false;
     bool operator==(const NearbyDevice &) const = default;
 };
 
@@ -47,7 +48,8 @@ public:
         return issue_;
     }
     void refresh();
-signals:
+    void restart();
+  signals:
     void changed();
 
 private:

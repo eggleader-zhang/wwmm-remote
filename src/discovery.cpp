@@ -17,6 +17,16 @@ Discovery::Discovery(LanProbe &probe, QByteArray key, QString name, Factory fact
     refresh();
 }
 
+void Discovery::restart()
+{
+    if (backend_) {
+        backend_->disconnect(this);
+        delete backend_;
+        backend_ = nullptr;
+    }
+    refresh();
+}
+
 void Discovery::refresh()
 {
     const auto links = probe_.links();
@@ -54,7 +64,10 @@ void Discovery::refresh()
             QCryptographicHash::hash(key_ + endpoint.toUtf8(), QCryptographicHash::Sha256).toHex().left(32);
         ads.append({QStringLiteral("w-") + QString::fromLatin1(id),
                     local,
-                    {{"v", "2"}, {"desk", "3"}, {"input", "1"},
+                    {{"v", "2"},
+                     {"desk", "3"},
+                     {"input", "1"},
+                     {"office", "1"},
                      {"pk", QString::fromLatin1(key_.toHex())},
                      {"addr", local.link.address.toString()},
                      {"name", QString::fromLatin1(name_.toUtf8().toBase64(QByteArray::Base64UrlEncoding |
@@ -98,7 +111,10 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
                       name,
                       os == "Windows" ? DesktopOS::windows : DesktopOS::macOS,
                       {socketAddress(address, *link), port},
-                      *link, fields.value("desk") == "3", fields.value("input") == "1"};
+                      *link,
+                      fields.value("desk") == "3",
+                      fields.value("input") == "1",
+                      fields.value("office") == "1"};
     const auto previous = seen_.constFind(source);
     if (previous == seen_.cend() ? seen_.size() >= 256 : *previous == peer)
         return;

@@ -1,5 +1,8 @@
 #pragma once
+#include "desktop_display.h"
 #include <QDialog>
+class QComboBox;
+class QVBoxLayout;
 class QLabel;
 
 namespace wwmm {
@@ -15,12 +18,23 @@ class DesktopViewer final : public QDialog {
 
     void focusVideo();
     void setStatus(const QString &text);
+    void setDisplays(const QList<DesktopDisplay> &list, quint64 selected);
+    void addTools(QWidget *tools);
+    void allowFileDrops(bool allow);
   signals:
     void switchRequested();
+    void displayRequested(quint64 id);
+    void fileDropped(const QString &path);
+
+  protected:
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
 
   private:
     InputWindow *surface_;
     QWidget *video_;
     QLabel *status_;
+    QComboBox *displays_;
+    QVBoxLayout *column_;
 };
 } // namespace wwmm

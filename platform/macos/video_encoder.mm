@@ -59,7 +59,7 @@ void MacVideoEncoder::setBitrate(int rate)
 }
 bool MacVideoEncoder::encode(CVPixelBufferRef image, qint64 us, bool force)
 {
-    if (!encoder_ || pending_.load() >= 3)
+    if (!encoder_ || pending_.load() >= 2)
         return false;
     ++pending_;
     VTEncodeInfoFlags flags = 0;

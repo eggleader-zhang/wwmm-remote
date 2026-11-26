@@ -9,17 +9,19 @@ class TrustedChannel final : public QObject
 {
     Q_OBJECT
 public:
-    // The viewer pins the selected key. The host accepts keys in its own trust store.
-    TrustedChannel(QTcpSocket *socket, DeviceStore &store, QByteArray expectedHost, QObject *parent);
-    void start();
-    void stop(const QString &reason);
-    void finish(const QByteArray &lastMessage);
-    bool send(const QByteArray &message);
-    QByteArray mediaKeys() const;
-    const QByteArray &peerKey() const
-    {
-        return peer_;
-    }
+  enum class Mode { Control, DataClient, DataServer };
+  TrustedChannel(QTcpSocket *socket, DeviceStore &store, QByteArray expectedHost, QObject *parent,
+                 Mode mode = Mode::Control);
+
+  qint64 pendingBytes() const { return socket_->bytesToWrite(); }
+
+  static constexpr int maxDataFrame = 16384 + 64;
+  void start();
+  void stop(const QString &reason);
+  void finish(const QByteArray &lastMessage);
+  bool send(const QByteArray &message);
+  QByteArray mediaKeys() const;
+  const QByteArray &peerKey() const { return peer_; }
 signals:
     void authenticated();
     void message(const QByteArray &data);
@@ -34,6 +36,7 @@ private:
     QByteArray expected_, peer_, clear_;
     bssl::UniquePtr<SSL> tls_;
     bool ready_ = false, ended_ = false;
+    Mode mode_;
     int handshakeBytes_ = 0;
 };
 } // namespace wwmm
