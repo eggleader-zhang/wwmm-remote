@@ -34,7 +34,8 @@ function(wwmm_add_desktop_media)
         modules/rtp_rtcp/source/leb128.cc rtc_base/bit_buffer.cc rtc_base/byte_buffer.cc
         modules/rtp_rtcp/source/rtp_header_extension_map.cc
         modules/rtp_rtcp/source/rtp_packet.cc modules/rtp_rtcp/source/rtp_packet_to_send.cc
-        rtc_base/bitstream_reader.cc rtc_base/checks.cc rtc_base/copy_on_write_buffer.cc)
+        rtc_base/bitstream_reader.cc rtc_base/checks.cc rtc_base/copy_on_write_buffer.cc
+        rtc_base/zero_memory.cc)
     list(TRANSFORM rtc_sources PREPEND "${webrtc_src_SOURCE_DIR}/")
     add_library(wwmm_webrtc STATIC ${rtc_sources})
     target_link_libraries(wwmm_webrtc PRIVATE absl::strings)
