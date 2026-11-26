@@ -63,9 +63,9 @@ def package_mac(stage, archive, arch):
     require_file(contents / "Frameworks/QtWidgets.framework/QtWidgets")
     require_file(contents / "PlugIns/platforms/libqcocoa.dylib")
     for framework in (contents / "Frameworks").glob("*.framework"):
-        subprocess.run(["lipo", "-verify_arch", arch, framework / framework.stem], check=True)
+        subprocess.run(["lipo", framework / framework.stem, "-verify_arch", arch], check=True)
     for plugin in (contents / "PlugIns").rglob("*.dylib"):
-        subprocess.run(["lipo", "-verify_arch", arch, plugin], check=True)
+        subprocess.run(["lipo", plugin, "-verify_arch", arch], check=True)
     # Resource notices are now complete. Seal the bundle after macdeployqt has signed the nested code.
     subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", app], check=True)
     subprocess.run(["codesign", "--verify", "--deep", "--strict", app], check=True)
