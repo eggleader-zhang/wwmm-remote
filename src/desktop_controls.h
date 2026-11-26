@@ -16,7 +16,7 @@ class TransferBar;
 
 class DesktopControls final : public QWidget {
   public:
-    DesktopControls(DesktopSession &session, QWidget *parent);
+    DesktopControls(DesktopSession &session, Discovery &discovery, QWidget *parent);
     ~DesktopControls() override;
 
   private:
@@ -24,15 +24,18 @@ class DesktopControls final : public QWidget {
     void updateState();
     void startCapture();
     void openViewer();
-    void switchDisplay();
+    void switchDisplay(bool formatOnly);
     void startPlayer();
-    void retireMedia();
+    void retireMedia(bool keepInput = false);
     void updateSound();
     void closeSound();
     void addTransferBar();
-    void endMedia();
+    void endMedia(bool keepViewer = false);
+    std::optional<NearbyDevice> reconnectPeer() const;
+    void updateReconnect();
     void refreshInputFocus();
     DesktopSession &session_;
+    Discovery &discovery_;
     QLabel *label_;
     QCheckBox *soundCheck_;
     std::shared_ptr<Callbacks> soundCallbacks_;

@@ -6,6 +6,8 @@ class QComboBox;
 class QCheckBox;
 class QVBoxLayout;
 class QLabel;
+class QPushButton;
+class QStackedWidget;
 
 namespace wwmm {
 class InputWindow;
@@ -20,7 +22,9 @@ class DesktopViewer final : public QDialog {
 
     void focusVideo();
     void setStatus(const QString &text);
-    void showQuality(VideoQuality quality);
+    void showQuality(VideoQuality limit, VideoQuality active);
+    void showInterrupted(const QString &message, bool canRetry);
+    void showDesktop(bool rich);
     void showSound(bool local, bool peer);
     void setDisplays(const QList<DesktopDisplay> &list, quint64 selected);
     void addTools(QWidget *tools);
@@ -31,6 +35,7 @@ class DesktopViewer final : public QDialog {
     void qualityRequested(wwmm::VideoQuality quality);
     void soundRequested(bool enable);
     void fileDropped(const QString &path);
+    void reconnectRequested();
 
   protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
@@ -39,6 +44,9 @@ class DesktopViewer final : public QDialog {
   private:
     InputWindow *surface_;
     QWidget *video_;
+    QStackedWidget *pages_;
+    QLabel *interrupted_;
+    QPushButton *retry_, *switchApp_ = nullptr;
     QLabel *status_;
     QComboBox *displays_, *quality_ = nullptr;
     QCheckBox *sound_ = nullptr;

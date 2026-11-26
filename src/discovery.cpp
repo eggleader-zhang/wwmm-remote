@@ -69,6 +69,7 @@ void Discovery::refresh()
                      {"input", "1"},
                      {"office", "1"},
                      {"media", "13"},
+                     {"adapt", "1"},
                      {"pk", QString::fromLatin1(key_.toHex())},
                      {"addr", local.link.address.toString()},
                      {"name", QString::fromLatin1(name_.toUtf8().toBase64(QByteArray::Base64UrlEncoding |
@@ -116,7 +117,8 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
                       fields.value("desk") == "3",
                       fields.value("input") == "1",
                       fields.value("office") == "1",
-                      fields.value("media") == "13"};
+                      fields.value("media") == "13",
+                      fields.value("adapt") == "1"};
     const auto previous = seen_.constFind(source);
     if (previous == seen_.cend() ? seen_.size() >= 256 : *previous == peer)
         return;

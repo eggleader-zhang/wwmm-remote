@@ -13,7 +13,7 @@ namespace wwmm {
 class DesktopSession final : public QObject {
     Q_OBJECT
   public:
-    enum State { Idle, Connecting, Waiting, Requested, Sharing, Viewing };
+    enum State { Idle, Connecting, Waiting, Requested, Sharing, Viewing, Interrupted };
 
     DesktopSession(LanProbe &probe, DeviceStore &store, QObject *parent = nullptr);
     ~DesktopSession() override;
@@ -30,6 +30,7 @@ class DesktopSession final : public QObject {
     bool richMedia() const { return rich_; }
 
     VideoQuality quality() const { return quality_; }
+    VideoQuality qualityLimit() const { return qualityLimit_; }
 
     void chooseQuality(VideoQuality quality);
     bool reduceQuality();
@@ -60,12 +61,13 @@ class DesktopSession final : public QObject {
     void reportFocus(InputFocus focus);
     void accept();
     void stop(const QString &reason = {});
+    void interrupt(const QString &reason);
     void sendFrame(QByteArray annexB, quint32 timestamp, bool keyframe);
     void refreshVideo();
   signals:
     void changed();
     void displaysChanged();
-    void displaySwitched();
+    void displaySwitched(bool formatOnly);
     void beforePaste();
     void qualityChanged();
     void soundChanged();
@@ -83,14 +85,15 @@ class DesktopSession final : public QObject {
     bool startNetwork();
     bool displayMessage(const QByteArray &data);
     bool mediaMessage(const QByteArray &data);
-    void applyQuality(VideoQuality quality);
+    void applyQuality(VideoQuality quality, bool keepEstimate = false);
     void syncSound();
     void attachSound();
-    void startDisplay(quint64 id);
+    void startDisplay(quint64 id, bool formatOnly = false);
     void drainPaste();
     void handle(const QByteArray &data);
     void setState(State state);
     void check();
+    void finishSession(const QString &reason, bool transportLost);
     void receiveInput(const InputEvent &event);
     LanProbe &probe_;
     DeviceStore &store_;
@@ -101,8 +104,10 @@ class DesktopSession final : public QObject {
     LanAddress link_;
     Endpoint remote_;
     QByteArray selected_;
-    bool host_ = false, received_ = false, rich_ = false;
-    VideoQuality quality_ = VideoQuality::FullHD;
+    bool host_ = false, received_ = false, rich_ = false, adaptive_ = false, retrying_ = false;
+    VideoQuality quality_ = VideoQuality::FullHD, qualityLimit_ = VideoQuality::FullHD;
+    VideoQuality hardwareLimit_ = VideoQuality::UHD;
+    AdaptiveResolution resolution_;
     quint32 localSound_ = 0, peerSound_ = 0;
     std::shared_ptr<AudioStream> sound_;
     bool interactive_ = false, extended_ = false, displayReady_ = false, needDisplayIdr_ = false;

@@ -13,11 +13,11 @@ TrustedChannel::TrustedChannel(QTcpSocket *socket, DeviceStore &store, QByteArra
     socket->setParent(this);
     socket->setReadBufferSize(32768);
     connect(socket, &QTcpSocket::readyRead, this, &TrustedChannel::pump);
-    connect(socket, &QTcpSocket::disconnected, this, [this] { stop(tr("对方已结束桌面会话。")); });
-    connect(socket, &QTcpSocket::errorOccurred, this, [this] { stop(tr("桌面连接已断开。")); });
+    connect(socket, &QTcpSocket::disconnected, this, [this] { stop(tr("桌面连接已断开。"), true); });
+    connect(socket, &QTcpSocket::errorOccurred, this, [this] { stop(tr("桌面连接已断开。"), true); });
     QTimer::singleShot(7000, this, [this] {
         if (!ready_)
-            stop(tr("设备身份验证超时。"));
+            stop(tr("设备身份验证超时。"), true);
     });
 }
 
@@ -99,7 +99,7 @@ void TrustedChannel::pump()
         int ret = SSL_do_handshake(tls_.get());
         auto err = SSL_get_error(tls_.get(), ret);
         if (!flush())
-            return stop(tr("桌面连接中断。"));
+            return stop(tr("桌面连接中断。"), true);
         if (ret != 1) {
             if (err != SSL_ERROR_WANT_READ)
                 stop(tr("双方设备身份验证失败，请检查配对记录。"));
@@ -177,13 +177,13 @@ void TrustedChannel::finish(const QByteArray &lastMessage)
     QTimer::singleShot(1000, this, &QObject::deleteLater);
 }
 
-void TrustedChannel::stop(const QString &reason)
+void TrustedChannel::stop(const QString &reason, bool transportLost)
 {
     if (ended_)
         return;
     ended_ = true;
     socket_->disconnect(this);
     socket_->abort();
-    emit closed(reason);
+    emit closed(reason, transportLost);
 }
 } // namespace wwmm

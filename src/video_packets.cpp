@@ -19,6 +19,8 @@ constexpr char start[] = {0, 0, 0, 1};
 int qualityBitrate(VideoQuality quality)
 {
     switch (quality) {
+    case VideoQuality::HD:
+        return 9000000;
     case VideoQuality::QHD:
         return 32000000;
     case VideoQuality::UHD:
@@ -26,6 +28,27 @@ int qualityBitrate(VideoQuality quality)
     default:
         return videoBitrate;
     }
+}
+
+VideoQuality AdaptiveResolution::observe(VideoQuality current, VideoQuality limit, qint64 now,
+                                         int loss256, int jitterMs, bool queued)
+{
+    // Count contiguous active RTCP reporting intervals. Silence is no evidence of spare bandwidth.
+    const bool strained = queued || loss256 >= 7 || jitterMs >= 25;
+    const bool clear = !queued && loss256 <= 1 && jitterMs <= 10;
+    int direction = 0;
+    if (strained && current > VideoQuality::HD)
+        direction = -1;
+    else if (clear && current < limit)
+        direction = 1;
+    if (direction != direction_ || last_ < 0 || now - last_ > 1500)
+        since_ = now;
+    direction_ = direction;
+    last_ = now;
+    if (!direction || now - since_ < (direction < 0 ? 1500 : 8000))
+        return current;
+    since_ = now;
+    return VideoQuality(int(current) + direction);
 }
 
 static bool supportedPicture(quint32 w, quint32 h)
@@ -39,8 +62,9 @@ QSize desktopSize(QSize source, VideoQuality quality)
         return {};
     QSize limit = quality == VideoQuality::UHD   ? QSize(3840, 2160)
                   : quality == VideoQuality::QHD ? QSize(2560, 1440)
+                  : quality == VideoQuality::HD  ? QSize(1280, 720)
                                                  : QSize(1920, 1080);
-    if (quality != VideoQuality::FullHD && source.height() > source.width())
+    if (quality > VideoQuality::FullHD && source.height() > source.width())
         limit.transpose();
     if (source.width() > limit.width() || source.height() > limit.height())
         source.scale(limit, Qt::KeepAspectRatio);

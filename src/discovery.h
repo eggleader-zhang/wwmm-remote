@@ -21,6 +21,7 @@ struct NearbyDevice {
     bool keyboardMouse = false;
     bool extendedDesktop = false;
     bool richMedia = false;
+    bool adaptiveVideo = false;
     bool operator==(const NearbyDevice &) const = default;
 };
 

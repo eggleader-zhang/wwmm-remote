@@ -55,8 +55,8 @@ struct DesktopControls::Callbacks {
     }
 };
 
-DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
-    : QWidget(parent), session_(session)
+DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, QWidget *parent)
+    : QWidget(parent), session_(session), discovery_(discovery)
 {
     column_ = new QVBoxLayout(this);
     column_->setContentsMargins(0, 0, 0, 0);
@@ -77,7 +77,7 @@ DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
     connect(&session, &DesktopSession::soundChanged, this, &DesktopControls::updateSound);
     connect(&session, &DesktopSession::qualityChanged, this, [this] {
         if (viewer_)
-            viewer_->showQuality(session_.quality());
+            viewer_->showQuality(session_.qualityLimit(), session_.quality());
     });
     connect(&session, &DesktopSession::notice, this, [this](const QString &message) {
         if (viewer_)
@@ -99,6 +99,7 @@ DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
     });
     connect(stop_, &QPushButton::clicked, this, [this] { session_.stop(); });
     connect(&session, &DesktopSession::changed, this, &DesktopControls::updateState);
+    connect(&discovery, &Discovery::changed, this, &DesktopControls::updateReconnect);
     connect(&session, &DesktopSession::displaySwitched, this, &DesktopControls::switchDisplay);
     connect(&session, &DesktopSession::displaysChanged, this, [this] {
         if (viewer_)
@@ -185,15 +186,17 @@ DesktopControls::~DesktopControls()
     endMedia();
 }
 
-void DesktopControls::retireMedia()
+void DesktopControls::retireMedia(bool keepInput)
 {
-    focusTimer_->stop();
+    if (!keepInput) {
+        focusTimer_->stop();
+        dragging_ = false;
+        input_.reset();
+        inputSink_.reset();
+        lastFocus_.reset();
+    }
     settleMotion_.stop();
-    dragging_ = false;
-    input_.reset();
-    inputSink_.reset();
     focusPending_ = false;
-    lastFocus_.reset();
     if (callbacks_) {
         QMutexLocker lock(&callbacks_->mutex);
         callbacks_->target = nullptr;
@@ -242,7 +245,7 @@ void DesktopControls::updateSound()
                              });
 }
 
-void DesktopControls::endMedia()
+void DesktopControls::endMedia(bool keepViewer)
 {
     closeSound();
     retireMedia();
@@ -250,12 +253,36 @@ void DesktopControls::endMedia()
     delete transfer_;
     transfer_ = nullptr;
     if (viewer_) {
+        viewer_->allowFileDrops(false);
+        if (keepViewer) {
+            viewer_->inputSurface()->changeDisplay();
+            viewer_->inputSurface()->setInputFocus(InputFocus::Raw);
+            return;
+        }
         viewer_->disconnect(this);
         viewer_->inputSurface()->disconnect(this);
         viewer_->hide();
         viewer_->deleteLater();
         viewer_ = nullptr;
     }
+}
+
+std::optional<NearbyDevice> DesktopControls::reconnectPeer() const
+{
+    for (const auto &peer : discovery_.devices())
+        if (peer.key == session_.peerKey() && peer.readonlyDesktop && (!session_.interactive() || peer.keyboardMouse))
+            return peer;
+    return {};
+}
+
+void DesktopControls::updateReconnect()
+{
+    if (!viewer_ || session_.state() != DesktopSession::Interrupted)
+        return;
+    const bool online = reconnectPeer().has_value();
+    const auto text = online ? tr("%1 已上线。重新连接后，对方需要再次同意。")
+                             : tr("正在等待 %1 回到局域网…");
+    viewer_->showInterrupted(text.arg(session_.peerName()), online);
 }
 
 void DesktopControls::updateState()
@@ -275,11 +302,20 @@ void DesktopControls::updateState()
     case DesktopSession::Idle:
         endMedia();
         break;
+    case DesktopSession::Interrupted:
+        endMedia(true);
+        label_->setText(tr("与 %1 的会话已中断。").arg(name));
+        updateReconnect();
+        break;
     case DesktopSession::Connecting:
         label_->setText(tr("正在验证设备身份…"));
+        if (viewer_)
+            viewer_->showInterrupted(label_->text(), false);
         break;
     case DesktopSession::Waiting:
         label_->setText(tr("等待 %1 同意桌面请求…").arg(name));
+        if (viewer_)
+            viewer_->showInterrupted(label_->text(), false);
         break;
     case DesktopSession::Requested: {
         label_->setText(
@@ -319,8 +355,8 @@ void DesktopControls::addTransferBar()
     transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this);
     if (viewer_) {
         viewer_->addTools(transfer_);
-        connect(viewer_, &DesktopViewer::fileDropped, &data, &SessionData::offerFile);
-        connect(&data, &SessionData::changed, viewer_, [this] {
+        connect(viewer_, &DesktopViewer::fileDropped, transfer_, [&data](const QString &path) { data.offerFile(path); });
+        connect(&data, &SessionData::changed, transfer_, [this] {
             auto &link = session_.dataLink();
             if (viewer_)
                 viewer_->allowFileDrops(link.ready() && link.fileState() == SessionData::NoFile);
@@ -329,9 +365,9 @@ void DesktopControls::addTransferBar()
         column_->addWidget(transfer_);
 }
 
-void DesktopControls::switchDisplay()
+void DesktopControls::switchDisplay(bool formatOnly)
 {
-    retireMedia();
+    retireMedia(formatOnly);
     if (session_.state() == DesktopSession::Sharing) {
         QString name;
         for (const auto &d : session_.displays())
@@ -341,16 +377,17 @@ void DesktopControls::switchDisplay()
             tr("%1 正在%2 %3")
                 .arg(session_.peerName(), session_.interactive() ? tr("控制") : tr("查看"), name));
         startCapture();
-        if (session_.interactive()) {
+        if (session_.interactive() && !formatOnly) {
             inputSink_ = createInputSink(session_.displayId());
             input_ = std::make_unique<HostInput>(session_.peerOS(), localOS(), *inputSink_);
             focusTimer_->start();
             refreshInputFocus();
         }
     } else if (viewer_) {
-        viewer_->inputSurface()->changeDisplay();
+        if (!formatOnly)
+            viewer_->inputSurface()->changeDisplay();
         viewer_->setDisplays(session_.displays(), session_.displayId());
-        viewer_->setStatus(tr("正在切换显示器…"));
+        viewer_->setStatus(formatOnly ? tr("正在调整画质…") : tr("正在切换显示器…"));
         startPlayer();
     }
 }
@@ -424,7 +461,18 @@ void DesktopControls::startCapture()
 void DesktopControls::openViewer()
 {
     const bool control = session_.interactive();
+    if (viewer_) {
+        viewer_->showDesktop(session_.richMedia());
+        if (control)
+            viewer_->focusVideo();
+        return;
+    }
     viewer_ = new DesktopViewer(this, control, session_.richMedia());
+    connect(viewer_, &DesktopViewer::reconnectRequested, this, [this] {
+        if (session_.state() == DesktopSession::Interrupted)
+            if (auto peer = reconnectPeer())
+                session_.view(*peer, session_.interactive());
+    });
     connect(viewer_, &DesktopViewer::qualityRequested, &session_, &DesktopSession::chooseQuality);
     connect(viewer_, &DesktopViewer::soundRequested, &session_, &DesktopSession::enableSound);
     viewer_->setWindowTitle((control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(session_.peerName()));
@@ -451,7 +499,7 @@ void DesktopControls::openViewer()
     auto *timer = new QTimer(viewer_);
     timer->setInterval(1000);
     const auto mode = control ? tr("控制") : tr("只读");
-    connect(timer, &QTimer::timeout, viewer_, [this, mode, shown = false]() mutable {
+    connect(timer, &QTimer::timeout, viewer_, [this, mode] {
         auto gate = callbacks_;
         if (!viewer_ || !gate)
             return;
@@ -460,9 +508,8 @@ void DesktopControls::openViewer()
             session_.refreshVideo();
         int count = gate->presented.exchange(0);
         if (count) {
-            shown = true;
             viewer_->setStatus(tr("%1 · H.264 · 最近一秒显示 %2 帧").arg(mode).arg(count));
-        } else if (shown)
+        } else if (!gate->firstPicture)
             viewer_->setStatus(tr("%1 · H.264 · 保持当前画面").arg(mode));
     });
     timer->start();

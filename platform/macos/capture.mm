@@ -25,6 +25,7 @@ struct MacCaptureState : std::enable_shared_from_this<MacCaptureState> {
     SCStream *stream = nil;
     WWMMScreenOutput *sink = nil;
     std::unique_ptr<MacVideoEncoder> encoder;
+    int requestedRate = 0;
     CVPixelBufferRef latest = nullptr;
     std::atomic_bool stopped{false};
     bool force = true, dirty = false, retryScheduled = false;
@@ -116,7 +117,7 @@ class MacCapture final : public DesktopCapture
                                          cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
                                          s->encoder =
                                              std::make_unique<MacVideoEncoder>(s->output, s->failure);
-                                         if (!s->encoder->open(size, qualityBitrate(quality)))
+                                         if (!s->encoder->open(size, s->requestedRate ? s->requestedRate : qualityBitrate(quality)))
                                              return;
                                          s->sink = [WWMMScreenOutput new];
                                          s->sink->owner = s;
@@ -145,6 +146,7 @@ class MacCapture final : public DesktopCapture
     {
         auto s = s_;
         dispatch_async(s->queue, ^{
+          s->requestedRate = rate;
           if (!s->stopped && s->encoder)
               s->encoder->setBitrate(rate);
         });

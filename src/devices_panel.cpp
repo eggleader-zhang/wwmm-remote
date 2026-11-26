@@ -113,7 +113,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     codeView->setTextInteractionFlags(Qt::TextSelectableByMouse);
     localLayout->addWidget(codeView);
     layout->addWidget(local);
-    layout->addWidget(new DesktopControls(*desktop,this));
+    layout->addWidget(new DesktopControls(*desktop, discovery, this));
 
     auto *near = new QGroupBox(tr("附近设备"), this);
     auto *nearLayout = new QVBoxLayout(near);
@@ -301,7 +301,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
             }
     });
     watchDesktopPower(this, [desktop, status, &probe, &discovery](bool awake) {
-        desktop->stop(QObject::tr("电脑已休眠，本次桌面授权已结束。"));
+        desktop->interrupt(QObject::tr("电脑已休眠，本次桌面授权已结束。"));
         if (awake) {
             probe.refresh();
             discovery.restart();

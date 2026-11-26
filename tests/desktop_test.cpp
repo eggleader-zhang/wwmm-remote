@@ -485,13 +485,27 @@ class DesktopTest final : public QObject
         QCOMPARE(received.size(), 5);
     }
 
+    void adaptiveResolution()
+    {
+        AdaptiveResolution policy;
+        auto tier = VideoQuality::FullHD;
+        for (int ms = 0; ms <= 1500; ms += 500)
+            tier = policy.observe(tier, VideoQuality::FullHD, ms, 12, 3, false);
+        QCOMPARE(tier, VideoQuality::HD);
+        QCOMPARE(desktopSize({2560, 1440}, tier), QSize(1280, 720));
+        QCOMPARE(policy.observe(tier, VideoQuality::FullHD, 30000, 0, 3, false), tier);
+        for (int ms = 30500; ms <= 50000; ms += 500)
+            tier = policy.observe(tier, VideoQuality::FullHD, ms, 0, 3, false);
+        QCOMPARE(tier, VideoQuality::FullHD);
+    }
+
     void officeSession()
     {
         Node viewer, host;
         host.trust(viewer);
         viewer.trust(host);
         auto peer = host.target();
-        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = peer.richMedia = true;
+        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = peer.richMedia = peer.adaptiveVideo = true;
         viewer.session.view(peer, true);
         QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
         auto &sender = viewer.session.dataLink();
@@ -507,8 +521,14 @@ class DesktopTest final : public QObject
         viewer.session.picturePresented();
         viewer.session.chooseDisplay(2);
         QTRY_COMPARE(viewer.session.displayId(), 2u);
+        host.session.sendFrame(fixture(), rtpTime(videoClockUs()), true);
+        QTRY_COMPARE(frames.size(), 2);
+        viewer.session.picturePresented();
+        QSignalSpy keys(&host.session, &DesktopSession::inputReceived);
         viewer.session.chooseQuality(VideoQuality::QHD);
         QTRY_COMPARE(viewer.session.quality(), VideoQuality::QHD);
+        viewer.session.sendInput(keyEvent(InputKind::KeyDown, 4, 0, 'A'));
+        QTRY_COMPARE(keys.size(), 1);
         QCOMPARE(desktopSize({3840, 2160}, viewer.session.quality()), QSize(2560, 1440));
         viewer.session.chooseQuality(VideoQuality::UHD);
         QTRY_COMPARE(viewer.session.quality(), VideoQuality::UHD);
@@ -576,8 +596,16 @@ class DesktopTest final : public QObject
         QFile result(saved);
         QVERIFY(result.open(QIODevice::ReadOnly));
         QCOMPARE(result.readAll(), bytes);
+        host.session.interrupt(QStringLiteral("network changed"));
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Interrupted);
+        QVERIFY(!sender.ready() && !viewer.session.localSound() && !sender.clipboardEnabled());
+        viewer.session.view(peer, false);
+        QCOMPARE(viewer.session.state(), DesktopSession::Interrupted);
+        viewer.session.view(peer, true);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        QVERIFY(!receiver.ready());
         host.session.stop();
-        QTRY_VERIFY(!sender.ready() && viewer.session.state() == DesktopSession::Idle);
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
     }
 
     void noTrustNoScreen()

@@ -17,7 +17,7 @@ public:
 
   static constexpr int maxDataFrame = 16384 + 64;
   void start();
-  void stop(const QString &reason);
+  void stop(const QString &reason, bool transportLost = false);
   void finish(const QByteArray &lastMessage);
   bool send(const QByteArray &message);
   QByteArray mediaKeys(bool audio = false) const;
@@ -25,7 +25,7 @@ public:
 signals:
     void authenticated();
     void message(const QByteArray &data);
-    void closed(const QString &reason);
+    void closed(const QString &reason, bool transportLost);
 
 private:
     static ssl_verify_result_t verify(SSL *ssl, uint8_t *alert);

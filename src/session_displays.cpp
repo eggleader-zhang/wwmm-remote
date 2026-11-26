@@ -39,7 +39,7 @@ void DesktopSession::updateHostDisplays(QList<DesktopDisplay> available, bool re
         displays_ = std::move(available);
         if (extended_) {
             if (!control_->send("L"))
-                return stop(tr("显示器列表连接已断开。"));
+                return interrupt(tr("显示器列表连接已断开。"));
             for (const auto &d : displays_) {
                 QByteArray msg = selection('d', d.id);
                 msg.resize(14);
@@ -48,10 +48,10 @@ void DesktopSession::updateHostDisplays(QList<DesktopDisplay> available, bool re
                 msg[13] = d.primary ? 1 : 0;
                 msg += d.name.left(55).toUtf8();
                 if (!control_->send(msg))
-                    return stop(tr("显示器列表连接已断开。"));
+                    return interrupt(tr("显示器列表连接已断开。"));
             }
             if (!control_->send("l"))
-                return stop(tr("显示器列表连接已断开。"));
+                return interrupt(tr("显示器列表连接已断开。"));
         }
         emit displaysChanged();
     }
@@ -62,22 +62,22 @@ void DesktopSession::updateHostDisplays(QList<DesktopDisplay> available, bool re
     }
 }
 
-void DesktopSession::startDisplay(quint64 id)
+void DesktopSession::startDisplay(quint64 id, bool formatOnly)
 {
     display_ = id;
-    displayReady_ = !extended_;
+    displayReady_ = formatOnly || !extended_;
     if (extended_) {
         // Both capture backends timestamp frames on this same monotonic 90 kHz clock.
         boundary_ = rtpTime(videoClockUs());
-        auto msg = selection('T', id);
+        auto msg = selection(formatOnly ? 't' : 'T', id);
         msg.resize(13);
         qToBigEndian(boundary_, msg.data() + 9);
         if (!control_->send(msg))
-            return stop(tr("显示器连接已断开。"));
+            return interrupt(tr("显示器连接已断开。"));
     }
     lastSent_.reset();
     stillFrame_.stop();
-    emit displaySwitched();
+    emit displaySwitched(formatOnly);
 }
 
 void DesktopSession::chooseDisplay(quint64 id)
@@ -91,7 +91,7 @@ void DesktopSession::chooseDisplay(quint64 id)
         return;
     displayReady_ = false;
     if (!control_->send(selection('S', id)))
-        stop(tr("无法切换显示器。"));
+        interrupt(tr("无法切换显示器。"));
 }
 
 bool DesktopSession::displayMessage(const QByteArray &msg)
@@ -118,22 +118,24 @@ bool DesktopSession::displayMessage(const QByteArray &msg)
         displays_ = std::move(announced_);
         listing_ = false;
         emit displaysChanged();
-    } else if (state_ == Viewing && op == 'T' && msg.size() == 13) {
+    } else if (state_ == Viewing && (op == 'T' || (adaptive_ && op == 't')) && msg.size() == 13) {
         const auto id = qFromBigEndian<quint64>(msg.constData() + 1);
-        if (findDisplay(displays_, id) == displays_.cend())
+        const bool formatOnly = op == 't';
+        if (findDisplay(displays_, id) == displays_.cend() || (formatOnly && display_ != id))
             return false;
         display_ = id;
-        displayReady_ = false;
+        if (!formatOnly)
+            displayReady_ = false;
         needDisplayIdr_ = true;
         boundary_ = qFromBigEndian<quint32>(msg.constData() + 9);
         lastReceived_.reset();
         wanted_.reset();
         received_ = false;
         stateClock_.restart();
-        if (interactive_)
+        if (interactive_ && !formatOnly)
             sendInput(InputEvent{});
         if (state_ == Viewing) {
-            emit displaySwitched();
+            emit displaySwitched(formatOnly);
             refreshVideo();
         }
     } else
@@ -148,7 +150,7 @@ void DesktopSession::picturePresented()
     QByteArray reply(5, 'R');
     qToBigEndian(boundary_, reply.data() + 1);
     if (!control_->send(reply))
-        return stop(tr("显示器连接已断开。"));
+        return interrupt(tr("显示器连接已断开。"));
     displayReady_ = true;
     emit displaysChanged();
 }

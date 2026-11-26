@@ -5,6 +5,7 @@
 #include <QCheckBox>
 #include <QDragEnterEvent>
 #include <QSignalBlocker>
+#include <QStackedWidget>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
@@ -20,7 +21,22 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     video_ = QWidget::createWindowContainer(surface_, this);
     video_->setFocusPolicy(interactive ? Qt::StrongFocus : Qt::NoFocus);
     video_->setMinimumSize(320, 180);
-    column_->addWidget(video_, 1);
+    pages_ = new QStackedWidget(this);
+    pages_->addWidget(video_);
+    auto *offline = new QWidget(pages_);
+    auto *actions = new QVBoxLayout(offline);
+    interrupted_ = new QLabel(offline);
+    interrupted_->setTextFormat(Qt::PlainText);
+    interrupted_->setWordWrap(true);
+    retry_ = new QPushButton(tr("重新连接"), offline);
+    retry_->setAutoDefault(false);
+    actions->addStretch();
+    actions->addWidget(interrupted_, 0, Qt::AlignCenter);
+    actions->addWidget(retry_, 0, Qt::AlignCenter);
+    actions->addStretch();
+    pages_->addWidget(offline);
+    column_->addWidget(pages_, 1);
+    connect(retry_, &QPushButton::clicked, this, &DesktopViewer::reconnectRequested);
     auto *row = new QHBoxLayout;
     status_ = new QLabel(tr("等待第一帧…"), this);
     row->addWidget(status_, 1);
@@ -34,7 +50,7 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
         emit displayRequested(displays_->itemData(index).toULongLong());
         focusVideo();
     });
-    if (rich) {
+    {
         quality_ = new QComboBox(this);
         quality_->setEnabled(false);
         quality_->setAccessibleName(tr("最高画质"));
@@ -63,7 +79,7 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
             preedit->setText(preedit->fontMetrics().elidedText(value, Qt::ElideRight, 220));
             preedit->setVisible(!value.isEmpty());
         });
-        auto *switchApp = new QPushButton(tr("切换远端应用"), this);
+        auto *switchApp = switchApp_ = new QPushButton(tr("切换远端应用"), this);
         switchApp->setEnabled(false);
         connect(surface_, &InputWindow::firstPictureShown, switchApp,
                 [switchApp] { switchApp->setEnabled(true); });
@@ -79,6 +95,7 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     row->addWidget(end);
     column_->addLayout(row);
     connect(end, &QPushButton::clicked, this, &QDialog::accept);
+    showDesktop(rich);
     resize(960, 600);
 }
 
@@ -101,10 +118,38 @@ void DesktopViewer::setDisplays(const QList<DesktopDisplay> &list, quint64 selec
         quality_->setEnabled(selected != 0);
 }
 
-void DesktopViewer::showQuality(VideoQuality quality)
+void DesktopViewer::showQuality(VideoQuality limit, VideoQuality active)
 {
-    if (quality_)
-        quality_->setCurrentIndex(int(quality));
+    const QStringList titles{tr("1080p · 办公"), tr("1440p"), tr("4K")};
+    const QStringList rates{tr("720p"), tr("1080p"), tr("1440p"), tr("4K")};
+    for (int i = 0; i < titles.size(); ++i)
+        quality_->setItemText(i, i == int(limit) && active != limit
+                                    ? tr("%1（当前 %2）").arg(titles[i], rates[int(active) + 1])
+                                    : titles[i]);
+    quality_->setCurrentIndex(int(limit));
+}
+
+void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
+{
+    pages_->setCurrentIndex(1);
+    interrupted_->setText(message);
+    retry_->setEnabled(canRetry);
+    displays_->hide();
+    quality_->hide();
+    sound_->hide();
+    if (switchApp_)
+        switchApp_->setEnabled(false);
+}
+
+void DesktopViewer::showDesktop(bool rich)
+{
+    pages_->setCurrentIndex(0);
+    quality_->setVisible(rich);
+    sound_->setVisible(rich);
+    showQuality(VideoQuality::FullHD, VideoQuality::FullHD);
+    setDisplays({}, 0);
+    showSound(false, false);
+    setStatus(tr("等待第一帧…"));
 }
 
 void DesktopViewer::showSound(bool local, bool peer)

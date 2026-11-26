@@ -80,6 +80,7 @@ struct VideoLink::Impl {
     DefaultTrials trials;
     webrtc::AimdRateControl rate{trials, true};
     int bitrate = videoBitrate, ceiling = videoBitrate;
+    bool backlogged = false;
     qint64 sentBytes = 0, reportTime = 0;
     std::optional<quint32> highest, lastTransit;
     quint32 base = 0, previousExpected = 0, previousCount = 0, receivedCount = 0;
@@ -153,19 +154,22 @@ bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys, const 
            configure(p_->inbound, p_->sending ? viewerKey : senderKey, p_->sending ? viewerSsrc : videoSsrc);
 }
 
-void VideoLink::setQuality(VideoQuality quality)
+void VideoLink::setQuality(VideoQuality quality, bool keepEstimate)
 {
     const auto ceiling = qualityBitrate(quality);
     if (ceiling == p_->ceiling)
         return;
-    p_->bitrate = p_->ceiling = ceiling;
-    p_->rate.SetEstimate(webrtc::DataRate::BitsPerSec(ceiling),
+    p_->ceiling = ceiling;
+    p_->bitrate = keepEstimate ? std::min(p_->bitrate, ceiling) : ceiling;
+    p_->rate.SetEstimate(webrtc::DataRate::BitsPerSec(p_->bitrate),
                          webrtc::Timestamp::Millis(p_->clock.elapsed()));
-    p_->budget.set_target_rate_kbps(ceiling * 7 / 1000);
+    p_->budget.set_target_rate_kbps(std::max(40000, p_->bitrate * 7 / 1000));
     p_->pending.clear();
     p_->pendingIdr.reset();
     p_->refreshAfterDrain = false;
     p_->needIdr = true;
+    p_->backlogged = false;
+    emit bitrateChanged(p_->bitrate);
 }
 
 void VideoLink::setAudio(std::shared_ptr<AudioStream> stream)
@@ -215,6 +219,7 @@ void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
     // abandoning dependent pictures, otherwise a large 4K keyframe could be starved forever.
     const size_t backlog = size_t(std::clamp(p_->bitrate / 24000, 80, 700));
     if (p_->pending.size() > backlog) {
+        p_->backlogged = true;
         p_->needIdr = true;
         if (p_->pendingIdr) {
             p_->refreshAfterDrain = true;
@@ -263,7 +268,7 @@ void VideoLink::tick()
             qFromBigEndian<quint32>(packet.constData() + 4) == *p_->pendingIdr)
             p_->pendingIdr.reset();
         if (!seal(p_->outbound, packet, false) || !p_->write(packet)) {
-            emit failed(tr("无法发送局域网视频。"));
+            emit transportLost(tr("无法发送局域网视频。"));
             return;
         }
         p_->budget.UseBudget(size_t(packet.size()));
@@ -521,6 +526,10 @@ void VideoLink::onFeedback(const QByteArray &data)
         if (elapsed < 250)
             return;
         int fraction = quint8(data[12]);
+        const bool backlog = p_->backlogged;
+        p_->backlogged = false;
+        if (elapsed <= 1500 && p_->sentBytes >= 8192)
+            emit receptionSample(now, fraction, int(qFromBigEndian<quint32>(data.constData() + 20) / 90), backlog);
         const auto estimated = webrtc::DataRate::BitsPerSec(
             std::max<qint64>(1, p_->sentBytes * 8000 / elapsed * (256 - fraction) / 256));
         p_->sentBytes = 0;
