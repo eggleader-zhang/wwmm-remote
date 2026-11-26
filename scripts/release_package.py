@@ -3,7 +3,6 @@ import argparse
 import os
 from pathlib import Path
 import re
-import shutil
 import struct
 import subprocess
 import tempfile
@@ -34,19 +33,22 @@ def windows_machine(path):
 
 
 def package_windows(stage, archive, arch):
-    # App-local MSVC libraries also allow a clean Windows installation to launch the portable exe.
-    crt_dir = Path(os.environ["VCToolsRedistDir"]) / arch
-    crt = next(crt_dir.glob("Microsoft.VC*.CRT"))
-    for library in crt.glob("*.dll"):
-        shutil.copy2(library, stage)
     required = [f"{APP}.exe", "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll",
-                "Qt6Concurrent.dll", "vcruntime140.dll", "msvcp140.dll", "plugins/platforms/qwindows.dll"]
+                "plugins/platforms/qwindows.dll", f"vc_redist.{arch}.exe"]
     for name in required:
         require_file(stage / name)
     machine = {"x64": 0x8664, "arm64": 0xaa64}[arch]
-    for binary in [stage / required[0], *stage.rglob("*.dll")]:
-        if windows_machine(binary) != machine:
+    binaries = [stage / required[0], *stage.rglob("*.dll")]
+    for binary in binaries:
+        actual = windows_machine(binary)
+        hybrid_dll = arch == "arm64" and binary.suffix.lower() == ".dll" and actual == 0xa64e
+        if actual != machine and not hybrid_dll:
             raise ValueError(f"{binary.name} has the wrong architecture for {arch}")
+    # Template-only uses of QtConcurrent can be fully inlined. Check the linked imports.
+    imports = subprocess.check_output(["dumpbin", "/nologo", "/dependents", *binaries],
+                                      text=True, errors="replace")
+    for name in set(re.findall(r"^\s*(Qt6[\w-]+\.dll)\s*$", imports, re.IGNORECASE | re.MULTILINE)):
+        require_file(stage / name)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
         for path in sorted(stage.rglob("*")):
             if path.is_file():
