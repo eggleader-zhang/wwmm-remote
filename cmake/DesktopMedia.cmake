@@ -13,12 +13,23 @@ function(wwmm_add_desktop_media)
         URL https://codeload.github.com/cisco/libsrtp/tar.gz/refs/tags/v2.8.1
         URL_HASH SHA256=ef5569220749529d778013aae1178391d972570a2b4f7288dda22effa875b07c
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR wwmm-populate-only)
-    FetchContent_MakeAvailable(webrtc_src media_absl media_srtp)
+    FetchContent_Declare(media_opus
+        URL https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz
+        URL_HASH SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR wwmm-populate-only)
+    FetchContent_MakeAvailable(webrtc_src media_absl media_srtp media_opus)
     set(LIBSRTP_TEST_APPS OFF)
     set(ENABLE_WARNINGS_AS_ERRORS OFF)
     set(BUILD_SHARED_LIBS OFF)
     set(CMAKE_AUTOMOC OFF)
     set(CMAKE_AUTOUIC OFF)
+    set(BUILD_TESTING OFF)
+    set(OPUS_BUILD_TESTING OFF)
+    set(OPUS_BUILD_PROGRAMS OFF)
+    set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF)
+    set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF)
+    add_subdirectory("${media_opus_SOURCE_DIR}" "${media_opus_BINARY_DIR}" EXCLUDE_FROM_ALL)
+    set(WWMM_OPUS_SOURCE "${media_opus_SOURCE_DIR}" PARENT_SCOPE)
     add_subdirectory("${media_srtp_SOURCE_DIR}" "${media_srtp_BINARY_DIR}" EXCLUDE_FROM_ALL)
     set(ABSL_ENABLE_INSTALL OFF)
     add_subdirectory("${media_absl_SOURCE_DIR}" "${media_absl_BINARY_DIR}" EXCLUDE_FROM_ALL)

@@ -6,6 +6,8 @@
 #include <QVBoxLayout>
 #include "video_packets.h"
 #include <QApplication>
+#include <QCheckBox>
+#include <QSignalBlocker>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMutex>
@@ -22,7 +24,7 @@ struct DesktopControls::Callbacks {
     DesktopControls *target;
     std::atomic_int queued{0}, presented{0};
     std::atomic<quint32> displayedStamp{0};
-    std::optional<quint32> receivedStamp;
+    std::optional<quint32> receivedStamp, capturedStamp;
     std::atomic_bool needsIdr{false}, firstPicture{true};
 
     explicit Callbacks(DesktopControls *target) : target(target) {}
@@ -44,8 +46,12 @@ struct DesktopControls::Callbacks {
 
     static MediaError error(std::shared_ptr<Callbacks> gate)
     {
-        return
-            [gate](QString error) { post(gate, [error](DesktopControls *ui) { ui->session_.stop(error); }); };
+        return [gate](QString error) {
+            post(gate, [error](DesktopControls *ui) {
+                if (!ui->session_.reduceQuality())
+                    ui->session_.stop(error);
+            });
+        };
     }
 };
 
@@ -64,6 +70,19 @@ DesktopControls::DesktopControls(DesktopSession &session, QWidget *parent)
     stop_ = new QPushButton(this);
     stop_->setObjectName("endDesktop");
     row->addWidget(label_, 1);
+    soundCheck_ = new QCheckBox(tr("共享系统声音"), this);
+    soundCheck_->hide();
+    row->addWidget(soundCheck_);
+    connect(soundCheck_, &QCheckBox::toggled, &session, &DesktopSession::enableSound);
+    connect(&session, &DesktopSession::soundChanged, this, &DesktopControls::updateSound);
+    connect(&session, &DesktopSession::qualityChanged, this, [this] {
+        if (viewer_)
+            viewer_->showQuality(session_.quality());
+    });
+    connect(&session, &DesktopSession::notice, this, [this](const QString &message) {
+        if (viewer_)
+            viewer_->setStatus(message);
+    });
     row->addWidget(yes_);
     row->addWidget(stop_);
     focusTimer_ = new QTimer(this);
@@ -184,8 +203,48 @@ void DesktopControls::retireMedia()
     callbacks_.reset();
 }
 
+void DesktopControls::closeSound()
+{
+    if (soundCallbacks_) {
+        QMutexLocker guard(&soundCallbacks_->mutex);
+        soundCallbacks_->target = nullptr;
+    }
+    audio_.reset();
+    soundCallbacks_.reset();
+    audioStream_.reset();
+}
+
+void DesktopControls::updateSound()
+{
+    const bool local = session_.localSound(), peer = session_.peerSound();
+    if (viewer_)
+        viewer_->showSound(local, peer);
+    {
+        QSignalBlocker block(soundCheck_);
+        soundCheck_->setChecked(local);
+        soundCheck_->setText(!local && peer ? tr("对方请求系统声音")
+                                            : (local && !peer ? tr("等待对方收听") : tr("共享系统声音")));
+    }
+    auto stream = session_.sound();
+    if (audioStream_ == stream)
+        return;
+    closeSound();
+    if (!stream)
+        return;
+    audioStream_ = stream;
+    auto gate = soundCallbacks_ = std::make_shared<Callbacks>(this);
+    audio_ = openSystemAudio(session_.state() == DesktopSession::Sharing, std::move(stream),
+                             [gate](QString reason) {
+                                 Callbacks::post(gate, [reason](DesktopControls *ui) {
+                                     ui->session_.enableSound(false);
+                                     emit ui->session_.notice(reason);
+                                 });
+                             });
+}
+
 void DesktopControls::endMedia()
 {
+    closeSound();
     retireMedia();
     topology_.stop();
     delete transfer_;
@@ -205,6 +264,7 @@ void DesktopControls::updateState()
     const bool control = session_.interactive();
     setVisible(s != DesktopSession::Idle);
     yes_->setVisible(s == DesktopSession::Requested);
+    soundCheck_->setVisible(s == DesktopSession::Sharing && session_.richMedia());
     yes_->setText(control ? tr("允许本次控制") : tr("允许本次查看"));
     stop_->setText(s == DesktopSession::Requested ? tr("拒绝")
                    : s == DesktopSession::Sharing ? (control ? tr("停止控制") : tr("停止共享"))
@@ -237,6 +297,7 @@ void DesktopControls::updateState()
         break;
     }
     case DesktopSession::Sharing:
+        updateSound();
         if (control && session_.extended())
             addTransferBar();
         session_.updateHostDisplays(desktopDisplays());
@@ -337,6 +398,10 @@ void DesktopControls::startCapture()
                 gate->needsIdr = false;
             Callbacks::post(gate, [gate, data = std::move(data), stamp, key](DesktopControls *ui) mutable {
                 --gate->queued;
+                if (ui->session_.quality() != VideoQuality::FullHD && gate->capturedStamp &&
+                    quint32(stamp - *gate->capturedStamp) < 9000)
+                    ui->settleMotion_.start();
+                gate->capturedStamp = stamp;
                 ui->session_.sendFrame(std::move(data), stamp, key);
             });
         },
@@ -348,18 +413,20 @@ void DesktopControls::startCapture()
                     const auto displays = desktopDisplays();
                     if (ui->session_.extended() && displays != ui->session_.displays())
                         ui->session_.updateHostDisplays(displays, true);
-                    else
+                    else if (!ui->session_.reduceQuality())
                         ui->session_.stop(error);
                 });
             });
         },
-        session_.displayId());
+        session_.displayId(), session_.quality());
 }
 
 void DesktopControls::openViewer()
 {
     const bool control = session_.interactive();
-    viewer_ = new DesktopViewer(this, control);
+    viewer_ = new DesktopViewer(this, control, session_.richMedia());
+    connect(viewer_, &DesktopViewer::qualityRequested, &session_, &DesktopSession::chooseQuality);
+    connect(viewer_, &DesktopViewer::soundRequested, &session_, &DesktopSession::enableSound);
     viewer_->setWindowTitle((control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(session_.peerName()));
     connect(viewer_, &DesktopViewer::displayRequested, &session_, &DesktopSession::chooseDisplay);
     if (control) {

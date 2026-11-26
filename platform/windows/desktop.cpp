@@ -404,7 +404,8 @@ QByteArray parameterSets(IMFTransform *mft, DWORD id, int &lengthSize)
     }
     return out;
 }
-std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size)
+
+std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size, int bitrate)
 {
     MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12},
         output{MFMediaType_Video, MFVideoFormat_H264};
@@ -422,7 +423,7 @@ std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size)
                     auto t = std::make_unique<Transform>();
                     t->setup(candidate.Get(), gpu);
                     auto compressed = videoType(MFVideoFormat_H264, size);
-                    compressed->SetUINT32(MF_MT_AVG_BITRATE, videoBitrate);
+                    compressed->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
                     compressed->SetUINT32(MF_MT_MPEG2_PROFILE, 77);
                     auto raw = videoType(MFVideoFormat_NV12, size);
                     codecValue(candidate.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -463,6 +464,7 @@ class WinCapture final : public DesktopCapture
     EncodedFrame output_;
     MediaError failure_;
     quint64 display_;
+    VideoQuality quality_;
     std::atomic_bool stopped_{false}, refresh_{true};
     std::atomic_int requestedRate_{0};
     std::atomic<qint64> responsiveUntil_{0};
@@ -474,9 +476,9 @@ class WinCapture final : public DesktopCapture
         ComPtr<IDXGIOutputDuplication> dup;
         check(gpu.output->DuplicateOutput(gpu.device.Get(), &dup), "无法复制当前用户的桌面");
         auto rect = gpu.screen.DesktopCoordinates;
-        auto size = desktopSize({int(rect.right - rect.left), int(rect.bottom - rect.top)});
+        auto size = desktopSize({int(rect.right - rect.left), int(rect.bottom - rect.top)}, quality_);
         DesktopPointer pointer(gpu.device.Get(), gpu.context.Get(), gpu.screen.Rotation);
-        auto encoder = hardwareEncoder(gpu, size);
+        auto encoder = hardwareEncoder(gpu, size, qualityBitrate(quality_));
         auto pool = encoderSurfaces(gpu, *encoder, size);
         ComPtr<ID3D11Texture2D> desktop;
         QSize inputSize;
@@ -575,8 +577,9 @@ class WinCapture final : public DesktopCapture
     }
 
   public:
-    WinCapture(EncodedFrame output, MediaError failure, quint64 display)
-        : output_(std::move(output)), failure_(std::move(failure)), display_(display), thread_([this] {
+    WinCapture(EncodedFrame output, MediaError failure, quint64 display, VideoQuality quality)
+        : output_(std::move(output)), failure_(std::move(failure)), display_(display), quality_(quality),
+          thread_([this] {
               try {
                   run();
               } catch (const Failure &failure) {
@@ -815,9 +818,10 @@ QList<DesktopDisplay> desktopDisplays()
     return displays;
 }
 
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display)
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
+                                               VideoQuality quality)
 {
-    return std::make_unique<WinCapture>(std::move(output), std::move(error), display);
+    return std::make_unique<WinCapture>(std::move(output), std::move(error), display, quality);
 }
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr view, PresentedFrame present, MediaError failure)
 {

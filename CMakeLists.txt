@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS deployment target")
 endif()
-project(WWMMRemote VERSION 1.0.0 LANGUAGES C CXX)
+project(WWMMRemote VERSION 1.3.0 LANGUAGES C CXX)
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -31,10 +31,10 @@ add_library(wwmm_lan STATIC
     src/session_data.cpp src/session_data.h src/session_displays.cpp
     src/desktop_input.cpp src/desktop_input.h src/input_keys.cpp
     src/video_packets.cpp src/video_packets.h
-    src/video_link.cpp src/video_link.h
+    src/video_link.cpp src/video_link.h src/session_media.cpp src/audio_stream.cpp src/audio_stream.h
     src/probe_message.cpp src/probe_message.h)
 target_include_directories(wwmm_lan PUBLIC src)
-target_link_libraries(wwmm_lan PUBLIC Qt6::Network ssl PRIVATE Qt6::Concurrent wwmm_webrtc srtp2)
+target_link_libraries(wwmm_lan PUBLIC Qt6::Network ssl PRIVATE Qt6::Concurrent wwmm_webrtc srtp2 opus)
 if(WIN32)
     target_sources(wwmm_lan PRIVATE platform/windows/vault.cpp platform/windows/discovery.cpp)
     target_link_libraries(wwmm_lan PRIVATE ws2_32 crypt32 dnsapi bcrypt)
@@ -45,20 +45,20 @@ endif()
 
 add_library(wwmm_widgets STATIC src/main_window.cpp src/main_window.h src/devices_panel.cpp src/devices_panel.h
     src/desktop_controls.cpp src/desktop_controls.h src/desktop_viewer.cpp src/desktop_viewer.h
-    src/input_window.cpp src/input_window.h src/transfer_bar.cpp src/transfer_bar.h)
+    src/input_window.cpp src/input_window.h src/transfer_bar.cpp src/transfer_bar.h src/clipboard_images.cpp src/clipboard_images.h)
 target_link_libraries(wwmm_widgets PUBLIC wwmm_lan Qt6::Widgets)
 if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)
     add_library(wwmm_native STATIC platform/macos/video_encoder.mm platform/macos/video_decoder.mm
-        platform/macos/capture.mm platform/macos/player.mm platform/macos/input.mm)
+        platform/macos/capture.mm platform/macos/player.mm platform/macos/input.mm platform/macos/audio.mm)
     set_target_properties(wwmm_native PROPERTIES OBJCXX_STANDARD 20)
     target_compile_options(wwmm_native PRIVATE -fobjc-arc)
     target_link_libraries(wwmm_native PUBLIC wwmm_lan PRIVATE "-framework ScreenCaptureKit" "-framework VideoToolbox"
         "-framework CoreMedia" "-framework CoreVideo" "-framework CoreGraphics" "-framework Metal" "-framework QuartzCore" "-framework AppKit"
-        "-framework ApplicationServices" "-framework Carbon")
+        "-framework ApplicationServices" "-framework Carbon" "-framework AudioToolbox")
 elseif(WIN32)
-    add_library(wwmm_native STATIC platform/windows/desktop.cpp platform/windows/pointer.cpp platform/windows/input.cpp)
+    add_library(wwmm_native STATIC platform/windows/desktop.cpp platform/windows/pointer.cpp platform/windows/input.cpp platform/windows/audio.cpp)
     target_compile_definitions(wwmm_native PRIVATE NOMINMAX)
     target_link_libraries(wwmm_native PUBLIC wwmm_lan PRIVATE d3d11 d3dcompiler dxgi dxguid mfplat mf mfuuid ole32 oleaut32 strmiids wmcodecdspuuid)
 endif()
@@ -94,7 +94,7 @@ if(BUILD_TESTING)
     target_link_libraries(wwmm_pair_tests PRIVATE wwmm_widgets Qt6::Test)
     add_test(NAME wwmm_pairing_and_discovery COMMAND wwmm_pair_tests)
     qt_add_executable(wwmm_desktop_tests tests/desktop_test.cpp)
-    target_link_libraries(wwmm_desktop_tests PRIVATE wwmm_lan Qt6::Test)
+    target_link_libraries(wwmm_desktop_tests PRIVATE wwmm_widgets Qt6::Test)
     add_test(NAME wwmm_readonly_desktop COMMAND wwmm_desktop_tests)
     set_tests_properties(wwmm_readonly_desktop wwmm_lan_and_ui wwmm_pairing_and_discovery PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
@@ -110,6 +110,7 @@ install(FILES "${WWMM_CRYPTO_LICENSE}" DESTINATION "${wwmm_notices}" RENAME Bori
 install(FILES "${WWMM_WEBRTC_SOURCE}/LICENSE" DESTINATION "${wwmm_notices}" RENAME WebRTC-LICENSE)
 install(FILES "${WWMM_WEBRTC_SOURCE}/PATENTS" DESTINATION "${wwmm_notices}" RENAME WebRTC-PATENTS)
 install(FILES "${WWMM_ABSL_SOURCE}/LICENSE" DESTINATION "${wwmm_notices}" RENAME Abseil-LICENSE)
+install(FILES "${WWMM_OPUS_SOURCE}/COPYING" DESTINATION "${wwmm_notices}" RENAME Opus-LICENSE)
 install(FILES "${WWMM_SRTP_SOURCE}/LICENSE" DESTINATION "${wwmm_notices}" RENAME libSRTP-LICENSE)
 get_filename_component(wwmm_qt_root "${Qt6_DIR}/../../.." ABSOLUTE)
 install(FILES "${wwmm_qt_root}/sbom/qtbase-${Qt6_VERSION}.spdx" DESTINATION "${wwmm_notices}" OPTIONAL)

@@ -2,8 +2,10 @@
 #include "desktop_session.h"
 #include "native_desktop.h"
 #include "native_input.h"
+#include "native_audio.h"
 #include <QWidget>
 class QLabel;
+class QCheckBox;
 class QPushButton;
 class QTimer;
 class QVBoxLayout;
@@ -25,11 +27,17 @@ class DesktopControls final : public QWidget {
     void switchDisplay();
     void startPlayer();
     void retireMedia();
+    void updateSound();
+    void closeSound();
     void addTransferBar();
     void endMedia();
     void refreshInputFocus();
     DesktopSession &session_;
     QLabel *label_;
+    QCheckBox *soundCheck_;
+    std::shared_ptr<Callbacks> soundCallbacks_;
+    std::shared_ptr<AudioStream> audioStream_;
+    std::unique_ptr<NativeAudio> audio_;
     QVBoxLayout *column_;
     TransferBar *transfer_ = nullptr;
     QPushButton *yes_, *stop_;

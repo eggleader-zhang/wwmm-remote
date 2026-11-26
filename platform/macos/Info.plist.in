@@ -17,7 +17,9 @@
     <key>NSAccessibilityUsageDescription</key>
     <string>仅在你允许本次远程控制后，WWMM Remote 才会在这台 Mac 上执行对方的键鼠操作。</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>你同意本次查看或控制后，WWMM Remote 会把主屏幕画面共享给已配对的局域网电脑。</string>
+    <string>你同意本次会话后，WWMM Remote 将所选显示器共享给已配对的局域网电脑。双方开启声音后才共享系统播放的声音。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>仅在双方开启本次声音共享后，采集电脑播放的系统声音并传给当前局域网设备。</string>
     <key>NSBonjourServices</key>
     <array><string>_wwmm-remote._tcp</string></array>
 </dict>

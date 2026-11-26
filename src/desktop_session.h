@@ -2,6 +2,8 @@
 #include "discovery.h"
 #include "desktop_display.h"
 #include "session_data.h"
+#include "audio_stream.h"
+#include "video_packets.h"
 #include "desktop_input.h"
 #include "trusted_channel.h"
 #include <QElapsedTimer>
@@ -24,6 +26,21 @@ class DesktopSession final : public QObject {
     bool interactive() const { return interactive_; }
 
     bool extended() const { return extended_; }
+
+    bool richMedia() const { return rich_; }
+
+    VideoQuality quality() const { return quality_; }
+
+    void chooseQuality(VideoQuality quality);
+    bool reduceQuality();
+
+    bool localSound() const { return localSound_ != 0; }
+
+    bool peerSound() const { return peerSound_ != 0; }
+
+    std::shared_ptr<AudioStream> sound() const { return sound_; }
+
+    void enableSound(bool enable);
 
     QByteArray peerKey() const { return selected_; }
 
@@ -50,6 +67,8 @@ class DesktopSession final : public QObject {
     void displaysChanged();
     void displaySwitched();
     void beforePaste();
+    void qualityChanged();
+    void soundChanged();
     void notice(const QString &message);
     void frame(const QByteArray &annexB, quint32 timestamp);
     void keyframeNeeded();
@@ -63,6 +82,10 @@ class DesktopSession final : public QObject {
     bool prepareNetwork();
     bool startNetwork();
     bool displayMessage(const QByteArray &data);
+    bool mediaMessage(const QByteArray &data);
+    void applyQuality(VideoQuality quality);
+    void syncSound();
+    void attachSound();
     void startDisplay(quint64 id);
     void drainPaste();
     void handle(const QByteArray &data);
@@ -78,13 +101,18 @@ class DesktopSession final : public QObject {
     LanAddress link_;
     Endpoint remote_;
     QByteArray selected_;
-    bool host_ = false, received_ = false;
+    bool host_ = false, received_ = false, rich_ = false;
+    VideoQuality quality_ = VideoQuality::FullHD;
+    quint32 localSound_ = 0, peerSound_ = 0;
+    std::shared_ptr<AudioStream> sound_;
     bool interactive_ = false, extended_ = false, displayReady_ = false, needDisplayIdr_ = false;
     QList<DesktopDisplay> displays_, announced_;
     quint64 display_ = 0;
     quint32 boundary_ = 0;
     bool listing_ = false;
     QList<InputEvent> afterPaste_;
+    std::optional<InputEvent> imagePaste_;
+    quint64 pasteRevision_ = 0;
     DesktopOS peerOS_ = DesktopOS::macOS;
     quint32 pointerSequence_ = 0, pointerFence_ = 0, lastPosition_ = 0;
     QTimer settlePointer_;

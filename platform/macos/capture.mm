@@ -69,7 +69,7 @@ class MacCapture final : public DesktopCapture
     std::shared_ptr<MacCaptureState> s_ = std::make_shared<MacCaptureState>();
 
   public:
-    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected)
+    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected, VideoQuality quality)
     {
         auto s = s_;
         s->output = std::move(output);
@@ -102,7 +102,8 @@ class MacCapture final : public DesktopCapture
                                          auto size = desktopSize(
                                              {qRound(filter.contentRect.size.width * filter.pointPixelScale),
                                               qRound(filter.contentRect.size.height *
-                                                     filter.pointPixelScale)});
+                                                     filter.pointPixelScale)},
+                                             quality);
                                          auto cfg = [SCStreamConfiguration new];
                                          cfg.width = size.width();
                                          cfg.height = size.height();
@@ -115,7 +116,7 @@ class MacCapture final : public DesktopCapture
                                          cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
                                          s->encoder =
                                              std::make_unique<MacVideoEncoder>(s->output, s->failure);
-                                         if (!s->encoder->open(size))
+                                         if (!s->encoder->open(size, qualityBitrate(quality)))
                                              return;
                                          s->sink = [WWMMScreenOutput new];
                                          s->sink->owner = s;
@@ -194,10 +195,11 @@ QList<DesktopDisplay> desktopDisplays()
     return displays;
 }
 
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display)
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
+                                               VideoQuality quality)
 {
     return std::make_unique<MacCapture>(std::move(output), std::move(error),
-                                        display ? CGDirectDisplayID(display) : CGMainDisplayID());
+                                        display ? CGDirectDisplayID(display) : CGMainDisplayID(), quality);
 }
 } // namespace wwmm
 @implementation WWMMScreenOutput

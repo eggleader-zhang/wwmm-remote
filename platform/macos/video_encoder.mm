@@ -17,7 +17,8 @@ MacVideoEncoder::~MacVideoEncoder()
         CFRelease(encoder_);
     }
 }
-bool MacVideoEncoder::open(QSize size)
+
+bool MacVideoEncoder::open(QSize size, int bitrate)
 {
     NSDictionary *spec = @{
         (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : @YES,
@@ -31,7 +32,7 @@ bool MacVideoEncoder::open(QSize size)
             (__bridge NSString *)kVTCompressionPropertyKey_RealTime : @YES,
             (__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering : @NO,
             (__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate : @(videoFps),
-            (__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate : @(videoBitrate),
+            (__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate : @(bitrate),
             (__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval : @(videoFps),
             (__bridge NSString *)
             kVTCompressionPropertyKey_ProfileLevel : (__bridge NSString *)kVTProfileLevel_H264_Main_AutoLevel,

@@ -84,6 +84,11 @@ DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, QObject *par
             emit notice(tr("剪贴板尚未同步，本次粘贴已取消。"));
         }
     });
+    connect(&data_, &SessionData::clipboardRejected, this, [this] {
+        imagePaste_.reset();
+        if (!afterPaste_.isEmpty())
+            sendInput(InputEvent{});
+    });
     connect(&data_, &SessionData::clipboardSettled, this, &DesktopSession::drainPaste);
     connect(&data_, &SessionData::notice, this, &DesktopSession::notice);
     connect(&store, &DeviceStore::changed, this, &DesktopSession::check);
@@ -144,6 +149,7 @@ void DesktopSession::view(const NearbyDevice &peer, bool withInput)
         return;
     }
     extended_ = peer.extendedDesktop;
+    rich_ = extended_ && peer.richMedia;
     attach(socket, peer.link, peer.key, withInput);
     connect(socket, &QTcpSocket::connected, control_, &TrustedChannel::start);
     socket->connectToHost(socketAddress(peer.endpoint.address, peer.link), peer.endpoint.port);
@@ -155,7 +161,7 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
     host_ = expected.isEmpty();
     interactive_ = withInput;
     if (host_)
-        extended_ = false;
+        rich_ = extended_ = false;
     pointerSequence_ = pointerFence_ = lastPosition_ = 0;
     latestPosition_.reset();
     selected_ = expected;
@@ -179,6 +185,8 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
             auto request = portMessage(op, network_->port);
             if (interactive_)
                 request.append(char(localOS()));
+            if (rich_)
+                request.append(char(13));
             if (!control_->send(request))
                 return stop(tr("无法准备局域网视频接收。"));
             setState(Waiting);
@@ -277,11 +285,16 @@ bool DesktopSession::startNetwork()
     auto keys = control_->mediaKeys();
     if (keys.size() != 60)
         return false;
+    auto audioKey = rich_ ? control_->mediaKeys(true) : QByteArray{};
+    if (rich_ && audioKey.size() != 30)
+        return false;
     bool ok = false;
     QMetaObject::invokeMethod(
-        network_->worker, [&] { ok = network_->link->connectPeer(remote_, keys); },
+        network_->worker, [&] { ok = network_->link->connectPeer(remote_, keys, audioKey); },
         Qt::BlockingQueuedConnection);
     OPENSSL_cleanse(keys.data(), keys.size());
+    if (!audioKey.isEmpty())
+        OPENSSL_cleanse(audioKey.data(), audioKey.size());
     return ok;
 }
 
@@ -291,8 +304,10 @@ void DesktopSession::handle(const QByteArray &data)
     if (data == "K")
         return;
     if (extended_ && (state_ == Sharing || state_ == Viewing)) {
+        if (rich_ && mediaMessage(data))
+            return;
         if (state_ == Viewing && interactive_ && data.size() == 19 && data[0] == 'B') {
-            data_.join(link_, remote_.address, selected_, data);
+            data_.join(link_, remote_.address, selected_, data, rich_);
             return;
         }
         if (displayMessage(data))
@@ -325,9 +340,12 @@ void DesktopSession::handle(const QByteArray &data)
     }
     const char op = data[0];
     const bool modern = op == 'v' || op == 'y' || op == 'c' || op == 'a';
-    const bool controlOffer = data.size() == 4 && (op == 'C' || op == 'A' || op == 'c' || op == 'a');
-    if ((!controlOffer && data.size() != 3) || (controlOffer && quint8(data[3]) != quint8(DesktopOS::macOS) &&
-                                                quint8(data[3]) != quint8(DesktopOS::windows)))
+    const bool controlOffer = op == 'C' || op == 'A' || op == 'c' || op == 'a';
+    const int baseSize = controlOffer ? 4 : 3;
+    const bool richOffer = modern && data.size() == baseSize + 1 && quint8(data.back()) == 13;
+    if ((!richOffer && data.size() != baseSize) ||
+        (controlOffer && quint8(data[3]) != quint8(DesktopOS::macOS) &&
+         quint8(data[3]) != quint8(DesktopOS::windows)))
         return stop(tr("对方发送了无效的桌面消息。"));
     remote_.port = qFromBigEndian<quint16>(data.constData() + 1);
     if (!remote_.port || !store_.peers().contains(selected_))
@@ -335,11 +353,12 @@ void DesktopSession::handle(const QByteArray &data)
     if (host_ && state_ == Connecting &&
         (op == 'V' || op == 'v' || (controlOffer && (op == 'C' || op == 'c')))) {
         extended_ = modern;
+        rich_ = richOffer;
         interactive_ = controlOffer;
         if (interactive_)
             peerOS_ = DesktopOS(quint8(data[3]));
         setState(Requested);
-    } else if (!host_ && state_ == Waiting && modern == extended_ &&
+    } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
         if (interactive_)
@@ -362,11 +381,13 @@ void DesktopSession::accept()
     auto reply = portMessage(op, network_->port);
     if (interactive_)
         reply.append(char(localOS()));
+    if (rich_)
+        reply.append(char(13));
     if (!control_->send(reply))
         return stop(tr("无法在当前局域网共享桌面。"));
     setState(Sharing);
     if (state_ == Sharing && extended_ && interactive_) {
-        const auto offer = data_.listen(link_, remote_.address, selected_);
+        const auto offer = data_.listen(link_, remote_.address, selected_, rich_);
         if (!offer.isEmpty() && !control_->send(offer))
             stop(tr("桌面连接已断开。"));
     }
@@ -379,6 +400,7 @@ void DesktopSession::sendInput(InputEvent input)
         return;
     data_.noteActivity();
     if (input.kind == InputKind::Reset) {
+        imagePaste_.reset();
         pasteTimer_.stop();
         afterPaste_.clear();
     } else {
@@ -386,6 +408,20 @@ void DesktopSession::sendInput(InputEvent input)
                            (input.mods & (localOS() == DesktopOS::macOS ? 0x88 : 0x11));
         if (paste)
             emit beforePaste();
+        if (paste && data_.imagePending()) {
+            if (!imagePaste_)
+                sendInput(InputEvent{});
+            if (!control_)
+                return;
+            imagePaste_ = input;
+            pasteRevision_ = data_.clipboardRevisionId();
+            return;
+        }
+        // Keep typing and pointer traffic live while a large screenshot is in flight.
+        // An action that changes the insertion target cancels a deferred paste.
+        if (imagePaste_ && input.kind != InputKind::Move &&
+            !(input.kind == InputKind::KeyUp && (input.key == imagePaste_->key || modifierBit(input.key))))
+            imagePaste_.reset();
         if ((paste && data_.clipboardPending()) || !afterPaste_.isEmpty()) {
             if (input.kind == InputKind::Move)
                 return;
@@ -448,6 +484,15 @@ void DesktopSession::drainPaste()
     if (data_.clipboardPending())
         return;
     pasteTimer_.stop();
+    const auto imagePaste = std::exchange(imagePaste_, {});
+    if (imagePaste && data_.clipboardEnabled() && pasteRevision_ == data_.clipboardRevisionId() &&
+        state_ == Viewing && displayReady_) {
+        auto release = *imagePaste;
+        release.kind = InputKind::KeyUp;
+        release.mods = 0;
+        if (!control_->send(packInput(*imagePaste)) || !control_->send(packInput(release)))
+            return stop(tr("截图粘贴连接已断开。"));
+    }
     const auto pending = std::exchange(afterPaste_, {});
     if (!pending.isEmpty() && !data_.clipboardEnabled())
         return sendInput(InputEvent{});
@@ -486,6 +531,28 @@ void DesktopSession::sendFrame(QByteArray frame, quint32 stamp, bool key)
         Qt::QueuedConnection);
 }
 
+void DesktopSession::attachSound()
+{
+    if (!network_)
+        return;
+    auto *link = network_->link;
+    QMetaObject::invokeMethod(
+        link, [link, stream = sound_] { link->setAudio(stream); }, Qt::QueuedConnection);
+}
+
+void DesktopSession::applyQuality(VideoQuality quality)
+{
+    if (state_ != Sharing || !rich_ || !display_ || !network_)
+        return;
+    quality_ = quality;
+    auto *link = network_->link;
+    QMetaObject::invokeMethod(link, [link, quality] { link->setQuality(quality); }, Qt::QueuedConnection);
+    if (!control_->send(QByteArray("q") + char(quality)))
+        return stop(tr("画质连接已断开。"));
+    emit qualityChanged();
+    startDisplay(display_);
+}
+
 void DesktopSession::refreshVideo()
 {
     if (state_ == Viewing && network_)
@@ -519,6 +586,11 @@ void DesktopSession::check()
     }
     if (state_ == Viewing && !received_) {
         refreshVideo();
+        if (rich_ && quality_ != VideoQuality::FullHD && stateClock_.elapsed() > 6500) {
+            stateClock_.restart();
+            reduceQuality();
+            return;
+        }
         if (stateClock_.elapsed() > 15000)
             stop(tr("未收到桌面画面，请检查共享端的录屏权限和局域网 UDP。"));
     }
@@ -534,12 +606,16 @@ void DesktopSession::stop(const QString &reason)
     stillFrame_.stop();
     settlePointer_.stop();
     latestPosition_.reset();
+    imagePaste_.reset();
     afterPaste_.clear();
     data_.reset();
     displays_.clear();
     announced_.clear();
     display_ = 0;
-    extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
+    rich_ = extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
+    quality_ = VideoQuality::FullHD;
+    localSound_ = peerSound_ = 0;
+    sound_.reset();
     auto *channel = std::exchange(control_, nullptr);
     channel->disconnect(this);
     channel->finish(state_ == Requested && reason.isEmpty() ? "N" : "X");

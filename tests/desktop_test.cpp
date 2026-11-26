@@ -1,4 +1,7 @@
 #include "desktop_session.h"
+#include "clipboard_images.h"
+#include <QMimeData>
+#include <cmath>
 #include "native_desktop.h"
 #include "video_packets.h"
 #include "video_link.h"
@@ -488,7 +491,7 @@ class DesktopTest final : public QObject
         host.trust(viewer);
         viewer.trust(host);
         auto peer = host.target();
-        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = true;
+        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = peer.richMedia = true;
         viewer.session.view(peer, true);
         QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
         auto &sender = viewer.session.dataLink();
@@ -504,6 +507,33 @@ class DesktopTest final : public QObject
         viewer.session.picturePresented();
         viewer.session.chooseDisplay(2);
         QTRY_COMPARE(viewer.session.displayId(), 2u);
+        viewer.session.chooseQuality(VideoQuality::QHD);
+        QTRY_COMPARE(viewer.session.quality(), VideoQuality::QHD);
+        QCOMPARE(desktopSize({3840, 2160}, viewer.session.quality()), QSize(2560, 1440));
+        viewer.session.chooseQuality(VideoQuality::UHD);
+        QTRY_COMPARE(viewer.session.quality(), VideoQuality::UHD);
+        QCOMPARE(desktopSize({3840, 2160}, host.session.quality()), QSize(3840, 2160));
+
+        viewer.session.enableSound(true);
+        QVERIFY(!viewer.session.sound());
+        host.session.enableSound(true);
+        QTRY_VERIFY(host.session.sound() && viewer.session.sound());
+        std::array<float, 3 * AudioStream::frames> tone{};
+        for (size_t i = 0; i < tone.size(); ++i)
+            tone[i] = float(std::sin(i * 0.1) * 0.5);
+        host.session.sound()->capture(tone.data(), tone.data(), 1, int(tone.size()));
+        bool heard = false;
+        auto audible = [&] {
+            if (heard)
+                return true;
+            std::array<float, 2 * AudioStream::frames> output{};
+            viewer.session.sound()->render(output.data(), AudioStream::frames);
+            heard = std::any_of(output.cbegin(), output.cend(), [](float v) { return std::abs(v) > 0.01f; });
+            return heard;
+        };
+        QTRY_VERIFY(audible());
+        host.session.enableSound(false);
+        QTRY_VERIFY(!viewer.session.sound());
 
         QSignalSpy copies(&host.session.dataLink(), &SessionData::clipboardText);
         sender.enableClipboard(true);
@@ -515,6 +545,22 @@ class DesktopTest final : public QObject
         QTRY_COMPARE(copies.size(), 1);
         QCOMPARE(copies.first().first().toString(), cells);
         QTRY_VERIFY(!sender.clipboardPending());
+
+        QImage copied(8, 8, QImage::Format_ARGB32), received;
+        copied.fill(QColor(40, 90, 160, 180));
+        ClipboardImages sending(sender, {}, this);
+        ClipboardImages receiving(
+            receiver,
+            [&](quint64, const QImage &image) {
+                received = image;
+                return true;
+            },
+            this);
+        QMimeData mime;
+        mime.setImageData(copied);
+        sending.copy(mime);
+        QTRY_VERIFY(!sender.clipboardPending());
+        QCOMPARE(received.pixelColor(0, 0), copied.pixelColor(0, 0));
 
         const auto path = viewer.dir.filePath("meeting.txt");
         QFile source(path);

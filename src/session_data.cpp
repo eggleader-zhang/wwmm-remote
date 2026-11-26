@@ -8,6 +8,7 @@
 #include <QtEndian>
 #include <atomic>
 #include <utility>
+#include <limits>
 
 namespace wwmm {
 namespace {
@@ -65,9 +66,10 @@ SessionData::~SessionData()
     }
 }
 
-QByteArray SessionData::listen(const LanAddress &link, QHostAddress peer, QByteArray key)
+QByteArray SessionData::listen(const LanAddress &link, QHostAddress peer, QByteArray key, bool rich)
 {
     reset();
+    rich_ = rich;
     link_ = link;
     remote_ = std::move(peer);
     peer_ = std::move(key);
@@ -98,12 +100,14 @@ QByteArray SessionData::listen(const LanAddress &link, QHostAddress peer, QByteA
     return QByteArray("B") + number(server_->serverPort()) + token_;
 }
 
-void SessionData::join(const LanAddress &link, QHostAddress peer, QByteArray key, const QByteArray &offer)
+void SessionData::join(const LanAddress &link, QHostAddress peer, QByteArray key, const QByteArray &offer,
+                       bool rich)
 {
     if (offer.size() != 19 || offer[0] != 'B' || !isOnLink(peer, link) || !field<quint16>(offer, 1) ||
         channel_ || bound_)
         return;
     reset();
+    rich_ = rich;
     peer_ = std::move(key);
     remote_ = std::move(peer);
     link_ = link;
@@ -161,7 +165,7 @@ void SessionData::reset()
         old->stop({});
         old->deleteLater();
     }
-    bound_ = host_ = localClip_ = peerClip_ = false;
+    bound_ = host_ = localClip_ = peerClip_ = rich_ = false;
     clearClipboard();
     clearFile();
     token_.clear();
@@ -173,9 +177,10 @@ void SessionData::reset()
 
 void SessionData::clearClipboard()
 {
-    inText_.clear();
-    outText_.clear();
-    startText_ = false;
+    incomingClip_.clear();
+    outgoingClip_.clear();
+    startClip_ = inImage_ = outImage_ = false;
+    clipOffset_ = expectedClipBytes_ = 0;
     receivingClip_ = pendingClip_ = 0;
     emit clipboardSettled();
 }
@@ -197,17 +202,80 @@ void SessionData::copyText(const QString &text)
         return;
     auto bytes = text.size() <= maxTextBytes ? text.toUtf8() : QByteArray{};
     if (text.size() > maxTextBytes || bytes.size() > maxTextBytes) {
+        discardLocalCopy();
         emit notice(tr("文字超过 1 MiB，可保存成文件发送。"));
         return;
     }
+    if (!beginCopy(false))
+        return;
+    outgoingClip_ = std::move(bytes);
+    startClip_ = true;
+    tick();
+}
+
+quint64 SessionData::beginCopy(bool image)
+{
+    if (!clipboardEnabled())
+        return 0;
+    if (pendingClip_ && rich_ && !send("w" + number(pendingClip_)))
+        return 0;
+    if (receivingClip_ && rich_ && !send("x" + number(receivingClip_)))
+        return 0;
     writer_ = store_.publicKey();
     receivingClip_ = 0;
-    inText_.clear();
-    outText_ = std::move(bytes);
+    incomingClip_.clear();
+    outgoingClip_.clear();
+    startClip_ = false;
+    outImage_ = image;
+    inImage_ = false;
+    clipOffset_ = 0;
     pendingClip_ = ++revision_;
-    startText_ = true;
-    textOffset_ = 0;
+    return pendingClip_;
+}
+
+void SessionData::discardLocalCopy()
+{
+    if (pendingClip_ && rich_)
+        send("w" + number(pendingClip_));
+    if (receivingClip_ && rich_)
+        send("x" + number(receivingClip_));
+    emit clipboardRejected();
+    clearClipboard();
+}
+
+quint64 SessionData::beginImage()
+{
+    const auto rev = rich_ ? beginCopy(true) : 0;
+    if (rev)
+        emit changed();
+    return rev;
+}
+
+void SessionData::encodedImage(quint64 rev, QByteArray png)
+{
+    if (!rev || rev != pendingClip_ || !outImage_ || !clipboardEnabled())
+        return;
+    if (png.isEmpty() || png.size() > maxImageBytes) {
+        discardLocalCopy();
+        emit notice(tr("截图超出限制或无法编码，可作为文件发送。"));
+        return;
+    }
+    outgoingClip_ = std::move(png);
+    startClip_ = true;
     tick();
+}
+
+void SessionData::finishImage(quint64 rev, bool applied)
+{
+    if (!expectsImage(rev))
+        return;
+    receivingClip_ = 0;
+    if (!applied)
+        emit clipboardRejected();
+    send((applied ? QByteArray("k") : QByteArray("x")) + number(rev));
+    emit clipboardSettled();
+    if (!applied)
+        emit notice(tr("未能将收到的截图写入剪贴板。"));
 }
 
 void SessionData::handle(const QByteArray &f)
@@ -233,51 +301,84 @@ void SessionData::handle(const QByteArray &f)
         return;
     }
     const char op = f[0];
-    if (op == 'b' || op == 't' || op == 'k') {
-        if (!clipboardEnabled())
-            return;
-        if (f.size() < 9)
+    if (op == 'b' || op == 't' || op == 'k' || (rich_ && (op == 'g' || op == 'x' || op == 'w')))
+        return handleClipboard(f);
+    handleFile(f);
+}
+
+void SessionData::handleClipboard(const QByteArray &f)
+{
+    if (!clipboardEnabled())
+        return;
+    if (f.size() < 9)
+        return failed();
+    const char op = f[0];
+    const auto rev = field<quint64>(f, 1);
+    if (op == 'k' || op == 'x' || op == 'w') {
+        if (f.size() != 9 || !rev)
             return failed();
-        const auto rev = field<quint64>(f, 1);
-        if (op == 'k') {
-            if (f.size() == 9 && pendingClip_ == rev) {
-                pendingClip_ = 0;
-                emit clipboardSettled();
-            }
-            return;
-        }
-        if (op == 'b') {
-            if (f.size() != 13 || field<quint32>(f, 9) > maxTextBytes || !rev)
-                return failed();
-            if (rev < revision_ || (rev == revision_ && peer_ <= writer_))
+        if (op == 'w') {
+            if (receivingClip_ != rev)
+                return;
+            receivingClip_ = 0;
+            incomingClip_.clear();
+            emit clipboardRejected();
+        } else {
+            if (pendingClip_ != rev)
                 return;
             pendingClip_ = 0;
-            startText_ = false;
-            outText_.clear();
-            writer_ = peer_;
-            revision_ = receivingClip_ = rev;
-            inText_.clear();
-            expectedText_ = int(field<quint32>(f, 9));
-        } else {
-            if (rev != receivingClip_ || !receivingClip_)
-                return;
-            if (f.size() <= 9 || f.size() - 9 > expectedText_ - inText_.size())
-                return failed();
-            inText_.append(f.constData() + 9, f.size() - 9);
+            outgoingClip_.clear();
+            startClip_ = false;
+            if (op == 'x')
+                emit clipboardRejected();
         }
-        if (inText_.size() == expectedText_) {
-            const auto value = QString::fromUtf8(inText_);
-            if (value.toUtf8() != inText_)
-                return failed();
-            receivingClip_ = 0;
-            inText_.clear();
-            emit clipboardText(value);
-            send("k" + number(rev));
-            emit clipboardSettled();
-        }
+        emit clipboardSettled();
         return;
     }
-    handleFile(f);
+    if (op == 'b' || op == 'g') {
+        const bool image = op == 'g';
+        if (f.size() != 13 || !rev || rev == std::numeric_limits<quint64>::max())
+            return failed();
+        const auto size = field<quint32>(f, 9);
+        if (size > quint32(image ? maxImageBytes : maxTextBytes) || (image && !size))
+            return failed();
+        if (rev < revision_ || (rev == revision_ && peer_ <= writer_))
+            return;
+        if (pendingClip_)
+            emit clipboardRejected();
+        pendingClip_ = 0;
+        startClip_ = false;
+        outgoingClip_.clear();
+        writer_ = peer_;
+        revision_ = receivingClip_ = rev;
+        inImage_ = image;
+        incomingClip_.clear();
+        expectedClipBytes_ = int(size);
+        incomingClip_.reserve(expectedClipBytes_);
+        if (image)
+            emit changed();
+    } else {
+        if (rev != receivingClip_ || !receivingClip_)
+            return;
+        if (f.size() <= 9 || f.size() - 9 > expectedClipBytes_ - incomingClip_.size())
+            return failed();
+        incomingClip_.append(f.constData() + 9, f.size() - 9);
+    }
+    if (incomingClip_.size() != expectedClipBytes_)
+        return;
+    auto content = std::exchange(incomingClip_, {});
+    expectedClipBytes_ = 0;
+    if (inImage_) {
+        emit clipboardImage(rev, content);
+        return; // The receiver acknowledges only after decoding and installing the image.
+    }
+    const auto value = QString::fromUtf8(content);
+    if (value.toUtf8() != content)
+        return failed();
+    receivingClip_ = 0;
+    emit clipboardText(value);
+    send("k" + number(rev));
+    emit clipboardSettled();
 }
 
 void SessionData::disk(Operation work, std::function<void(DiskResult)> finish)
@@ -474,18 +575,19 @@ void SessionData::tick()
         pump_.start();
         return;
     }
-    if (startText_) {
-        startText_ = false;
-        if (!send("b" + number(pendingClip_) + number(quint32(outText_.size()))))
+    if (startClip_) {
+        startClip_ = false;
+        if (!send((outImage_ ? QByteArray("g") : QByteArray("b")) + number(pendingClip_) +
+                  number(quint32(outgoingClip_.size()))))
             return;
     }
-    if (textOffset_ < outText_.size()) {
-        const auto part = outText_.mid(textOffset_, chunk);
+    if (clipOffset_ < outgoingClip_.size()) {
+        const auto part = outgoingClip_.mid(clipOffset_, chunk);
         if (!send("t" + number(pendingClip_) + part))
             return;
-        textOffset_ += int(part.size());
-        if (textOffset_ == outText_.size())
-            outText_.clear();
+        clipOffset_ += int(part.size());
+        if (clipOffset_ == outgoingClip_.size())
+            outgoingClip_.clear();
         pump_.start();
         return;
     }

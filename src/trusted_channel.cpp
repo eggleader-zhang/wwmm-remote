@@ -150,13 +150,14 @@ bool TrustedChannel::send(const QByteArray &message)
     return !ended_;
 }
 
-QByteArray TrustedChannel::mediaKeys() const
+QByteArray TrustedChannel::mediaKeys(bool audio) const
 {
-    constexpr char label[] = "EXPORTER-WWMM-desktop-v3-SRTP";
-    QByteArray keys(60, '\0');
+    const QByteArrayView label = audio ? QByteArrayView("EXPORTER-WWMM-system-audio-v1")
+                                       : QByteArrayView("EXPORTER-WWMM-desktop-v3-SRTP");
+    QByteArray keys(audio ? 30 : 60, '\0');
     if (!ready_ || ended_ ||
-        !SSL_export_keying_material(tls_.get(), reinterpret_cast<uint8_t *>(keys.data()), keys.size(), label,
-                                    sizeof(label) - 1, nullptr, 0, 0))
+        !SSL_export_keying_material(tls_.get(), reinterpret_cast<uint8_t *>(keys.data()), keys.size(),
+                                    label.data(), size_t(label.size()), nullptr, 0, 0))
         return {};
     return keys;
 }

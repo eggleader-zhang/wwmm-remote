@@ -20,7 +20,7 @@ public:
   void stop(const QString &reason);
   void finish(const QByteArray &lastMessage);
   bool send(const QByteArray &message);
-  QByteArray mediaKeys() const;
+  QByteArray mediaKeys(bool audio = false) const;
   const QByteArray &peerKey() const { return peer_; }
 signals:
     void authenticated();

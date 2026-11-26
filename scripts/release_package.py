@@ -107,7 +107,7 @@ def main():
         subprocess.run(["cmake", "--install", build, "--prefix", stage], check=True)
         notices = (stage if os_name == "windows" else stage / f"{APP}.app/Contents/Resources") / "third-party"
         for name in ["BoringSSL-LICENSE", "WebRTC-LICENSE", "WebRTC-PATENTS", "Abseil-LICENSE",
-                     "libSRTP-LICENSE", f"qtbase-{QT_VERSION}.spdx"]:
+                     "libSRTP-LICENSE", "Opus-LICENSE", f"qtbase-{QT_VERSION}.spdx"]:
             require_file(notices / name)
         install_license_files(notices)
         packed = Path(temp) / archive.name

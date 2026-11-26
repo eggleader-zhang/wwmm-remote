@@ -23,6 +23,8 @@ struct DefaultTrials : webrtc::FieldTrialsView {
         return {};
     }
 };
+
+constexpr quint32 audioSsrc = 0x57415531;
 struct CachedPacket {
     quint16 seq;
     qint64 sent;
@@ -34,6 +36,8 @@ struct Assembly {
     std::optional<quint16> first, last;
     QHash<quint16, QByteArray> parts;
     qsizetype size = 0;
+    qint64 lastPart = 0;
+    bool keyframe = false;
 };
 bool configure(srtp_t &ctx, const char *key, quint32 ssrc)
 {
@@ -65,14 +69,17 @@ struct VideoLink::Impl {
     }
     bool sending;
     QUdpSocket udp;
-    QTimer timer;
+    QTimer timer, audioTimer;
+    std::shared_ptr<AudioStream> audio;
+    srtp_t audioContext = nullptr;
+    quint16 audioSequence = quint16(QRandomGenerator::global()->generate());
     QElapsedTimer clock;
     LanAddress link;
     Endpoint peer;
     srtp_t outbound = nullptr, inbound = nullptr;
     DefaultTrials trials;
     webrtc::AimdRateControl rate{trials, true};
-    int bitrate = videoBitrate;
+    int bitrate = videoBitrate, ceiling = videoBitrate;
     qint64 sentBytes = 0, reportTime = 0;
     std::optional<quint32> highest, lastTransit;
     quint32 base = 0, previousExpected = 0, previousCount = 0, receivedCount = 0;
@@ -84,7 +91,8 @@ struct VideoLink::Impl {
     QList<Assembly> frames;
     std::optional<quint32> delivered;
     std::optional<quint16> nextSeq;
-    bool needIdr = true;
+    bool needIdr = true, refreshAfterDrain = false;
+    std::optional<quint32> pendingIdr;
     qint64 lastTick = -4, lastPli = -200, lastRefresh = -200;
     void wake()
     {
@@ -97,6 +105,8 @@ struct VideoLink::Impl {
     }
     ~Impl()
     {
+        if (audioContext)
+            srtp_dealloc(audioContext);
         if (outbound)
             srtp_dealloc(outbound);
         if (inbound)
@@ -106,6 +116,9 @@ struct VideoLink::Impl {
 
 VideoLink::VideoLink(bool sender, QObject *parent) : QObject(parent), p_(std::make_unique<Impl>(sender))
 {
+    p_->audioTimer.setTimerType(Qt::PreciseTimer);
+    p_->audioTimer.setInterval(10);
+    connect(&p_->audioTimer, &QTimer::timeout, this, &VideoLink::pumpAudio);
     p_->timer.setTimerType(Qt::PreciseTimer);
     p_->timer.setInterval(2);
     connect(&p_->timer, &QTimer::timeout, this, &VideoLink::tick);
@@ -123,7 +136,8 @@ quint16 VideoLink::bind(const LanAddress &link)
     p_->udp.setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, 512 * 1024);
     return p_->udp.localPort();
 }
-bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys)
+
+bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys, const QByteArray &audioKey)
 {
     static const auto initialized = srtp_init();
     if (initialized != srtp_err_status_ok || keys.size() != 60 || !peer.port ||
@@ -131,9 +145,61 @@ bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys)
         return false;
     p_->peer = {socketAddress(peer.address, p_->link), peer.port};
     const auto *senderKey = keys.constData(), *viewerKey = senderKey + 30;
+    if (!audioKey.isEmpty() &&
+        (audioKey.size() != 30 || !configure(p_->audioContext, audioKey.constData(), audioSsrc)))
+        return false;
     return configure(p_->outbound, p_->sending ? senderKey : viewerKey,
                      p_->sending ? videoSsrc : viewerSsrc) &&
            configure(p_->inbound, p_->sending ? viewerKey : senderKey, p_->sending ? viewerSsrc : videoSsrc);
+}
+
+void VideoLink::setQuality(VideoQuality quality)
+{
+    const auto ceiling = qualityBitrate(quality);
+    if (ceiling == p_->ceiling)
+        return;
+    p_->bitrate = p_->ceiling = ceiling;
+    p_->rate.SetEstimate(webrtc::DataRate::BitsPerSec(ceiling),
+                         webrtc::Timestamp::Millis(p_->clock.elapsed()));
+    p_->budget.set_target_rate_kbps(ceiling * 7 / 1000);
+    p_->pending.clear();
+    p_->pendingIdr.reset();
+    p_->refreshAfterDrain = false;
+    p_->needIdr = true;
+}
+
+void VideoLink::setAudio(std::shared_ptr<AudioStream> stream)
+{
+    p_->audio = std::move(stream);
+    if (p_->audio && p_->audioContext && p_->sending)
+        p_->audioTimer.start();
+    else
+        p_->audioTimer.stop();
+}
+
+void VideoLink::pumpAudio()
+{
+    if (!p_->audio || !p_->audioContext)
+        return;
+    // An old sound packet can be concealed on playback. It must not delay fresh screen data.
+    const bool congested = p_->pending.size() * 1200u > size_t(p_->bitrate / 400);
+    for (int i = 0; i < 3; ++i) {
+        auto next = p_->audio->take();
+        if (!next)
+            return;
+        if (congested)
+            continue;
+        QByteArray packet(20, '\0');
+        packet[0] = char(0x80);
+        packet[1] = 111;
+        qToBigEndian(p_->audioSequence++, packet.data() + 2);
+        qToBigEndian(next->stamp, packet.data() + 4);
+        qToBigEndian(audioSsrc, packet.data() + 8);
+        qToBigEndian(p_->audio->generation(), packet.data() + 12);
+        packet += next->payload;
+        if (seal(p_->audioContext, packet, false))
+            p_->write(packet);
+    }
 }
 
 void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
@@ -145,17 +211,22 @@ void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
         emit failed(tr("硬件编码器返回了无效或不支持的 H.264 画面。"));
         return;
     }
-    if (p_->needIdr && !key) {
-        emit keyframeNeeded();
-        return;
-    }
-    if (p_->pending.size() > 700) {
-        p_->pending.clear();
+    // Limit queued motion to a short burst. Complete an in-flight reference picture before
+    // abandoning dependent pictures, otherwise a large 4K keyframe could be starved forever.
+    const size_t backlog = size_t(std::clamp(p_->bitrate / 24000, 80, 700));
+    if (p_->pending.size() > backlog) {
         p_->needIdr = true;
-        if (!key) {
-            emit keyframeNeeded();
+        if (p_->pendingIdr) {
+            p_->refreshAfterDrain = true;
+            p_->wake();
             return;
         }
+        p_->pending.clear();
+    }
+    if (p_->needIdr && !key) {
+        p_->refreshAfterDrain = true;
+        p_->wake();
+        return;
     }
     auto packets = packetizeVideo(annexB, key, p_->sequence, timestamp);
     if (packets.isEmpty()) {
@@ -164,6 +235,9 @@ void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
         return;
     }
     p_->needIdr = false;
+    p_->refreshAfterDrain = false;
+    if (key)
+        p_->pendingIdr = timestamp;
     for (auto &packet : packets)
         p_->pending.push_back(std::move(packet));
     p_->wake();
@@ -185,6 +259,9 @@ void VideoLink::tick()
     while (!p_->pending.empty() && p_->budget.bytes_remaining() > 0) {
         auto packet = std::move(p_->pending.front());
         p_->pending.pop_front();
+        if (p_->pendingIdr && (quint8(packet[1]) & 0x80) &&
+            qFromBigEndian<quint32>(packet.constData() + 4) == *p_->pendingIdr)
+            p_->pendingIdr.reset();
         if (!seal(p_->outbound, packet, false) || !p_->write(packet)) {
             emit failed(tr("无法发送局域网视频。"));
             return;
@@ -195,7 +272,12 @@ void VideoLink::tick()
     }
     while (!p_->history.empty() && (now - p_->history.front().sent > 100 || p_->history.size() > 1536))
         p_->history.pop_front();
-    if (p_->pending.empty())
+    if (p_->refreshAfterDrain && !p_->pendingIdr && now - p_->lastRefresh >= 100) {
+        p_->lastRefresh = now;
+        p_->refreshAfterDrain = false;
+        emit keyframeNeeded();
+    }
+    if (p_->pending.empty() && !p_->refreshAfterDrain)
         p_->timer.stop();
 }
 
@@ -209,6 +291,16 @@ void VideoLink::receive()
             continue;
         auto data = datagram.data();
         int len = int(data.size());
+        if (!p_->sending && quint8(data[0]) == 0x80 && quint8(data[1]) == 111) {
+            if (p_->audio && p_->audioContext && len > 20 &&
+                qFromBigEndian<quint32>(data.constData() + 8) == audioSsrc &&
+                srtp_unprotect(p_->audioContext, data.data(), &len) == srtp_err_status_ok && len > 20 &&
+                qFromBigEndian<quint64>(data.constData() + 12) == p_->audio->generation()) {
+                data.resize(len);
+                p_->audio->receive(qFromBigEndian<quint32>(data.constData() + 4), data.mid(20));
+            }
+            continue;
+        }
         auto status = p_->sending ? srtp_unprotect_rtcp(p_->inbound, data.data(), &len)
                                   : srtp_unprotect(p_->inbound, data.data(), &len);
         if (status != srtp_err_status_ok)
@@ -257,6 +349,8 @@ void VideoLink::onRtp(const QByteArray &data)
         f->last = seq;
     f->parts.insert(seq, data.mid(20));
     f->size += data.size() - 20;
+    f->lastPart = p_->clock.elapsed();
+    f->keyframe = (flags & 0x20) != 0;
     p_->wake();
     if (f->first && f->last && f->parts.size() == int(quint16(*f->last - *f->first)) + 1)
         deliver();
@@ -294,7 +388,16 @@ void VideoLink::deliver()
             emit frameReady(frame, ts);
             continue;
         }
-        if (now - f.arrived >= 35) {
+        const auto fresh = std::find_if(p_->frames.crbegin(), p_->frames.crend(), [](const Assembly &a) {
+            return a.keyframe && a.first && a.last && a.parts.size() == int(quint16(*a.last - *a.first)) + 1;
+        });
+        if (fresh != p_->frames.crend() && fresh->timestamp != f.timestamp) {
+            const auto stamp = fresh->timestamp;
+            while (p_->frames.first().timestamp != stamp)
+                p_->frames.removeFirst();
+            continue;
+        }
+        if (now - f.lastPart >= 35 || now - f.arrived >= 180) {
             p_->frames.removeFirst();
             requestKeyframe();
             continue;
@@ -428,7 +531,7 @@ void VideoLink::onFeedback(const QByteArray &data)
         auto at = webrtc::Timestamp::Millis(now);
         const auto usage = overuse ? webrtc::BandwidthUsage::kBwOverusing : webrtc::BandwidthUsage::kBwNormal;
         const auto target = p_->rate.Update(webrtc::RateControlInput(usage, estimated), at);
-        const int next = int(std::clamp<int64_t>(target.bps(), 3000000, videoBitrate));
+        const int next = int(std::clamp<int64_t>(target.bps(), 3000000, p_->ceiling));
         if (target.bps() != next)
             p_->rate.SetEstimate(webrtc::DataRate::BitsPerSec(next), at);
         if (std::abs(next - p_->bitrate) >= 250000) {

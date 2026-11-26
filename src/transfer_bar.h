@@ -12,6 +12,7 @@ class QMimeData;
 namespace wwmm {
 QString droppedFile(const QMimeData *mime);
 
+class ClipboardImages;
 class TransferBar final : public QWidget {
   public:
     explicit TransferBar(SessionData &data, QWidget *parent);
@@ -25,6 +26,7 @@ class TransferBar final : public QWidget {
     void update();
     void chooseFile(bool saving);
     SessionData &data_;
+    ClipboardImages *images_;
     QCheckBox *clipboard_;
     QLabel *status_;
     QPushButton *file_, *cancel_;

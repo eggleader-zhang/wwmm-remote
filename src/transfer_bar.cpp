@@ -1,4 +1,5 @@
 #include "transfer_bar.h"
+#include "clipboard_images.h"
 #include "native_input.h"
 #include <QApplication>
 #include <QCheckBox>
@@ -12,6 +13,7 @@
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QStandardPaths>
+#include <algorithm>
 
 namespace wwmm {
 QString droppedFile(const QMimeData *mime)
@@ -47,6 +49,7 @@ TransferBar::TransferBar(SessionData &data, QWidget *parent) : QWidget(parent), 
             [this] { chooseFile(data_.fileState() == SessionData::Offered); });
     connect(cancel_, &QPushButton::clicked, &data, &SessionData::cancelFile);
     connect(&data, &SessionData::changed, this, &TransferBar::update);
+    connect(&data, &SessionData::clipboardSettled, this, &TransferBar::update);
     auto *progress = new QTimer(this);
     progress->setSingleShot(true);
     progress->setInterval(120);
@@ -62,6 +65,20 @@ TransferBar::TransferBar(SessionData &data, QWidget *parent) : QWidget(parent), 
     poll_.setInterval(180);
     connect(&poll_, &QTimer::timeout, this, &TransferBar::pollClipboard);
     connect(QApplication::clipboard(), &QClipboard::dataChanged, this, &TransferBar::pollClipboard);
+    images_ = new ClipboardImages(
+        data,
+        [this](quint64 rev, const QImage &image) {
+            pollClipboard();
+            if (!data_.expectsImage(rev))
+                return false;
+            applying_ = true;
+            previous_.reset();
+            QApplication::clipboard()->setImage(image);
+            revision_ = clipboardRevision();
+            applying_ = false;
+            return true;
+        },
+        this);
     connect(&data, &SessionData::clipboardText, this, [this](const QString &value) {
         applying_ = true;
         previous_ = value;
@@ -81,9 +98,29 @@ void TransferBar::pollClipboard()
         return;
     revision_ = revision;
     auto *mime = QApplication::clipboard()->mimeData();
-    if (!mime || !mime->hasText() || (mime->hasUrls() && !mime->hasFormat(QStringLiteral("text/plain"))))
+    if (!mime)
         return;
-    auto text = mime->text();
+    const auto urls = mime->urls();
+    if (std::any_of(urls.cbegin(), urls.cend(), [](const QUrl &url) { return url.isLocalFile(); })) {
+        previous_.reset();
+        if (data_.supportsImages())
+            data_.discardLocalCopy();
+        return;
+    }
+    const bool plain = mime->hasText() && (!mime->hasUrls() || mime->hasFormat(QStringLiteral("text/plain")));
+    const auto text = plain ? mime->text() : QString{};
+    if (data_.supportsImages() && (mime->hasImage() || mime->hasFormat(QStringLiteral("image/png"))) &&
+        text.isEmpty()) {
+        previous_.reset();
+        images_->copy(*mime);
+        return;
+    }
+    if (!plain) {
+        previous_.reset();
+        if (data_.supportsImages())
+            data_.discardLocalCopy();
+        return;
+    }
     if (previous_ && text == *previous_)
         return;
     if (text.size() <= SessionData::maxTextBytes)
@@ -95,6 +132,9 @@ void TransferBar::update()
 {
     const bool ready = data_.ready();
     clipboard_->setEnabled(ready);
+    clipboard_->setText(data_.supportsImages() ? tr("同步文字和截图") : tr("同步文字剪贴板"));
+    clipboard_->setToolTip(data_.supportsImages() ? tr("双方开启后，同步本次会话中新复制的文字和图片。")
+                                                  : tr("双方开启后，同步本次会话中新复制的文字。"));
     {
         QSignalBlocker block(clipboard_);
         clipboard_->setChecked(data_.localClipboard());
@@ -115,6 +155,10 @@ void TransferBar::update()
     file_->setText(state == SessionData::Offered ? tr("选择保存位置") : tr("发送文件"));
     cancel_->setVisible(state != SessionData::NoFile);
     if (state == SessionData::NoFile) {
+        if (data_.imagePending()) {
+            status_->setText(tr("正在同步截图…"));
+            return;
+        }
         status_->setText(!ready ? tr("文件与剪贴板未连接")
                                 : (data_.localClipboard() && !watching_ ? tr("等待对方开启剪贴板")
                                                                         : tr("可拖入一个文件发送")));

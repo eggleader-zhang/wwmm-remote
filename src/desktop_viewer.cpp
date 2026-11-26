@@ -2,6 +2,7 @@
 #include "input_window.h"
 #include "transfer_bar.h"
 #include <QComboBox>
+#include <QCheckBox>
 #include <QDragEnterEvent>
 #include <QSignalBlocker>
 #include <QHBoxLayout>
@@ -11,7 +12,7 @@
 #include <QWindow>
 
 namespace wwmm {
-DesktopViewer::DesktopViewer(QWidget *parent, bool interactive)
+DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     : QDialog(parent, Qt::Window), surface_(new InputWindow(interactive))
 {
     column_ = new QVBoxLayout(this);
@@ -33,6 +34,25 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive)
         emit displayRequested(displays_->itemData(index).toULongLong());
         focusVideo();
     });
+    if (rich) {
+        quality_ = new QComboBox(this);
+        quality_->setEnabled(false);
+        quality_->setAccessibleName(tr("最高画质"));
+        quality_->setToolTip(tr("最高传输分辨率，保留屏幕宽高比"));
+        quality_->addItems({tr("1080p · 办公"), tr("1440p"), tr("4K")});
+        row->addWidget(quality_);
+        connect(quality_, &QComboBox::activated, this, [this](int index) {
+            emit qualityRequested(VideoQuality(index));
+            focusVideo();
+        });
+        sound_ = new QCheckBox(tr("远端声音"), this);
+        sound_->setToolTip(tr("共享端同意后，播放对方电脑的系统声音"));
+        row->addWidget(sound_);
+        connect(sound_, &QCheckBox::toggled, this, [this](bool enabled) {
+            emit soundRequested(enabled);
+            focusVideo();
+        });
+    }
     connect(surface_, &InputWindow::fileDropped, this, &DesktopViewer::fileDropped);
     if (interactive) {
         auto *preedit = new QLabel(this);
@@ -77,6 +97,23 @@ void DesktopViewer::setDisplays(const QList<DesktopDisplay> &list, quint64 selec
     }
     displays_->setCurrentIndex(displays_->findData(QVariant::fromValue(selected)));
     displays_->setVisible(list.size() > 1);
+    if (quality_)
+        quality_->setEnabled(selected != 0);
+}
+
+void DesktopViewer::showQuality(VideoQuality quality)
+{
+    if (quality_)
+        quality_->setCurrentIndex(int(quality));
+}
+
+void DesktopViewer::showSound(bool local, bool peer)
+{
+    if (!sound_)
+        return;
+    QSignalBlocker guard(sound_);
+    sound_->setChecked(local);
+    sound_->setText(local && !peer ? tr("等待共享端开启声音") : tr("远端声音"));
 }
 
 void DesktopViewer::addTools(QWidget *tools)

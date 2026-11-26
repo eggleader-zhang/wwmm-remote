@@ -15,12 +15,35 @@ webrtc::ArrayView<const uint8_t> bytes(QByteArrayView data)
 }
 constexpr char start[] = {0, 0, 0, 1};
 } // namespace
-QSize desktopSize(QSize source)
+
+int qualityBitrate(VideoQuality quality)
+{
+    switch (quality) {
+    case VideoQuality::QHD:
+        return 32000000;
+    case VideoQuality::UHD:
+        return 50000000;
+    default:
+        return videoBitrate;
+    }
+}
+
+static bool supportedPicture(quint32 w, quint32 h)
+{
+    return qMin(w, h) >= 2 && qMax(w, h) <= 3840 && qMin(w, h) <= 2160;
+}
+
+QSize desktopSize(QSize source, VideoQuality quality)
 {
     if (source.width() < 2 || source.height() < 2)
         return {};
-    if (source.width() > 1920 || source.height() > 1080)
-        source.scale(1920, 1080, Qt::KeepAspectRatio);
+    QSize limit = quality == VideoQuality::UHD   ? QSize(3840, 2160)
+                  : quality == VideoQuality::QHD ? QSize(2560, 1440)
+                                                 : QSize(1920, 1080);
+    if (quality != VideoQuality::FullHD && source.height() > source.width())
+        limit.transpose();
+    if (source.width() > limit.width() || source.height() > limit.height())
+        source.scale(limit, Qt::KeepAspectRatio);
     return {source.width() & ~1, source.height() & ~1};
 }
 
@@ -42,7 +65,7 @@ QSize h264PictureSize(const QByteArray &annexB)
     for (auto unit : h264Units(annexB))
         if ((quint8(unit[0]) & 31) == 7) {
             auto s = webrtc::SpsParser::ParseSps(bytes(unit.sliced(1)));
-            if (s && s->width >= 2 && s->width <= 1920 && s->height >= 2 && s->height <= 1080)
+            if (s && supportedPicture(s->width, s->height))
                 return {int(s->width), int(s->height)};
         }
     return {};
@@ -58,7 +81,7 @@ bool validAccessUnit(const QByteArray &annexB, bool &keyframe)
             return false;
         if (type == 7) {
             auto info = webrtc::SpsParser::ParseSps(bytes(nal.sliced(1)));
-            if (!info || info->width < 2 || info->height < 2 || info->width > 1920 || info->height > 1080)
+            if (!info || !supportedPicture(info->width, info->height))
                 return false;
             sps = true;
         }

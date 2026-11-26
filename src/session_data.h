@@ -16,8 +16,9 @@ class SessionData final : public QObject {
   public:
     explicit SessionData(DeviceStore &store, QObject *parent);
     ~SessionData() override;
-    QByteArray listen(const LanAddress &link, QHostAddress peer, QByteArray key);
-    void join(const LanAddress &link, QHostAddress peer, QByteArray key, const QByteArray &offer);
+    QByteArray listen(const LanAddress &link, QHostAddress peer, QByteArray key, bool rich = false);
+    void join(const LanAddress &link, QHostAddress peer, QByteArray key, const QByteArray &offer,
+              bool rich = false);
     void reset();
 
     bool ready() const { return bound_; }
@@ -30,6 +31,24 @@ class SessionData final : public QObject {
 
     void enableClipboard(bool enable);
     void copyText(const QString &text);
+
+    bool supportsImages() const { return rich_; }
+
+    bool imagePending() const { return (pendingClip_ && outImage_) || (receivingClip_ && inImage_); }
+
+    quint64 clipboardRevisionId() const { return revision_; }
+
+    quint64 beginImage();
+    void encodedImage(quint64 revision, QByteArray png);
+
+    bool expectsImage(quint64 revision) const
+    {
+        return clipboardEnabled() && inImage_ && receivingClip_ == revision;
+    }
+
+    void finishImage(quint64 revision, bool applied);
+    void discardLocalCopy();
+    static constexpr int maxImageBytes = 36 * 1024 * 1024;
 
     void noteActivity() { activity_.start(); }
 
@@ -51,6 +70,8 @@ class SessionData final : public QObject {
   signals:
     void changed();
     void clipboardText(const QString &text);
+    void clipboardImage(quint64 revision, const QByteArray &png);
+    void clipboardRejected();
     void clipboardSettled();
     void progressChanged();
     void notice(const QString &message);
@@ -72,6 +93,8 @@ class SessionData final : public QObject {
     void tick();
     void clearFile();
     void clearClipboard();
+    quint64 beginCopy(bool image);
+    void handleClipboard(const QByteArray &frame);
     void fileError(const QString &reason);
     bool send(const QByteArray &frame);
     void failed();
@@ -85,9 +108,9 @@ class SessionData final : public QObject {
     QByteArray peer_, token_;
     bool bound_ = false, host_ = false, localClip_ = false, peerClip_ = false;
     quint64 revision_ = 0, pendingClip_ = 0, receivingClip_ = 0;
-    QByteArray writer_, outText_, inText_;
-    int textOffset_ = 0, expectedText_ = 0;
-    bool startText_ = false;
+    QByteArray writer_, outgoingClip_, incomingClip_;
+    int clipOffset_ = 0, expectedClipBytes_ = 0;
+    bool startClip_ = false, rich_ = false, inImage_ = false, outImage_ = false;
     FileState fileState_ = NoFile;
     QByteArray id_;
     QString name_;
