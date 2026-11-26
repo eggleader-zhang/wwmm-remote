@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key><string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key><string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleName</key><string>WWMM Remote</string>
+    <key>CFBundleDisplayName</key><string>WWMM Remote</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleShortVersionString</key><string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+    <key>CFBundleVersion</key><string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+    <key>LSMinimumSystemVersion</key><string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>WWMM Remote 在同一局域网发现和配对你选择的电脑，经你同意传输桌面画面和本次授权的键鼠输入。</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>仅在你允许本次远程控制后，WWMM Remote 才会在这台 Mac 上执行对方的键鼠操作。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>你同意本次查看或控制后，WWMM Remote 会把主屏幕画面共享给已配对的局域网电脑。</string>
+    <key>NSBonjourServices</key>
+    <array><string>_wwmm-remote._tcp</string></array>
+</dict>
+</plist>

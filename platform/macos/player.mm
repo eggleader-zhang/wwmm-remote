@@ -1,0 +1,211 @@
+#import <AppKit/AppKit.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include "video_decoder.h"
+#include <atomic>
+#include <mutex>
+
+@interface WWMMMetalView : NSView
+@end
+@implementation WWMMMetalView
+- (NSView *)hitTest:(NSPoint)point
+{
+    return nil; // The hosting Qt window handles focused mouse, keyboard and IME events.
+}
+- (BOOL)isOpaque
+{
+    return YES;
+}
+- (CALayer *)makeBackingLayer
+{
+    return [CAMetalLayer layer];
+}
+- (void)renewGState
+{
+    [super renewGState];
+    [self updateDrawable];
+}
+- (void)setFrameSize:(NSSize)size
+{
+    [super setFrameSize:size];
+    [self updateDrawable];
+}
+- (void)viewDidChangeBackingProperties
+{
+    [super viewDidChangeBackingProperties];
+    [self updateDrawable];
+}
+- (void)updateDrawable
+{
+    CAMetalLayer *metal = (CAMetalLayer *)self.layer;
+    if ([metal isKindOfClass:[CAMetalLayer class]]) {
+        NSSize size = [self convertSizeToBacking:self.bounds.size];
+        metal.drawableSize = CGSizeMake(MAX(1, size.width), MAX(1, size.height));
+    }
+}
+@end
+namespace wwmm
+{
+namespace
+{
+struct Render {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> commands;
+    id<MTLRenderPipelineState> pipeline;
+    CAMetalLayer *layer;
+    CVMetalTextureCacheRef textures = nullptr;
+    dispatch_queue_t queue = dispatch_queue_create("dev.wwmm.present", DISPATCH_QUEUE_SERIAL);
+    dispatch_semaphore_t drawablesAvailable = dispatch_semaphore_create(2);
+    std::atomic_bool stopped{false};
+    std::mutex callbackMutex;
+    PresentedFrame presented;
+    ~Render()
+    {
+        if (textures)
+            CFRelease(textures);
+    }
+    bool open()
+    {
+        if (!device || CVMetalTextureCacheCreate(nullptr, nullptr, device, nullptr, &textures))
+            return false;
+        commands = [device newCommandQueueWithMaxCommandBufferCount:2];
+        NSString *code = @R"metal(
+#include <metal_stdlib>
+using namespace metal;
+struct V {float4 pos [[position]];float2 uv;};
+vertex V vs(uint id [[vertex_id]]) {
+    float2 uv=float2((id<<1)&2,id&2);return {float4(uv.x*2-1,1-uv.y*2,0,1),uv};
+}
+fragment float4 fs(V v [[stage_in]],texture2d<float> y [[texture(0)]],texture2d<float> uv [[texture(1)]]) {
+    constexpr sampler s(address::clamp_to_edge,filter::linear);
+    float l=1.164384*(y.sample(s,v.uv).r-16.0/255.0);
+    float2 c=uv.sample(s,v.uv).rg-128.0/255.0;
+    return float4(l+1.792741*c.y,l-0.213249*c.x-0.532909*c.y,l+2.112402*c.x,1);
+})metal";
+        NSError *err = nil;
+        auto lib = [device newLibraryWithSource:code options:nil error:&err];
+        if (!lib)
+            return false;
+        auto desc = [MTLRenderPipelineDescriptor new];
+        desc.vertexFunction = [lib newFunctionWithName:@"vs"];
+        desc.fragmentFunction = [lib newFunctionWithName:@"fs"];
+        desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        pipeline = [device newRenderPipelineStateWithDescriptor:desc error:&err];
+        return pipeline && commands;
+    }
+};
+void display(std::shared_ptr<Render> r, CVPixelBufferRef image, quint32 stamp)
+{
+    if (r->stopped || dispatch_semaphore_wait(r->drawablesAvailable, DISPATCH_TIME_NOW))
+        return;
+    CVPixelBufferRetain(image);
+    dispatch_async(r->queue, ^{
+      @autoreleasepool {
+          id<CAMetalDrawable> dst = r->stopped ? nil : [r->layer nextDrawable];
+          CVMetalTextureRef y = nullptr, uv = nullptr;
+          if (dst) {
+              CVMetalTextureCacheCreateTextureFromImage(
+                  nullptr, r->textures, image, nullptr, MTLPixelFormatR8Unorm,
+                  CVPixelBufferGetWidthOfPlane(image, 0), CVPixelBufferGetHeightOfPlane(image, 0), 0, &y);
+              CVMetalTextureCacheCreateTextureFromImage(
+                  nullptr, r->textures, image, nullptr, MTLPixelFormatRG8Unorm,
+                  CVPixelBufferGetWidthOfPlane(image, 1), CVPixelBufferGetHeightOfPlane(image, 1), 1, &uv);
+          }
+          if (y && uv) {
+              auto cb = [r->commands commandBuffer];
+              auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
+              pass.colorAttachments[0].texture = dst.texture;
+              pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+              pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+              pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+              auto enc = [cb renderCommandEncoderWithDescriptor:pass];
+              const double dw = dst.texture.width, dh = dst.texture.height, w = CVPixelBufferGetWidth(image),
+                           h = CVPixelBufferGetHeight(image);
+              const double scale = std::min(dw / w, dh / h);
+              [enc setViewport:MTLViewport{(dw - w * scale) / 2, (dh - h * scale) / 2, w * scale, h * scale,
+                                           0, 1}];
+              [enc setRenderPipelineState:r->pipeline];
+              [enc setFragmentTexture:CVMetalTextureGetTexture(y) atIndex:0];
+              [enc setFragmentTexture:CVMetalTextureGetTexture(uv) atIndex:1];
+              [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+              [enc endEncoding];
+              [dst addPresentedHandler:^(id<MTLDrawable> d) {
+                std::lock_guard guard(r->callbackMutex);
+                if (r->presented && d.presentedTime > 0)
+                    r->presented(stamp);
+              }];
+              [cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+                CFRelease(y);
+                CFRelease(uv);
+                CVPixelBufferRelease(image);
+                dispatch_semaphore_signal(r->drawablesAvailable);
+              }];
+              [cb presentDrawable:dst];
+              [cb commit];
+          } else {
+              if (y)
+                  CFRelease(y);
+              if (uv)
+                  CFRelease(uv);
+              CVPixelBufferRelease(image);
+              dispatch_semaphore_signal(r->drawablesAvailable);
+          }
+      }
+    });
+}
+class MacPlayer final : public DesktopPlayer
+{
+    WWMMMetalView *view_;
+    std::shared_ptr<Render> render_ = std::make_shared<Render>();
+    std::unique_ptr<MacVideoDecoder> decoder_;
+
+  public:
+    MacPlayer(quintptr native, PresentedFrame presented, MediaError error)
+    {
+        auto *host = (__bridge NSView *)reinterpret_cast<void *>(native);
+        auto r = render_;
+        r->presented = std::move(presented);
+        if (!host || !r->open()) {
+            error(QStringLiteral("无法创建 Metal 视频显示器。"));
+            return;
+        }
+        view_ = [[WWMMMetalView alloc] initWithFrame:host.bounds];
+        view_.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        view_.wantsLayer = YES;
+        [host addSubview:view_];
+        r->layer = (CAMetalLayer *)view_.layer;
+        r->layer.device = r->device;
+        r->layer.opaque = YES;
+        r->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        r->layer.maximumDrawableCount = 2;
+        r->layer.displaySyncEnabled = NO;
+        r->layer.framebufferOnly = YES;
+        r->layer.allowsNextDrawableTimeout = YES;
+        [view_ updateDrawable];
+        decoder_ = std::make_unique<MacVideoDecoder>(
+            [r](CVPixelBufferRef image, quint32 stamp) { display(r, image, stamp); }, std::move(error));
+    }
+    void push(const QByteArray &frame, quint32 timestamp) override
+    {
+        if (decoder_)
+            decoder_->push(frame, timestamp);
+    }
+    ~MacPlayer() override
+    {
+        render_->stopped = true;
+        {
+            std::lock_guard guard(render_->callbackMutex);
+            render_->presented = {};
+        }
+        decoder_.reset();
+        dispatch_sync(render_->queue, ^{
+                      });
+        [view_ removeFromSuperview];
+    }
+};
+} // namespace
+std::unique_ptr<DesktopPlayer> playDesktop(quintptr view, PresentedFrame present, MediaError error)
+{
+    return std::make_unique<MacPlayer>(view, std::move(present), std::move(error));
+}
+} // namespace wwmm
