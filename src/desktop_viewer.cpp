@@ -3,12 +3,19 @@
 #include "transfer_bar.h"
 #include <QComboBox>
 #include <QCheckBox>
+#include <QActionGroup>
 #include <QDragEnterEvent>
+#include <QGridLayout>
+#include <QKeyEvent>
+#include <QMenu>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
 
@@ -18,11 +25,30 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
 {
     column_ = new QVBoxLayout(this);
     // The native renderer owns the video surface. Only the toolbar needs Qt's raster backing store.
-    video_ = QWidget::createWindowContainer(surface_, this);
+    pages_ = new QStackedWidget(this);
+    picturePage_ = new QWidget(pages_);
+    auto *grid = new QGridLayout(picturePage_);
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(0);
+    grid->setColumnStretch(0, 1);
+    grid->setRowStretch(0, 1);
+    video_ = QWidget::createWindowContainer(surface_, picturePage_);
     video_->setFocusPolicy(interactive ? Qt::StrongFocus : Qt::NoFocus);
     video_->setMinimumSize(320, 180);
-    pages_ = new QStackedWidget(this);
-    pages_->addWidget(video_);
+    grid->addWidget(video_, 0, 0);
+    horizontal_ = new QScrollBar(Qt::Horizontal, picturePage_);
+    horizontal_->setObjectName("horizontalPan");
+    vertical_ = new QScrollBar(Qt::Vertical, picturePage_);
+    horizontal_->setAccessibleName(tr("水平查看画面"));
+    vertical_->setAccessibleName(tr("垂直查看画面"));
+    grid->addWidget(horizontal_, 1, 0);
+    grid->addWidget(vertical_, 0, 1);
+    for (auto *bar : {horizontal_, vertical_}) {
+        bar->hide();
+        bar->setFocusPolicy(Qt::NoFocus);
+        connect(bar, &QScrollBar::valueChanged, this, &DesktopViewer::applyViewport);
+    }
+    pages_->addWidget(picturePage_);
     auto *offline = new QWidget(pages_);
     auto *actions = new QVBoxLayout(offline);
     interrupted_ = new QLabel(offline);
@@ -39,6 +65,7 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     connect(retry_, &QPushButton::clicked, this, &DesktopViewer::reconnectRequested);
     auto *row = new QHBoxLayout;
     status_ = new QLabel(tr("等待第一帧…"), this);
+    status_->setWordWrap(true);
     row->addWidget(status_, 1);
     displays_ = new QComboBox(this);
     displays_->setAccessibleName(tr("远端显示器"));
@@ -50,6 +77,41 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
         emit displayRequested(displays_->itemData(index).toULongLong());
         focusVideo();
     });
+    auto *displayOptions = new QToolButton(this);
+    displayOptions->setText(tr("显示"));
+    displayOptions->setPopupMode(QToolButton::InstantPopup);
+    auto *menu = new QMenu(displayOptions);
+    displayOptions->setMenu(menu);
+    auto *scale = new QActionGroup(menu);
+    auto *fit = menu->addAction(tr("适应窗口"));
+    original_ = menu->addAction(tr("原始像素（1:1）"));
+    original_->setObjectName("originalPixels");
+    for (auto *action : {fit, original_}) {
+        action->setCheckable(true);
+        scale->addAction(action);
+    }
+    fit->setChecked(true);
+    connect(scale, &QActionGroup::triggered, this, [this] {
+        updateViewport();
+        focusVideo();
+    });
+    menu->addSeparator();
+    auto *full = menu->addAction(tr("全屏"));
+    full->setObjectName("toggleFullScreen");
+    connect(menu, &QMenu::aboutToShow, this, [this, full] {
+        full->setText(isFullScreen() ? tr("退出全屏") : tr("全屏"));
+    });
+    connect(full, &QAction::triggered, this, &DesktopViewer::toggleFullScreen);
+    row->addWidget(displayOptions);
+
+    auto *layoutTimer = new QTimer(this);
+    layoutTimer->setSingleShot(true);
+    auto resized = [layoutTimer] { layoutTimer->start(0); };
+    connect(surface_, &QWindow::widthChanged, this, resized);
+    connect(surface_, &QWindow::heightChanged, this, resized);
+    connect(surface_, &InputWindow::pixelRatioChanged, this, resized);
+    connect(surface_, &InputWindow::pictureSizeChanged, this, &DesktopViewer::updateViewport);
+    connect(layoutTimer, &QTimer::timeout, this, &DesktopViewer::updateViewport);
     {
         quality_ = new QComboBox(this);
         quality_->setEnabled(false);
@@ -97,6 +159,49 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     connect(end, &QPushButton::clicked, this, &QDialog::accept);
     showDesktop(rich);
     resize(960, 600);
+}
+
+void DesktopViewer::updateViewport()
+{
+    const auto picture = surface_->pictureSize();
+    const auto page = picturePage_->size();
+    const auto scale = surface_->devicePixelRatio();
+    const int barWidth = vertical_->sizeHint().width(), barHeight = horizontal_->sizeHint().height();
+    const bool original = original_->isChecked() && !picture.isEmpty();
+    bool horizontal = original && picture.width() > qRound(page.width() * scale);
+    const bool vertical = original && picture.height() > qRound((page.height() - (horizontal ? barHeight : 0)) * scale);
+    horizontal = horizontal || (vertical && picture.width() > qRound((page.width() - barWidth) * scale));
+    auto setBar = [](QScrollBar *bar, bool show, int span, int pixels) {
+        QSignalBlocker block(bar);
+        bar->setVisible(show);
+        bar->setPageStep(span);
+        bar->setRange(0, show ? qMax(0, pixels - span) : 0);
+    };
+    setBar(horizontal_, horizontal, qRound((page.width() - (vertical ? barWidth : 0)) * scale), picture.width());
+    setBar(vertical_, vertical, qRound((page.height() - (horizontal ? barHeight : 0)) * scale), picture.height());
+    applyViewport();
+}
+
+void DesktopViewer::applyViewport()
+{
+    surface_->setViewport({original_->isChecked(), {horizontal_->value(), vertical_->value()}});
+    emit viewportChanged();
+}
+
+void DesktopViewer::toggleFullScreen()
+{
+    setWindowState(windowState().setFlag(Qt::WindowFullScreen, !isFullScreen()));
+    if (pages_->currentWidget() == picturePage_)
+        focusVideo();
+}
+
+void DesktopViewer::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_Escape && isFullScreen()) {
+        toggleFullScreen();
+        event->accept();
+    } else
+        QDialog::keyPressEvent(event);
 }
 
 void DesktopViewer::setDisplays(const QList<DesktopDisplay> &list, quint64 selected)

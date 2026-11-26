@@ -8,6 +8,8 @@ class QVBoxLayout;
 class QLabel;
 class QPushButton;
 class QStackedWidget;
+class QScrollBar;
+class QAction;
 
 namespace wwmm {
 class InputWindow;
@@ -36,14 +38,22 @@ class DesktopViewer final : public QDialog {
     void soundRequested(bool enable);
     void fileDropped(const QString &path);
     void reconnectRequested();
+    void viewportChanged();
 
   protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
   private:
     InputWindow *surface_;
     QWidget *video_;
+    QWidget *picturePage_;
+    QScrollBar *horizontal_, *vertical_;
+    QAction *original_;
+    void updateViewport();
+    void applyViewport();
+    void toggleFullScreen();
     QStackedWidget *pages_;
     QLabel *interrupted_;
     QPushButton *retry_, *switchApp_ = nullptr;

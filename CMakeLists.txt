@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS deployment target")
 endif()
-project(WWMMRemote VERSION 1.4.0 LANGUAGES C CXX)
+project(WWMMRemote VERSION 1.5.0 LANGUAGES C CXX)
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -27,7 +27,7 @@ add_library(wwmm_lan STATIC
     src/pair_session.cpp src/pair_session.h
     src/pairing.cpp src/pairing.h
     src/trusted_channel.cpp src/trusted_channel.h
-    src/desktop_session.cpp src/desktop_session.h src/desktop_display.h
+    src/desktop_session.cpp src/desktop_session.h src/desktop_display.h src/video_viewport.h
     src/session_data.cpp src/session_data.h src/session_displays.cpp
     src/desktop_input.cpp src/desktop_input.h src/input_keys.cpp
     src/video_packets.cpp src/video_packets.h
@@ -56,7 +56,7 @@ if(APPLE)
     target_compile_options(wwmm_native PRIVATE -fobjc-arc)
     target_link_libraries(wwmm_native PUBLIC wwmm_lan PRIVATE "-framework ScreenCaptureKit" "-framework VideoToolbox"
         "-framework CoreMedia" "-framework CoreVideo" "-framework CoreGraphics" "-framework Metal" "-framework QuartzCore" "-framework AppKit"
-        "-framework ApplicationServices" "-framework Carbon" "-framework AudioToolbox")
+        "-framework ApplicationServices" "-framework Carbon" "-framework AudioToolbox" "-framework ColorSync")
 elseif(WIN32)
     add_library(wwmm_native STATIC platform/windows/desktop.cpp platform/windows/pointer.cpp platform/windows/input.cpp platform/windows/audio.cpp)
     target_compile_definitions(wwmm_native PRIVATE NOMINMAX)

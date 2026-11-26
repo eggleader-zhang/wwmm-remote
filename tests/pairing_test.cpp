@@ -4,6 +4,8 @@
 #include "input_window.h"
 #include "main_window.h"
 #include <QApplication>
+#include <QAction>
+#include <QScrollBar>
 #include <QCheckBox>
 #include <QFile>
 #include <QFocusEvent>
@@ -539,6 +541,19 @@ class PairTest : public QObject
         const auto before = sent.size();
         QCoreApplication::sendEvent(surface, &confirm);
         QCOMPARE(sent.size(), before);
+        auto *original = dialog.findChild<QAction *>("originalPixels");
+        auto *pan = dialog.findChild<QScrollBar *>("horizontalPan");
+        auto *full = dialog.findChild<QAction *>("toggleFullScreen");
+        QVERIFY(original && pan && full);
+        surface->setPictureSize({3840, 2160});
+        original->trigger();
+        QVERIFY(surface->viewport().originalPixels);
+        pan->setValue(160);
+        QCOMPARE(surface->viewport().offset.x(), 160);
+        full->trigger();
+        QVERIFY(dialog.isFullScreen());
+        full->trigger();
+        QVERIFY(!dialog.isFullScreen());
     }
 
     void nativeDnsSd()

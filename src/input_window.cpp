@@ -175,6 +175,7 @@ void InputWindow::changeDisplay()
     resetInput();
     ready_ = false;
     picture_ = {};
+    emit pictureSizeChanged();
 }
 
 void InputWindow::cancelPreedit()
@@ -280,7 +281,8 @@ bool InputWindow::mouse(QMouseEvent *m)
 {
     bool move = m->type() == QEvent::MouseMove;
     const bool down = m->type() == QEvent::MouseButtonPress || m->type() == QEvent::MouseButtonDblClick;
-    auto p = screenPoint(m->position(), size(), picture_, buttons_ != 0);
+    const auto scale = devicePixelRatio();
+    auto p = screenPoint(m->position() * scale, size() * scale, picture_, buttons_ != 0, viewport_);
     if (!p)
         return true;
     if (!move && down)
@@ -319,7 +321,8 @@ bool InputWindow::wheel(QWheelEvent *w)
 {
     if (!focused_)
         return true;
-    auto p = screenPoint(w->position(), size(), picture_, buttons_ != 0);
+    const auto scale = devicePixelRatio();
+    auto p = screenPoint(w->position() * scale, size() * scale, picture_, buttons_ != 0, viewport_);
     if (!p)
         return true;
     InputEvent e;
@@ -340,6 +343,8 @@ bool InputWindow::wheel(QWheelEvent *w)
 
 bool InputWindow::event(QEvent *ev)
 {
+    if (ev->type() == QEvent::DevicePixelRatioChange)
+        emit pixelRatioChanged();
     if (fileDrops_ &&
         (ev->type() == QEvent::DragEnter || ev->type() == QEvent::DragMove || ev->type() == QEvent::Drop)) {
         auto *drop = static_cast<QDropEvent *>(ev);

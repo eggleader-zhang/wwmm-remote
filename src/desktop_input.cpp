@@ -27,20 +27,20 @@ bool newerInput(quint32 a, quint32 b)
     return qint32(a - b) > 0;
 }
 
-std::optional<ScreenPoint> screenPoint(QPointF local, QSizeF view, QSize picture, bool clamp)
+std::optional<ScreenPoint> screenPoint(QPointF local, QSize view, QSize picture, bool clamp, VideoViewport viewport)
 {
-    if (view.isEmpty() || picture.isEmpty())
+    const auto [source, dest] = viewport.place(picture, view);
+    if (dest.isEmpty())
         return {};
-    auto scale = std::min(view.width() / picture.width(), view.height() / picture.height());
-    const QSizeF image(picture.width() * scale, picture.height() * scale);
-    const double x = local.x() - (view.width() - image.width()) / 2,
-                 y = local.y() - (view.height() - image.height()) / 2;
-    if (!clamp && (x < 0 || y < 0 || x >= image.width() || y >= image.height()))
+    const auto point = local - dest.topLeft();
+    if (!clamp && (point.x() < 0 || point.y() < 0 || point.x() >= dest.width() || point.y() >= dest.height()))
         return {};
-    auto axis = [](double p, double span) {
-        return quint16(qRound(std::clamp(p / std::max(1., span - 1.), 0., 1.) * 65535.));
+    auto axis = [](double p, int span, int start, int length, int full) {
+        const auto fraction = std::clamp(p / std::max(1, span - 1), 0., 1.);
+        return quint16(qRound((start + fraction * (length - 1)) * 65535. / std::max(1, full - 1)));
     };
-    return ScreenPoint{axis(x, image.width()), axis(y, image.height())};
+    return ScreenPoint{axis(point.x(), dest.width(), source.x(), source.width(), picture.width()),
+                       axis(point.y(), dest.height(), source.y(), source.height(), picture.height())};
 }
 
 QByteArray packInput(const InputEvent &e)

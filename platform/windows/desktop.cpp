@@ -154,7 +154,8 @@ struct Gpu {
         return tex;
     }
     void blit(ID3D11Texture2D *src, UINT slice, QSize input, ID3D11Texture2D *dst, QSize outputSize,
-              bool encoding, DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_IDENTITY, UINT dstSlice = 0)
+              bool encoding, DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_IDENTITY, UINT dstSlice = 0,
+              VideoViewport viewport = {})
     {
         if (input != inSize || outputSize != outSize) {
             processor.Reset();
@@ -208,9 +209,10 @@ struct Gpu {
             od.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
         ComPtr<ID3D11VideoProcessorOutputView> ov;
         check(video->CreateVideoProcessorOutputView(dst, modes.Get(), &od, &ov), "无法写入 GPU 视频面");
-        auto fit = encoding ? outputSize : input.scaled(outputSize, Qt::KeepAspectRatio);
-        LONG x = (outputSize.width() - fit.width()) / 2, y = (outputSize.height() - fit.height()) / 2;
-        RECT source{0, 0, input.width(), input.height()}, dest{x, y, x + fit.width(), y + fit.height()};
+        const auto area = encoding ? VideoPlacement{QRect(QPoint{}, input), QRect(QPoint{}, outputSize)}
+                                   : viewport.place(input, outputSize);
+        auto rect = [](QRect r) -> RECT { return {r.x(), r.y(), r.x() + r.width(), r.y() + r.height()}; };
+        const auto source = rect(area.source), dest = rect(area.destination);
         vctx->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &source);
         vctx->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &dest);
         D3D11_VIDEO_COLOR bg{};
@@ -616,6 +618,8 @@ class WinPlayer final : public DesktopPlayer
     std::condition_variable available_;
     std::deque<Frame> queue_;
     bool stopped_ = false, needIdr_ = true;
+    bool repaint_ = false;
+    VideoViewport viewport_;
     std::thread thread_;
     void run()
     {
@@ -643,7 +647,11 @@ class WinPlayer final : public DesktopPlayer
             }
             throw Failure{QStringLiteral("系统解码器没有可用的 NV12 GPU 输出。")};
         };
+        VideoViewport viewport;
+        bool redraw = false;
+        ComPtr<IMFSample> latest;
         auto draw = [&](IMFSample *sample) {
+            redraw = false;
             ComPtr<IMFMediaBuffer> buf;
             check(sample->GetBufferByIndex(0, &buf), "读取解码纹理失败");
             ComPtr<IMFDXGIBuffer> dx;
@@ -674,7 +682,7 @@ class WinPlayer final : public DesktopPlayer
             display = output;
             ComPtr<ID3D11Texture2D> surface;
             check(swap->GetBuffer(0, IID_PPV_ARGS(&surface)), "无法获取显示面");
-            gpu.blit(tex.Get(), slice, picture, surface.Get(), output, false);
+            gpu.blit(tex.Get(), slice, picture, surface.Get(), output, false, DXGI_MODE_ROTATION_IDENTITY, 0, viewport);
             auto hr = swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED)
                 return;
@@ -683,18 +691,25 @@ class WinPlayer final : public DesktopPlayer
             if (SUCCEEDED(sample->GetSampleTime(&stamp)))
                 presented_(quint32(stamp * 9 / 1000));
         };
+        auto decoded = [&](IMFSample *sample) {
+            latest = sample;
+            draw(sample);
+        };
         std::optional<Frame> pending;
         while (true) {
             {
                 std::unique_lock lock(mutex_);
-                if (!pending && queue_.empty() && !stopped_) {
+                if (!pending && queue_.empty() && !stopped_ && !repaint_) {
                     if (decoder.events)
                         available_.wait_for(lock, std::chrono::milliseconds(3));
                     else
-                        available_.wait(lock, [&] { return stopped_ || !queue_.empty(); });
+                        available_.wait(lock, [&] { return stopped_ || !queue_.empty() || repaint_; });
                 }
                 if (stopped_)
                     break;
+                viewport = viewport_;
+                redraw = repaint_;
+                repaint_ = false;
                 if (!pending && !queue_.empty()) {
                     pending = std::move(queue_.front());
                     queue_.pop_front();
@@ -702,7 +717,9 @@ class WinPlayer final : public DesktopPlayer
             }
             if (!picture.isEmpty()) {
                 decoder.poll();
-                decoder.drain(nv12, draw);
+                decoder.drain(nv12, decoded);
+                if (redraw && latest)
+                    draw(latest.Get());
             }
             if (!pending)
                 continue;
@@ -746,7 +763,7 @@ class WinPlayer final : public DesktopPlayer
             if (decoder.submit(sample.Get()))
                 pending.reset();
             decoder.poll();
-            decoder.drain(nv12, draw);
+            decoder.drain(nv12, decoded);
         }
     }
 
@@ -761,6 +778,13 @@ class WinPlayer final : public DesktopPlayer
               }
           })
     {
+    }
+    void setViewport(VideoViewport viewport) override
+    {
+        std::lock_guard guard(mutex_);
+        viewport_ = viewport;
+        repaint_ = true;
+        available_.notify_one();
     }
     void push(const QByteArray &data, quint32 stamp) override
     {
@@ -800,12 +824,19 @@ BOOL CALLBACK collectMonitor(HMONITOR monitor, HDC, LPRECT, LPARAM param)
         DISPLAY_DEVICEW device{};
         device.cb = sizeof(device);
         auto name = QString::fromWCharArray(info.szDevice);
-        if (EnumDisplayDevicesW(info.szDevice, 0, &device, 0) && device.DeviceString[0])
-            name = QString::fromWCharArray(device.DeviceString);
+        QString persistent;
+        for (DWORD i = 0; EnumDisplayDevicesW(info.szDevice, i, &device, EDD_GET_DEVICE_INTERFACE_NAME); ++i) {
+            if (device.StateFlags & DISPLAY_DEVICE_ACTIVE) {
+                if (device.DeviceString[0])
+                    name = QString::fromWCharArray(device.DeviceString);
+                persistent = QString::fromWCharArray(device.DeviceID);
+                break;
+            }
+        }
         auto r = info.rcMonitor;
         reinterpret_cast<QList<DesktopDisplay> *>(param)->append(
             {quintptr(monitor), name, QSize(int(r.right - r.left), int(r.bottom - r.top)),
-             bool(info.dwFlags & MONITORINFOF_PRIMARY)});
+             bool(info.dwFlags & MONITORINFOF_PRIMARY), persistent});
     }
     return TRUE;
 }

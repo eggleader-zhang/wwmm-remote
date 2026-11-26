@@ -1,6 +1,7 @@
 #pragma once
 #include "desktop_display.h"
 #include "video_packets.h"
+#include "video_viewport.h"
 #include <QByteArray>
 #include <QString>
 #include <chrono>
@@ -35,6 +36,7 @@ class DesktopPlayer
 public:
     virtual ~DesktopPlayer() = default;
     virtual void push(const QByteArray &annexB, quint32 timestamp) = 0;
+    virtual void setViewport(VideoViewport viewport) = 0;
 };
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError failure, quint64 display = 0,

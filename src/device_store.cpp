@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLockFile>
+#include <QSettings>
 #include <QSysInfo>
 #include <QtConcurrentRun>
 #include <memory>
@@ -121,7 +122,26 @@ bool DeviceStore::forget(const QByteArray &key, QString &error)
         error = tr("设备身份无效。");
         return false;
     }
-    return update(key, {}, true, error);
+    if (!update(key, {}, true, error))
+        return false;
+    savePreferredDisplay(key, {});
+    return true;
+}
+
+QString DeviceStore::preferredDisplay(const QByteArray &peer) const
+{
+    QSettings settings(QDir(directory_).filePath("displays.ini"), QSettings::IniFormat);
+    return settings.value(QString::fromLatin1(publicKey_.toHex() + '/' + peer.toHex())).toString();
+}
+
+void DeviceStore::savePreferredDisplay(const QByteArray &peer, const QString &display) const
+{
+    QSettings settings(QDir(directory_).filePath("displays.ini"), QSettings::IniFormat);
+    const auto key = QString::fromLatin1(publicKey_.toHex() + '/' + peer.toHex());
+    if (display.isEmpty())
+        settings.remove(key);
+    else if (peers_.contains(peer))
+        settings.setValue(key, display);
 }
 
 bool DeviceStore::update(const QByteArray &key, const QString &name, bool remove, QString &error)

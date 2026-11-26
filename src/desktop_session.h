@@ -113,6 +113,7 @@ class DesktopSession final : public QObject {
     bool interactive_ = false, extended_ = false, displayReady_ = false, needDisplayIdr_ = false;
     QList<DesktopDisplay> displays_, announced_;
     quint64 display_ = 0;
+    QString rememberOnPresent_;
     quint32 boundary_ = 0;
     bool listing_ = false;
     QList<InputEvent> afterPaste_;

@@ -58,9 +58,16 @@ struct Render {
     dispatch_semaphore_t drawablesAvailable = dispatch_semaphore_create(2);
     std::atomic_bool stopped{false};
     std::mutex callbackMutex;
+    std::mutex pictureMutex;
+    CVPixelBufferRef latest = nullptr;
+    quint32 stamp = 0;
+    VideoViewport viewport;
+    bool dirty = false, scheduled = false;
     PresentedFrame presented;
     ~Render()
     {
+        if (latest)
+            CVPixelBufferRelease(latest);
         if (textures)
             CFRelease(textures);
     }
@@ -73,8 +80,9 @@ struct Render {
 #include <metal_stdlib>
 using namespace metal;
 struct V {float4 pos [[position]];float2 uv;};
-vertex V vs(uint id [[vertex_id]]) {
-    float2 uv=float2((id<<1)&2,id&2);return {float4(uv.x*2-1,1-uv.y*2,0,1),uv};
+vertex V vs(uint id [[vertex_id]], constant float4 &crop [[buffer(0)]]) {
+    float2 uv=float2((id<<1)&2,id&2);
+    return {float4(uv.x*2-1,1-uv.y*2,0,1),crop.xy + uv * crop.zw};
 }
 fragment float4 fs(V v [[stage_in]],texture2d<float> y [[texture(0)]],texture2d<float> uv [[texture(1)]]) {
     constexpr sampler s(address::clamp_to_edge,filter::linear);
@@ -94,13 +102,25 @@ fragment float4 fs(V v [[stage_in]],texture2d<float> y [[texture(0)]],texture2d<
         return pipeline && commands;
     }
 };
-void display(std::shared_ptr<Render> r, CVPixelBufferRef image, quint32 stamp)
+// Call with pictureMutex held. Enqueue at most one new draw of the latest decoded surface.
+void scheduleDisplay(std::shared_ptr<Render> r)
 {
-    if (r->stopped || dispatch_semaphore_wait(r->drawablesAvailable, DISPATCH_TIME_NOW))
+    if (!r->dirty || r->scheduled || !r->latest || r->stopped ||
+        dispatch_semaphore_wait(r->drawablesAvailable, DISPATCH_TIME_NOW))
         return;
-    CVPixelBufferRetain(image);
+    r->scheduled = true;
     dispatch_async(r->queue, ^{
       @autoreleasepool {
+          CVPixelBufferRef image;
+          quint32 stamp;
+          VideoViewport viewport;
+          {
+              std::lock_guard guard(r->pictureMutex);
+              image = CVPixelBufferRetain(r->latest);
+              stamp = r->stamp;
+              viewport = r->viewport;
+              r->dirty = r->scheduled = false;
+          }
           id<CAMetalDrawable> dst = r->stopped ? nil : [r->layer nextDrawable];
           CVMetalTextureRef y = nullptr, uv = nullptr;
           if (dst) {
@@ -119,11 +139,13 @@ void display(std::shared_ptr<Render> r, CVPixelBufferRef image, quint32 stamp)
               pass.colorAttachments[0].storeAction = MTLStoreActionStore;
               pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
               auto enc = [cb renderCommandEncoderWithDescriptor:pass];
-              const double dw = dst.texture.width, dh = dst.texture.height, w = CVPixelBufferGetWidth(image),
-                           h = CVPixelBufferGetHeight(image);
-              const double scale = std::min(dw / w, dh / h);
-              [enc setViewport:MTLViewport{(dw - w * scale) / 2, (dh - h * scale) / 2, w * scale, h * scale,
-                                           0, 1}];
+              QSize picture(int(CVPixelBufferGetWidth(image)), int(CVPixelBufferGetHeight(image)));
+              const auto [source, dest] = viewport.place(picture, {int(dst.texture.width), int(dst.texture.height)});
+              const float w = picture.width(), h = picture.height();
+              const float crop[] = {source.x() / w, source.y() / h, source.width() / w, source.height() / h};
+              [enc setViewport:MTLViewport{double(dest.x()), double(dest.y()), double(dest.width()),
+                                           double(dest.height()), 0, 1}];
+              [enc setVertexBytes:crop length:sizeof(crop) atIndex:0];
               [enc setRenderPipelineState:r->pipeline];
               [enc setFragmentTexture:CVMetalTextureGetTexture(y) atIndex:0];
               [enc setFragmentTexture:CVMetalTextureGetTexture(uv) atIndex:1];
@@ -139,6 +161,8 @@ void display(std::shared_ptr<Render> r, CVPixelBufferRef image, quint32 stamp)
                 CFRelease(uv);
                 CVPixelBufferRelease(image);
                 dispatch_semaphore_signal(r->drawablesAvailable);
+                std::lock_guard guard(r->pictureMutex);
+                scheduleDisplay(r);
               }];
               [cb presentDrawable:dst];
               [cb commit];
@@ -149,6 +173,8 @@ void display(std::shared_ptr<Render> r, CVPixelBufferRef image, quint32 stamp)
                   CFRelease(uv);
               CVPixelBufferRelease(image);
               dispatch_semaphore_signal(r->drawablesAvailable);
+              std::lock_guard guard(r->pictureMutex);
+              scheduleDisplay(r);
           }
       }
     });
@@ -182,8 +208,22 @@ class MacPlayer final : public DesktopPlayer
         r->layer.framebufferOnly = YES;
         r->layer.allowsNextDrawableTimeout = YES;
         [view_ updateDrawable];
-        decoder_ = std::make_unique<MacVideoDecoder>(
-            [r](CVPixelBufferRef image, quint32 stamp) { display(r, image, stamp); }, std::move(error));
+        decoder_ = std::make_unique<MacVideoDecoder>([r](CVPixelBufferRef image, quint32 stamp) {
+            std::lock_guard guard(r->pictureMutex);
+            if (r->latest)
+                CVPixelBufferRelease(r->latest);
+            r->latest = CVPixelBufferRetain(image);
+            r->stamp = stamp;
+            r->dirty = true;
+            scheduleDisplay(r);
+        }, std::move(error));
+    }
+    void setViewport(VideoViewport viewport) override
+    {
+        std::lock_guard guard(render_->pictureMutex);
+        render_->viewport = viewport;
+        render_->dirty = true;
+        scheduleDisplay(render_);
     }
     void push(const QByteArray &frame, quint32 timestamp) override
     {

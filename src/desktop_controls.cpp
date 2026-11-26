@@ -137,7 +137,7 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     });
     connect(&session, &DesktopSession::frame, this, [this](const QByteArray &frame, quint32 time) {
         if (player_) {
-            if (session_.interactive() && !viewer_->inputSurface()->hasPictureSize())
+            if (!callbacks_->receivedStamp || !viewer_->inputSurface()->hasPictureSize())
                 viewer_->inputSurface()->setPictureSize(h264PictureSize(frame));
             callbacks_->receivedStamp = time;
             player_->push(frame, time);
@@ -477,17 +477,12 @@ void DesktopControls::openViewer()
     connect(viewer_, &DesktopViewer::soundRequested, &session_, &DesktopSession::enableSound);
     viewer_->setWindowTitle((control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(session_.peerName()));
     connect(viewer_, &DesktopViewer::displayRequested, &session_, &DesktopSession::chooseDisplay);
+    connect(viewer_, &DesktopViewer::viewportChanged, this, [this] {
+        if (player_)
+            player_->setViewport(viewer_->inputSurface()->viewport());
+    });
     if (control) {
         auto *surface = viewer_->inputSurface();
-        auto *resized = new QTimer(viewer_);
-        resized->setSingleShot(true);
-        auto resizeFinished = [resized] { resized->start(60); };
-        connect(surface, &QWindow::widthChanged, resized, resizeFinished);
-        connect(surface, &QWindow::heightChanged, resized, resizeFinished);
-        connect(resized, &QTimer::timeout, this, [this] {
-            if (callbacks_ && !callbacks_->firstPicture)
-                session_.refreshVideo();
-        });
         connect(surface, &InputWindow::input, this, [this](const InputEvent &e) { session_.sendInput(e); });
         connect(viewer_, &DesktopViewer::switchRequested, this, [this] {
             InputEvent event;
@@ -534,5 +529,6 @@ void DesktopControls::startPlayer()
                 });
         },
         Callbacks::error(gate));
+    player_->setViewport(viewer_->inputSurface()->viewport());
 }
 } // namespace wwmm

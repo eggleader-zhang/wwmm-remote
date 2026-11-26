@@ -9,6 +9,7 @@ struct DesktopDisplay {
     QString name;
     QSize pixels;
     bool primary = false;
+    QString persistentId; // Local monitor identity. Only the session-scoped id crosses the network.
     bool operator==(const DesktopDisplay &) const = default;
 };
 

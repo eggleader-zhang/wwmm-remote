@@ -30,11 +30,26 @@ void DesktopSession::updateHostDisplays(QList<DesktopDisplay> available, bool re
         available.resize(displayLimit);
     const auto old = findDisplay(displays_, display_);
     const auto selected = findDisplay(available, display_);
-    const bool current = selected != available.cend();
+    const bool current = selected != available.cend() &&
+                         (old == displays_.cend() || old->persistentId == selected->persistentId);
     const bool resized = current && old != displays_.cend() && old->pixels != selected->pixels;
     const auto primary =
         std::find_if(available.cbegin(), available.cend(), [](const auto &d) { return d.primary; });
-    const auto id = current ? display_ : (primary == available.cend() ? available.first().id : primary->id);
+    auto first = primary == available.cend() ? available.cbegin() : primary;
+    if (!current) {
+        rememberOnPresent_.clear();
+        if (!display_ && extended_) {
+            const auto saved = store_.preferredDisplay(selected_);
+            if (saved.isEmpty())
+                rememberOnPresent_ = first->persistentId;
+            else {
+                auto matches = [&saved](const DesktopDisplay &d) { return d.persistentId == saved; };
+                if (std::count_if(available.cbegin(), available.cend(), matches) == 1)
+                    first = std::find_if(available.cbegin(), available.cend(), matches);
+            }
+        }
+    }
+    const auto id = current ? display_ : first->id;
     if (available != displays_) {
         displays_ = std::move(available);
         if (extended_) {
@@ -99,10 +114,18 @@ bool DesktopSession::displayMessage(const QByteArray &msg)
     const char op = msg[0];
     if (state_ == Sharing && op == 'S' && msg.size() == 9) {
         const auto id = qFromBigEndian<quint64>(msg.constData() + 1);
-        startDisplay(findDisplay(displays_, id) == displays_.cend() ? display_ : id);
+        auto screen = findDisplay(displays_, id);
+        if (screen != displays_.cend())
+            rememberOnPresent_ = screen->persistentId;
+        startDisplay(screen == displays_.cend() ? display_ : id);
     } else if (state_ == Sharing && op == 'R' && msg.size() == 5) {
-        if (qFromBigEndian<quint32>(msg.constData() + 1) == boundary_)
+        if (qFromBigEndian<quint32>(msg.constData() + 1) == boundary_) {
             displayReady_ = true;
+            if (!rememberOnPresent_.isEmpty()) {
+                store_.savePreferredDisplay(selected_, rememberOnPresent_);
+                rememberOnPresent_.clear();
+            }
+        }
     } else if (state_ == Viewing && msg == "L") {
         announced_.clear();
         listing_ = true;

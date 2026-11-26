@@ -29,6 +29,8 @@ class DeviceStore final : public QObject
     void openAsync();
     bool remember(const QByteArray &key, const QString &name, QString &error);
     bool forget(const QByteArray &key, QString &error);
+    QString preferredDisplay(const QByteArray &peer) const;
+    void savePreferredDisplay(const QByteArray &peer, const QString &display) const;
     const QByteArray &publicKey() const { return publicKey_; }
     const QMap<QByteArray, QString> &peers() const { return peers_; }
     QByteArray sign(const QByteArray &message) const;

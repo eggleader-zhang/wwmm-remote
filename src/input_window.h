@@ -12,11 +12,16 @@ class InputWindow final : public QWindow {
 
     void setPictureSize(QSize s)
     {
-        if (!s.isEmpty())
+        if (!s.isEmpty() && picture_ != s) {
             picture_ = s;
+            emit pictureSizeChanged();
+        }
     }
 
     bool hasPictureSize() const { return !picture_.isEmpty(); }
+    QSize pictureSize() const { return picture_; }
+    VideoViewport viewport() const { return viewport_; }
+    void setViewport(VideoViewport viewport) { viewport_ = viewport; }
 
     void presented();
     void changeDisplay();
@@ -31,6 +36,8 @@ class InputWindow final : public QWindow {
     void preeditChanged(const QString &text);
     void firstPictureShown();
     void fileDropped(const QString &path);
+    void pictureSizeChanged();
+    void pixelRatioChanged();
 
   protected:
     bool event(QEvent *event) override;
@@ -49,6 +56,7 @@ class InputWindow final : public QWindow {
     bool fileDrops_ = false;
     InputFocus focus_ = InputFocus::Raw;
     QSize picture_;
+    VideoViewport viewport_;
     quint8 mods_ = 0, buttons_ = 0;
     QHash<quint8, quint8> held_;
     QPointF caret_{8, 8};

@@ -660,6 +660,7 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     displays_.clear();
     announced_.clear();
     display_ = 0;
+    rememberOnPresent_.clear();
     adaptive_ = rich_ = extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
     qualityLimit_ = quality_ = VideoQuality::FullHD;
     hardwareLimit_ = VideoQuality::UHD;

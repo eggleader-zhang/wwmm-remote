@@ -1,5 +1,6 @@
 #pragma once
 #include "probe_message.h"
+#include "video_viewport.h"
 #include <QMap>
 #include <QPointF>
 #include <QSizeF>
@@ -31,7 +32,8 @@ struct InputEvent {
 QByteArray packInput(const InputEvent &e);
 std::optional<InputEvent> readInput(const QByteArray &message);
 QList<QString> inputTextChunks(const QString &text);
-std::optional<ScreenPoint> screenPoint(QPointF local, QSizeF view, QSize picture, bool clamp);
+std::optional<ScreenPoint> screenPoint(QPointF local, QSize view, QSize picture, bool clamp,
+                                       VideoViewport viewport = {});
 bool newerInput(quint32 a, quint32 b);
 quint8 modifierBit(quint8 usage);
 int nativeKeyCode(DesktopOS os, quint8 usage);

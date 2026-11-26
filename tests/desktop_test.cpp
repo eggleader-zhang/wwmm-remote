@@ -247,6 +247,9 @@ class DesktopTest final : public QObject
         p = screenPoint({210, 9}, {201, 201}, {201, 101}, true);
         QVERIFY(p);
         QCOMPARE(p->x, 65535);
+        const VideoViewport panned{true, {100, 40}};
+        auto edge = screenPoint({99, 59}, {100, 60}, {200, 100}, false, panned);
+        QVERIFY(edge && edge->x == 65535 && edge->y == 65535);
         QCOMPARE(p->y, 0);
     }
     void rtpRoundTrip()
@@ -512,7 +515,8 @@ class DesktopTest final : public QObject
         auto &receiver = host.session.dataLink();
         QVERIFY(!receiver.ready());
         host.session.accept();
-        host.session.updateHostDisplays({{1, "Main", {1920, 1080}, true}, {2, "Side", {1080, 1920}, false}});
+        host.session.updateHostDisplays({{1, "Main", {1920, 1080}, true, "panel-a"},
+                                         {2, "Side", {1080, 1920}, false, "panel-b"}});
         QTRY_VERIFY(sender.ready() && receiver.ready());
         QTRY_COMPARE(viewer.session.displayId(), 1u);
         QSignalSpy frames(&viewer.session, &DesktopSession::frame);
@@ -604,6 +608,14 @@ class DesktopTest final : public QObject
         viewer.session.view(peer, true);
         QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
         QVERIFY(!receiver.ready());
+        host.session.accept();
+        // The OS assigned new handles to the same two monitors between connections.
+        host.session.updateHostDisplays({{8, "Main", {1920, 1080}, true, "panel-a"},
+                                         {9, "Side", {1080, 1920}, false, "panel-b"}});
+        QTRY_COMPARE(viewer.session.displayId(), 9u);
+        host.session.updateHostDisplays({{8, "Main", {1920, 1080}, true, "panel-a"}});
+        QTRY_COMPARE(viewer.session.displayId(), 8u);
+        QCOMPARE(host.store.preferredDisplay(viewer.store.publicKey()), QStringLiteral("panel-b"));
         host.session.stop();
         QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
     }

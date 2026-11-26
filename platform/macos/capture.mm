@@ -1,5 +1,6 @@
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <AppKit/AppKit.h>
+#import <ColorSync/ColorSync.h>
 #include "video_encoder.h"
 #include "video_packets.h"
 #include <atomic>
@@ -189,10 +190,15 @@ QList<DesktopDisplay> desktopDisplays()
         if (!id || CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay)
             continue;
         const auto rect = screen.frame;
+        QString persistent;
+        if (CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(id)) {
+            persistent = QString::fromNSString(CFBridgingRelease(CFUUIDCreateString(nullptr, uuid)));
+            CFRelease(uuid);
+        }
         displays.append({id, QString::fromNSString(screen.localizedName),
                          QSize(qRound(rect.size.width * screen.backingScaleFactor),
                                qRound(rect.size.height * screen.backingScaleFactor)),
-                         id == CGMainDisplayID()});
+                         id == CGMainDisplayID(), persistent});
     }
     return displays;
 }
