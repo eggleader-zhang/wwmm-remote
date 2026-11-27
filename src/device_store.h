@@ -28,7 +28,7 @@ class DeviceStore final : public QObject
     ~DeviceStore() override;
     bool open(QString &error);
     void openAsync();
-    bool remember(const QByteArray &key, const QString &name, QString &error);
+    bool remember(const QByteArray &key, const QString &name, QString &error, bool allowDirectAccess = false);
     bool forget(const QByteArray &key, QString &error);
     bool allowsDirectAccess(const QByteArray &key) const { return directAccess_.contains(key); }
     bool setDirectAccess(const QByteArray &key, bool allow, QString &error);
@@ -44,7 +44,7 @@ class DeviceStore final : public QObject
     void openFinished(const QString &error);
 
   private:
-    enum class Change { Load, Pair, Forget, AllowDirect, RequireConsent };
+    enum class Change { Load, Pair, PairWithDirectAccess, Forget, AllowDirect, RequireConsent };
     bool update(Change change, const QByteArray &key, const QString &name, QString &error);
     QString directory_;
     VaultIO vault_;

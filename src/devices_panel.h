@@ -4,6 +4,8 @@
 #include <QWidget>
 
 class QAction;
+class QCheckBox;
+class QHideEvent;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -20,12 +22,18 @@ class DevicesPanel final : public QWidget
   public:
     DevicesPanel(LanProbe &, Discovery &, Pairing &, DeviceStore &, QWidget *parent = nullptr);
     DesktopSession &desktopSession() const { return *desktop_; }
+    void openLastDevice();
+
+  protected:
+    void hideEvent(QHideEvent *event) override;
 
   private:
     void refreshList();
     void updateActions();
     void updateOffer();
     void requestDesktop(bool control);
+    void rememberTarget(const QByteArray &key, bool control);
+    void tryAutoConnect(bool timerDue = false);
     void showStatus(const QString &message);
     QByteArray selectedKey() const;
     QStringList recent_;
@@ -38,11 +46,13 @@ class DevicesPanel final : public QWidget
     QListWidget *list_;
     QLabel *empty_, *issue_, *localCode_, *status_;
     QLineEdit *code_;
+    QCheckBox *pairAccess_;
     QPushButton *offer_, *pair_, *primary_;
     QPushButton *more_;
-    QAction *view_, *control_, *directAccess_, *repair_, *forget_;
-    QTimer refresh_, countdown_;
-    QByteArray actionKey_, repairKey_;
-    bool primaryControl_ = false;
+    QAction *view_, *control_, *directAccess_, *repair_, *forget_, *autoConnect_;
+    QTimer refresh_, countdown_, autoDial_;
+    QByteArray actionKey_, repairKey_, pendingPeer_;
+    int retryDelayMs_ = 0;
+    bool primaryControl_ = false, pendingControl_ = false, asleep_ = false;
 };
 } // namespace wwmm

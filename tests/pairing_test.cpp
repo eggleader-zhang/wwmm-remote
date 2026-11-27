@@ -558,7 +558,7 @@ class PairTest : public QObject
         auto *view = left.findChild<QAction *>("viewDesktop");
         auto *allow = right.findChild<QPushButton *>("allowDesktop");
         auto *decline = right.findChild<QPushButton *>("endDesktop");
-        auto *remember = right.findChild<QCheckBox *>("rememberAccess");
+        auto *remember = right.findChild<QPushButton *>("rememberAccess");
         auto *permission = right.findChild<QAction *>("directAccess");
         QVERIFY(remember && permission);
         QVERIFY(permission->isEnabled() && !permission->isChecked());

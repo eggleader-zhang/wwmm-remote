@@ -28,7 +28,7 @@ int Pairing::secondsLeft() const
     return server_ ? int((deadline_.remainingTime() + 999) / 1000) : 0;
 }
 
-void Pairing::offer()
+void Pairing::offer(bool allowDirectAccess)
 {
     if (derivingOffer_)
         return;
@@ -37,6 +37,7 @@ void Pairing::offer()
         return;
     }
     cancelOffer();
+    offerDirectAccess_ = allowDirectAccess;
     const auto epoch = offerEpoch_;
     offeredOn_ = probe_.endpoints();
     const auto code =
@@ -73,6 +74,7 @@ void Pairing::clearOffer()
 {
     ++offerEpoch_;
     server_.reset();
+    offerDirectAccess_ = false;
     code_.clear();
     offeredOn_.clear();
     attempts_ = 0;
@@ -107,7 +109,7 @@ void Pairing::incoming(QTcpSocket *socket, const LanAddress &link)
             error = tr("本次配对码已失效。");
             return false;
         }
-        if (!store_.remember(key, name, error))
+        if (!store_.remember(key, name, error, offerDirectAccess_))
             return false;
         clearOffer();
         return true;
@@ -166,11 +168,13 @@ void Pairing::pair(const NearbyDevice &target, const QString &code)
         auto *session = new PairSession(socket, ctx, store_, name_, target.key, save, this);
         outbound_ = session;
         outboundLink_ = target.link;
-        connect(session, &PairSession::finished, this, [this](bool, const QString &message) {
+        connect(session, &PairSession::finished, this, [this, target](bool ok, const QString &message) {
             outbound_ = nullptr;
             outboundLink_.reset();
             emit stateChanged();
             emit notice(message);
+            if (ok)
+                emit pairedWithHost(target);
         });
         connect(socket, &QTcpSocket::connected, session, &PairSession::start);
         socket->connectToHost(socketAddress(target.endpoint.address, target.link), target.endpoint.port);

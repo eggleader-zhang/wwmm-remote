@@ -703,6 +703,7 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
         return;
     const bool resume = transportLost && !host_ && (state_ == Viewing || retrying_) &&
                         store_.peers().contains(selected_);
+    const bool targetUnreachable = transportLost && !host_ && state_ == Connecting;
     const auto last = transportLost && adaptive_ ? "D" : (state_ == Requested && reason.isEmpty() ? "N" : "X");
     auto *channel = std::exchange(control_, nullptr);
     if (channel) {
@@ -738,6 +739,8 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     }
     retrying_ = resume;
     setState(resume ? Interrupted : Idle);
+    if (!resume)
+        emit ended(targetUnreachable);
     emit notice(reason.isEmpty() ? tr("本次桌面会话已结束。") : reason);
 }
 } // namespace wwmm

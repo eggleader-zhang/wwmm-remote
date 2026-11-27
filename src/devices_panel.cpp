@@ -3,6 +3,8 @@
 #include "desktop_tray.h"
 #include "main_window.h"
 #include <QApplication>
+#include <QCheckBox>
+#include <QHideEvent>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -24,6 +26,7 @@ namespace wwmm
 namespace
 {
 constexpr int detailRole = Qt::UserRole + 1;
+constexpr auto directPairingSetting = "pairing/allowDirectAccess";
 
 QLabel *label(QWidget *parent)
 {
@@ -135,6 +138,7 @@ QWidget *createDevicesPage(LanProbe &probe, DeviceStore &store)
         layout->addWidget(panel);
         loading->hide();
         loading->deleteLater();
+        QTimer::singleShot(0, panel, &DevicesPanel::openLastDevice);
         QObject::connect(qApp, &QGuiApplication::applicationStateChanged, panel,
                          [&store](Qt::ApplicationState state) {
                              if (state == Qt::ApplicationActive)
@@ -177,6 +181,10 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     connect(&probe, &LanProbe::receivingChanged, receive, &QAction::setChecked);
     auto *settings = local->menu()->addMenu(tr("设置"));
     settings->setToolTipsVisible(true);
+    autoConnect_ = settings->addAction(tr("自动连接上次的设备"));
+    autoConnect_->setCheckable(true);
+    autoConnect_->setChecked(QSettings().value("desktop/autoConnect", true).toBool());
+    autoConnect_->setToolTip(tr("打开应用时连接上次的设备，意外断线后自动重连"));
 #ifdef Q_OS_WIN
     auto *macKeys = settings->addAction(tr("自动映射 Mac 按键关系"));
     macKeys->setObjectName("autoMapMacKeys");
@@ -196,6 +204,12 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     localCode_->setObjectName("localPairCode");
     localCode_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(localCode_);
+    pairAccess_ = new QCheckBox(tr("允许持此配对码的设备以后直接查看和控制本机"), this);
+    layout->addWidget(pairAccess_);
+    connect(pairAccess_, &QCheckBox::clicked, this, [this](bool allow) {
+        QSettings().setValue(directPairingSetting, allow);
+        pairing_.setOfferDirectAccess(allow);
+    });
 
     layout->addWidget(new DesktopControls(*desktop_, discovery, settings, this));
     list_ = new QListWidget(this);
@@ -265,7 +279,11 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         if (!error.isEmpty())
             showStatus(error);
     });
-    connect(list_, &QListWidget::currentItemChanged, this, &DevicesPanel::updateActions);
+    connect(list_, &QListWidget::currentItemChanged, this, [this] {
+        if (pendingPeer_ != selectedKey())
+            pendingPeer_.clear();
+        updateActions();
+    });
     connect(code_, &QLineEdit::textChanged, this, &DevicesPanel::updateActions);
     connect(code_, &QLineEdit::returnPressed, pair_, &QPushButton::click);
     connect(primary_, &QPushButton::clicked, this, [this] { requestDesktop(primaryControl_); });
@@ -278,6 +296,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         updateActions();
     });
     connect(repair_, &QAction::triggered, this, [this] {
+        pendingPeer_.clear();
         repairKey_ = repairKey_.isEmpty() ? selectedKey() : QByteArray{};
         code_->clear();
         updateActions();
@@ -299,6 +318,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         if (peer != online.cend() && (!store_.peers().contains(key) || key == repairKey_) &&
             code_->text().size() == 8 && code_->hasAcceptableInput()) {
             const auto target = *peer;
+            pendingPeer_.clear();
             repairKey_.clear();
             showStatus(tr("正在验证设备身份…"));
             pairing_.pair(target, code_->text());
@@ -306,9 +326,13 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         }
     });
     connect(offer_, &QPushButton::clicked, this, [this] {
-        if (pairing_.code().isEmpty())
-            pairing_.offer();
-        else
+        pendingPeer_.clear();
+        if (pairing_.code().isEmpty()) {
+            const bool controlled = desktop_->state() == DesktopSession::Sharing && desktop_->interactive();
+            const bool allow = !controlled && QSettings().value(directPairingSetting, true).toBool();
+            pairAccess_->setChecked(allow);
+            pairing_.offer(allow);
+        } else
             pairing_.cancelOffer();
     });
     countdown_.setInterval(1000);
@@ -320,30 +344,70 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     connect(&probe, &LanProbe::endpointsChanged, this, &DevicesPanel::updateOffer);
     connect(&probe, &LanProbe::receivingChanged, this, &DevicesPanel::updateOffer);
     connect(&pairing, &Pairing::notice, this, &DevicesPanel::showStatus);
-    connect(desktop_, &DesktopSession::notice, this, &DevicesPanel::showStatus);
-    connect(desktop_, &DesktopSession::changed, this, [this, schedule] {
-        if (desktop_->state() == DesktopSession::Connecting)
-            showStatus({});
-        if (desktop_->state() == DesktopSession::Viewing) {
-            const auto key = QString::fromLatin1(desktop_->peerKey().toHex());
-            const auto record = (desktop_->interactive() ? QStringLiteral("c") : QStringLiteral("v")) + key;
-            if (recent_.value(0) != record) {
-                recent_.removeIf([&key](const QString &r) { return r.mid(1) == key; });
-                recent_.prepend(record);
-                if (recent_.size() > 5)
-                    recent_.removeLast();
-                QSettings().setValue(recentSetting_, recent_);
-                schedule();
-            }
+    connect(&pairing, &Pairing::pairedWithHost, this, [this](const NearbyDevice &host) {
+        if (!autoConnect_->isChecked() || desktop_->state() != DesktopSession::Idle || !host.canRequestDesktop(false))
+            return;
+        pendingPeer_ = host.key;
+        pendingControl_ = host.canRequestDesktop(true) && !recent_.contains(QStringLiteral("v") + host.key.toHex());
+        rememberTarget(pendingPeer_, pendingControl_);
+        retryDelayMs_ = 0;
+        tryAutoConnect();
+    });
+    autoDial_.setSingleShot(true);
+    connect(&autoDial_, &QTimer::timeout, this, [this] { tryAutoConnect(true); });
+    connect(autoConnect_, &QAction::toggled, this, [this](bool enabled) {
+        QSettings().setValue("desktop/autoConnect", enabled);
+        if (enabled && desktop_->state() == DesktopSession::Interrupted) {
+            tryAutoConnect();
+        } else if (enabled) {
+            openLastDevice();
+        } else {
+            pendingPeer_.clear();
+            autoDial_.stop();
         }
         updateActions();
     });
+    connect(desktop_, &DesktopSession::notice, this, [this](const QString &message) {
+        if (desktop_->state() == DesktopSession::Idle && !pendingPeer_.isEmpty() && autoDial_.isActive())
+            showStatus(tr("%1 暂时未接通，稍后会自动重试。").arg(store_.peers().value(pendingPeer_)));
+        else
+            showStatus(message);
+    });
+    connect(desktop_, &DesktopSession::ended, this, [this](bool targetUnreachable) {
+        if (!targetUnreachable)
+            pendingPeer_.clear();
+        tryAutoConnect();
+    });
+    connect(desktop_, &DesktopSession::changed, this, [this] {
+        const auto state = desktop_->state();
+        autoDial_.stop();
+        if (state == DesktopSession::Connecting) {
+            if (pendingPeer_ != desktop_->peerKey())
+                pendingPeer_.clear();
+            showStatus({});
+        }
+        if (state == DesktopSession::Waiting || state == DesktopSession::Sharing || state == DesktopSession::Requested)
+            pendingPeer_.clear();
+        if (state == DesktopSession::Sharing && desktop_->interactive() &&
+            (pairing_.preparing() || !pairing_.code().isEmpty()))
+            pairing_.cancelOffer();
+        if (state == DesktopSession::Interrupted)
+            tryAutoConnect();
+        if (state == DesktopSession::Viewing) {
+            retryDelayMs_ = 0;
+            rememberTarget(desktop_->peerKey(), desktop_->interactive());
+        }
+        updateActions();
+        updateOffer();
+    });
     watchDesktopPower(this, [this](bool awake) {
+        asleep_ = !awake;
+        autoDial_.stop();
         desktop_->interrupt(tr("电脑已休眠，本次桌面授权已结束。"));
         if (awake) {
             probe_.refresh();
             discovery_.restart();
-            showStatus(tr("已唤醒。设备上线后可重新连接。"));
+            tryAutoConnect();
         }
     });
     refreshList();
@@ -438,6 +502,7 @@ void DevicesPanel::refreshList()
     list_->setVisible(!rows.isEmpty());
     empty_->setVisible(rows.isEmpty());
     updateActions();
+    tryAutoConnect();
 }
 
 void DevicesPanel::updateActions()
@@ -476,12 +541,13 @@ void DevicesPanel::updateActions()
     directAccess_->setEnabled(trusted && (!beingControlled || directAccess_->isChecked()));
     code_->setVisible(pairable && !busy);
     pair_->setVisible(pairable || busy);
-    pair_->setText(busy ? tr("取消配对") : tr("配对"));
+    pair_->setText(busy ? tr("取消配对") : autoConnect_->isChecked() ? tr("配对并连接") : tr("配对"));
     pair_->setEnabled(busy || (pairable && code_->text().size() == 8));
     auto hint = discovery_.issue();
     if (hint.isEmpty() && trusted && !repairing && idle && !busy) {
         if (!present)
-            hint = tr("设备已离线。请在对方电脑上打开 WWMM Remote。");
+            hint = key == pendingPeer_ ? tr("正在等待设备上线，上线后会自动连接。")
+                                       : tr("设备已离线。请在对方电脑上打开 WWMM Remote。");
         else if (!canView)
             hint = tr("桌面协议不兼容。请将两端的 WWMM Remote 更新到同一最新版。");
         else if (peer->desktop == DesktopAccess::Unspecified)
@@ -495,10 +561,13 @@ void DevicesPanel::updateOffer()
 {
     const auto code = pairing_.code();
     offer_->setText(pairing_.preparing() ? tr("正在生成…") : code.isEmpty() ? tr("本机配对码") : tr("取消配对码"));
+    const bool controlled = desktop_->state() == DesktopSession::Sharing && desktop_->interactive();
     offer_->setEnabled(!store_.publicKey().isEmpty() && !pairing_.preparing() && probe_.receiving() &&
                        !probe_.endpoints().isEmpty());
     offer_->setToolTip(!probe_.receiving() ? tr("在「本机」菜单中开启局域网发现") : QString{});
     localCode_->setVisible(!code.isEmpty());
+    pairAccess_->setEnabled(!controlled);
+    pairAccess_->setVisible(!code.isEmpty());
     if (code.isEmpty()) {
         countdown_.stop();
         localCode_->clear();
@@ -514,6 +583,8 @@ void DevicesPanel::requestDesktop(bool control)
 {
     if (desktop_->state() != DesktopSession::Idle)
         return;
+    pendingPeer_.clear();
+    autoDial_.stop();
     const auto key = selectedKey();
     const auto &online = discovery_.devicesByKey();
     const auto peer = online.constFind(key);
@@ -522,6 +593,78 @@ void DevicesPanel::requestDesktop(bool control)
         return;
     }
     const auto target = *peer;
+    desktop_->view(target, control);
+}
+
+void DevicesPanel::openLastDevice()
+{
+    if (!autoConnect_->isChecked() || desktop_->state() != DesktopSession::Idle || recent_.isEmpty() ||
+        !isVisible() || window()->isMinimized())
+        return;
+    const auto &record = recent_.first();
+    pendingPeer_ = QByteArray::fromHex(record.mid(1).toLatin1());
+    pendingControl_ = record.startsWith(u'c');
+    retryDelayMs_ = 0;
+    autoDial_.stop();
+    tryAutoConnect();
+    updateActions();
+}
+
+void DevicesPanel::rememberTarget(const QByteArray &key, bool control)
+{
+    const auto hex = QString::fromLatin1(key.toHex());
+    const auto record = (control ? QStringLiteral("c") : QStringLiteral("v")) + hex;
+    if (recent_.value(0) == record)
+        return;
+    recent_.removeIf([&hex](const QString &previous) { return previous.mid(1) == hex; });
+    recent_.prepend(record);
+    if (recent_.size() > 5)
+        recent_.removeLast();
+    QSettings().setValue(recentSetting_, recent_);
+    if (!refresh_.isActive())
+        refresh_.start(0);
+}
+
+void DevicesPanel::hideEvent(QHideEvent *event)
+{
+    pendingPeer_.clear();
+    QWidget::hideEvent(event);
+}
+
+void DevicesPanel::tryAutoConnect(bool timerDue)
+{
+    const bool resuming = desktop_->state() == DesktopSession::Interrupted;
+    if (!autoConnect_->isChecked() || asleep_ || (!resuming && desktop_->state() != DesktopSession::Idle))
+        return;
+    if (!resuming && (!isVisible() || window()->isMinimized() || pairing_.busy() || pairing_.preparing() ||
+                      !pairing_.code().isEmpty())) {
+        pendingPeer_.clear();
+        return;
+    }
+    const auto key = resuming ? desktop_->peerKey() : pendingPeer_;
+    if (key.isEmpty())
+        return;
+    if (!store_.peers().contains(key)) {
+        pendingPeer_.clear();
+        return;
+    }
+    const auto &online = discovery_.devicesByKey();
+    const auto peer = online.constFind(key);
+    // An interrupted viewer keeps its original input mode.
+    if (peer == online.cend() || !peer->canRequestDesktop(resuming && desktop_->interactive())) {
+        autoDial_.stop();
+        return;
+    }
+    if (!timerDue) {
+        // Stagger simultaneous opens of a pair that has connected in both directions.
+        const int stagger = store_.publicKey() < key ? 0 : 350;
+        if (!autoDial_.isActive())
+            autoDial_.start((resuming ? qMax(900, retryDelayMs_) : retryDelayMs_) + stagger);
+        return;
+    }
+    const auto target = *peer;
+    const bool control = resuming ? desktop_->interactive() : pendingControl_ && target.canRequestDesktop(true);
+    retryDelayMs_ = qBound(1000, retryDelayMs_ * 2, 15000);
     desktop_->view(target, control);
 }
 } // namespace wwmm

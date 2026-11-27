@@ -79,6 +79,7 @@ class DesktopSession final : public QObject {
     void refreshVideo();
   signals:
     void changed();
+    void ended(bool targetUnreachable);
     void displaysChanged();
     void displaySwitched(bool formatOnly);
     void beforePaste();

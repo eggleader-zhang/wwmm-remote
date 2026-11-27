@@ -111,13 +111,13 @@ void DeviceStore::openAsync()
     }));
 }
 
-bool DeviceStore::remember(const QByteArray &key, const QString &name, QString &error)
+bool DeviceStore::remember(const QByteArray &key, const QString &name, QString &error, bool allowDirectAccess)
 {
     if (key.size() != 32 || key == publicKey_ || !validDeviceName(name)) {
         error = tr("设备身份无效。");
         return false;
     }
-    return update(Change::Pair, key, name, error);
+    return update(allowDirectAccess ? Change::PairWithDirectAccess : Change::Pair, key, name, error);
 }
 
 bool DeviceStore::setDirectAccess(const QByteArray &key, bool allow, QString &error)
@@ -211,14 +211,17 @@ bool DeviceStore::update(Change change, const QByteArray &key, const QString &na
             direct.insert(raw);
     }
     const auto id = QString::fromLatin1(key.toHex());
-    if (change == Change::Pair) {
+    if (change == Change::Pair || change == Change::PairWithDirectAccess) {
         if (!verified.contains(key) && verified.size() >= 128) {
             error = tr("已保存 128 台设备，请先撤销不用的设备。");
             return false;
         }
         peers.insert(id, name);
         verified.insert(key, name);
-        direct.remove(key);
+        if (change == Change::PairWithDirectAccess)
+            direct.insert(key);
+        else
+            direct.remove(key);
     } else if (change == Change::Forget) {
         peers.remove(id);
         verified.remove(key);

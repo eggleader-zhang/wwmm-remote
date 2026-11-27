@@ -11,7 +11,8 @@ class Pairing final : public QObject
     Q_OBJECT
 public:
     Pairing(LanProbe &probe, DeviceStore &store, QString name, int lifetimeMs = 120000);
-    void offer();
+    void offer(bool allowDirectAccess = false);
+    void setOfferDirectAccess(bool allow) { offerDirectAccess_ = allow; }
     void cancelOffer();
     void pair(const NearbyDevice &target, const QString &code);
     void cancelPair();
@@ -35,6 +36,7 @@ public:
 signals:
     void stateChanged();
     void notice(const QString &message);
+    void pairedWithHost(const wwmm::NearbyDevice &host);
 
 private:
     void incoming(QTcpSocket *socket, const LanAddress &link);
@@ -53,5 +55,6 @@ private:
     int attempts_ = 0;
     quint64 offerEpoch_ = 0, clientEpoch_ = 0;
     bool derivingOffer_ = false, derivingClient_ = false;
+    bool offerDirectAccess_ = false;
 };
 } // namespace wwmm

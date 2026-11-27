@@ -1,6 +1,7 @@
 #include "desktop_tray.h"
 #include "desktop_session.h"
 #include "desktop_update.h"
+#include "devices_panel.h"
 #include <QApplication>
 
 namespace wwmm {
@@ -11,6 +12,13 @@ void showDevicesWindow(QWidget &window)
     window.show();
     window.raise();
     window.activateWindow();
+}
+
+void openDevicesWindow(QWidget &window)
+{
+    showDevicesWindow(window);
+    if (auto *panel = window.findChild<DevicesPanel *>())
+        panel->openLastDevice();
 }
 
 DesktopTray::DesktopTray(QWidget &window) : QObject(&window), window_(window), icon_(this)
@@ -26,7 +34,7 @@ DesktopTray::DesktopTray(QWidget &window) : QObject(&window), window_(window), i
 #endif
     icon_.setToolTip(qApp->applicationName());
     auto *open = menu_.addAction(tr("打开设备窗口"));
-    connect(open, &QAction::triggered, this, [this] { showDevicesWindow(window_); });
+    connect(open, &QAction::triggered, this, [this] { openDevicesWindow(window_); });
     stop_ = menu_.addAction(tr("停止共享"));
     stop_->setVisible(false);
     menu_.addSeparator();
@@ -39,7 +47,7 @@ DesktopTray::DesktopTray(QWidget &window) : QObject(&window), window_(window), i
 #ifdef Q_OS_WIN
     connect(&icon_, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
         if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
-            showDevicesWindow(window_);
+            openDevicesWindow(window_);
     });
 #endif
     icon_.show();

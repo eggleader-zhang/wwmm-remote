@@ -87,7 +87,7 @@ int main(int argc, char **argv)
     QObject::connect(&launcher, &QLocalServer::newConnection, window.get(), [&] {
         while (auto *socket = launcher.nextPendingConnection())
             socket->deleteLater();
-        wwmm::showDevicesWindow(*window);
+        wwmm::openDevicesWindow(*window);
     });
     QObject::connect(&probe, &wwmm::LanProbe::receivingChanged, &app, [&](bool enabled) {
         settings.setValue(QStringLiteral("diagnostics/receive"), enabled);

@@ -40,13 +40,13 @@ class DesktopControls final : public QWidget {
     DesktopSession &session_;
     Discovery &discovery_;
     QLabel *label_;
-    QCheckBox *soundCheck_, *rememberAccess_;
+    QCheckBox *soundCheck_;
     std::shared_ptr<Callbacks> soundCallbacks_;
     std::shared_ptr<AudioStream> audioStream_;
     std::unique_ptr<NativeAudio> audio_;
     QVBoxLayout *column_;
     TransferBar *transfer_ = nullptr;
-    QPushButton *yes_, *stop_;
+    QPushButton *yes_, *stop_, *rememberAccess_;
     DesktopViewer *viewer_ = nullptr;
     QAction *localCursor_, *remoteCursor_;
     std::shared_ptr<Callbacks> callbacks_;

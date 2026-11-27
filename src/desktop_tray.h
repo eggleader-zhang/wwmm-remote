@@ -7,6 +7,7 @@ class DesktopSession;
 class DesktopUpdate;
 
 void showDevicesWindow(QWidget &window);
+void openDevicesWindow(QWidget &window);
 
 class DesktopTray final : public QObject {
   public:

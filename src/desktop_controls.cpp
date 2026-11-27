@@ -114,20 +114,17 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
         if (viewer_)
             viewer_->setStatus(message);
     });
+    rememberAccess_ = new QPushButton(tr("允许并记住"), this);
+    rememberAccess_->setObjectName("rememberAccess");
+    rememberAccess_->setToolTip(tr("允许这台已配对设备以后直接查看和控制本机"));
+    row->addWidget(rememberAccess_);
     row->addWidget(yes_);
     row->addWidget(stop_);
-    rememberAccess_ = new QCheckBox(tr("以后允许此设备免确认查看和控制本机"), this);
-    rememberAccess_->setObjectName("rememberAccess");
-    column_->addWidget(rememberAccess_);
-    connect(rememberAccess_, &QCheckBox::toggled, this, [this](bool remember) {
-        yes_->setText(remember ? tr("允许并记住") : tr("允许本次控制"));
-    });
     focusTimer_ = new QTimer(this);
     focusTimer_->setInterval(200);
     connect(focusTimer_, &QTimer::timeout, this, &DesktopControls::refreshInputFocus);
-    connect(yes_, &QPushButton::clicked, this, [this] {
-        session_.accept(rememberAccess_->isChecked());
-    });
+    connect(rememberAccess_, &QPushButton::clicked, this, [this] { session_.accept(true); });
+    connect(yes_, &QPushButton::clicked, this, [this] { session_.accept(); });
     connect(stop_, &QPushButton::clicked, this, [this] { session_.stop(); });
     connect(&session, &DesktopSession::changed, this, &DesktopControls::updateState);
     connect(&discovery, &Discovery::changed, this, &DesktopControls::updateReconnect);
@@ -331,7 +328,7 @@ void DesktopControls::updateReconnect()
     if (!viewer_ || session_.state() != DesktopSession::Interrupted)
         return;
     const bool online = reconnectPeer().has_value();
-    const auto text = online ? tr("%1 已上线，可以重新连接。")
+    const auto text = online ? tr("已在局域网中找到 %1。")
                              : tr("正在等待 %1 回到局域网…");
     viewer_->showInterrupted(text.arg(session_.peerName()), online);
 }
@@ -353,7 +350,6 @@ void DesktopControls::updateState()
     setVisible(s != DesktopSession::Idle);
     yes_->setVisible(s == DesktopSession::Requested);
     rememberAccess_->setVisible(s == DesktopSession::Requested && control);
-    rememberAccess_->setChecked(false);
     soundCheck_->setVisible(s == DesktopSession::Sharing && session_.richMedia());
     yes_->setText(control ? tr("允许本次控制") : tr("允许本次查看"));
     stop_->setText(s == DesktopSession::Requested ? tr("拒绝")
