@@ -133,6 +133,45 @@ int serveTestPeer(QApplication &app, const QString &directory)
     QTimer::singleShot(25000, &app, [&] { app.exit(5); });
     return app.exec();
 }
+
+#ifdef Q_OS_WIN
+void runKeyboardTestOnOwnDesktop()
+{
+    // Hosted Windows 11 can cover every window with its first-run setup.
+    // Give only this test process an empty, ordinary desktop for its input.
+    const auto original = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP);
+    QVERIFY(original);
+    auto closeOriginal = qScopeGuard([&] { CloseDesktop(original); });
+    wchar_t originalName[128]{};
+    QVERIFY(GetUserObjectInformationW(original, UOI_NAME, originalName, sizeof(originalName), nullptr));
+    QCOMPARE(QString::fromWCharArray(originalName).toLower(), QStringLiteral("default"));
+    const QString name = "WWMM-test-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    auto wideName = name.toStdWString();
+    const auto own = CreateDesktopW(wideName.data(), nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+    QVERIFY(own);
+    auto closeOwn = qScopeGuard([&] { CloseDesktop(own); });
+    QVERIFY(SwitchDesktop(own));
+    auto restore = qScopeGuard([&] { SwitchDesktop(original); });
+
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const auto report = directory.filePath("keyboard.txt");
+    QProcess child;
+    auto env = QProcessEnvironment::systemEnvironment();
+    env.insert("WWMM_TEST_INPUT_DESKTOP", name);
+    child.setProcessEnvironment(env);
+    child.setCreateProcessArgumentsModifier([&](QProcess::CreateProcessArguments *args) {
+        args->startupInfo->lpDesktop = wideName.data();
+    });
+    child.start(QCoreApplication::applicationFilePath(), {"foregroundMacShortcuts", "-o", report + ",txt"});
+    QVERIFY2(child.waitForFinished(45000), qPrintable(child.errorString()));
+    QFile results(report);
+    QVERIFY(results.open(QIODevice::ReadOnly));
+    const auto output = results.readAll();
+    QVERIFY2(child.exitStatus() == QProcess::NormalExit && child.exitCode() == 0 &&
+             output.contains("PASS   : PairTest::foregroundMacShortcuts()"), output.constData());
+}
+#endif
 } // namespace
 class PairTest : public QObject
 {
@@ -625,6 +664,11 @@ class PairTest : public QObject
         QVERIFY(GetClientRect(target, &bounds) && bounds.right > 0 && bounds.bottom > 0);
         POINT point{bounds.right / 2, bounds.bottom / 2};
         QVERIFY(ClientToScreen(target, &point));
+        if (!qEnvironmentVariableIsSet("WWMM_TEST_INPUT_DESKTOP") &&
+            !QTest::qWaitFor([&] { return GetAncestor(WindowFromPoint(point), GA_ROOT) == window; }, 1000)) {
+            view.hide();
+            return runKeyboardTestOnOwnDesktop();
+        }
         QTRY_COMPARE(GetAncestor(WindowFromPoint(point), GA_ROOT), window);
         QVERIFY(SetCursorPos(point.x, point.y));
         POINT cursor{};
