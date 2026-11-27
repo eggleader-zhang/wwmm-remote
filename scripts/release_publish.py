@@ -1,4 +1,4 @@
-"""Publish the two tested installers at the exact workflow commit."""
+"""Publish the two installers at the exact workflow commit."""
 
 import hashlib
 import json
@@ -66,6 +66,6 @@ elif not r["draft"] or r["target_commitish"] != sha:
 gh("release", "upload", tag, *(root / name for name in expected), "--clobber")
 actual = {a["name"]: a["digest"] for a in release()["assets"]}
 if actual != {k: "sha256:" + v for k, v in expected.items()}:
-    raise RuntimeError("Uploaded digests do not match installed/tested files")
+    raise RuntimeError("Uploaded digests do not match the packaged files")
 gh("release", "edit", tag, "--draft=false", "--latest", "--notes-file", notes)
 print(gh("release", "view", tag, "--json", "url", "--jq", ".url"))

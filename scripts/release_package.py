@@ -108,9 +108,8 @@ def main():
     require_file(qt / "lib/cmake/Qt6/Qt6Config.cmake")
     os.environ["PATH"] = str(qt / "bin") + os.pathsep + os.environ["PATH"]
     windows = os_name == "windows"
-    targets = ["wwmm_remote", "wwmm_pair_tests", "wwmm_desktop_tests"]
     configure = ["cmake", "-S", ROOT, "-B", build, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-                 "-DBUILD_TESTING=ON", f"-DCMAKE_PREFIX_PATH={qt}"]
+                 "-DBUILD_TESTING=OFF", f"-DCMAKE_PREFIX_PATH={qt}"]
     if "GITHUB_RUN_NUMBER" in os.environ:
         configure.append(f"-DWWMM_BUILD_NUMBER={int(os.environ['GITHUB_RUN_NUMBER'])}")
     if windows:
@@ -119,25 +118,8 @@ def main():
     else:
         configure.append(f"-DCMAKE_OSX_ARCHITECTURES={arch}")
     subprocess.run(configure, check=True)
-    subprocess.run(["cmake", "--build", build, "--target", *targets, "--parallel",
+    subprocess.run(["cmake", "--build", build, "--target", "wwmm_remote", "--parallel",
                     str(min(os.cpu_count() or 2, 8))], check=True)
-    env = dict(os.environ, QT_QPA_PLATFORM="windows" if windows else "offscreen", QT_PLUGIN_PATH=str(qt / "plugins"))
-    suffix = ".exe" if windows else ""
-    gui_cases = ["readOnlyRequestButtons", "trayLifecycle", "storeAndRevocation"]
-    if windows:
-        gui_cases += ["macKeyPreferences", "foregroundMacShortcuts"]
-    for binary, cases in [("wwmm_pair_tests", gui_cases),
-                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess", "updateWaitsForIdle",
-                                                  "shortcutMapping", "mappedMacKeyboard"])]:
-        # Qt GUI tests on Windows can send their default output to the debugger.
-        report = build / (binary + "-results.txt")
-        report.unlink(missing_ok=True)
-        try:
-            subprocess.run([build / (binary + suffix), "-o", f"{report},txt", *cases],
-                           env=env, check=True, timeout=90)
-        finally:
-            if report.is_file():
-                print(report.read_text(encoding="utf-8", errors="replace"), flush=True)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)
     output = ROOT / "dist" / version

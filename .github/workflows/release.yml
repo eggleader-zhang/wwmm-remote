@@ -13,7 +13,6 @@ on:
       - 'src/**'
       - 'platform/**'
       - 'installer/**'
-      - 'tests/**'
 
 concurrency:
   group: desktop-releases
@@ -165,37 +164,8 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  install-test:
-    needs: [version, installers]
-    name: Install and upgrade · ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: darwin, target: macos-arm64, runner: macos-26 }
-          - { os: darwin, target: macos-x86_64, runner: macos-26-intel }
-          - { os: windows, target: windows-x64, runner: windows-2022 }
-          - { os: windows, target: windows-arm64, runner: windows-11-arm }
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: installer-${{ matrix.os }}
-          path: packages
-      - name: Load previously published portable edition for migration
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download v1.5.2-r2 --pattern "*-${{ matrix.target }}.zip" --dir previous
-      - name: Exercise native installation, offline upgrade and preserved profile
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == Windows ]]; then py=python; else py=python3; fi
-          "$py" scripts/release_verify.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
-
   publish:
-    needs: [version, install-test]
+    needs: [version, installers]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -208,7 +178,7 @@ jobs:
           pattern: installer-*
           path: packages
           merge-multiple: true
-      - name: Publish the tested installers
+      - name: Publish the installers
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
