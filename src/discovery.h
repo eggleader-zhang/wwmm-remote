@@ -2,6 +2,7 @@
 
 #include "lan_probe.h"
 #include <QMap>
+#include <optional>
 
 namespace wwmm
 {
@@ -45,6 +46,7 @@ public:
     using Factory = std::function<DnsSdBackend *(QObject *)>;
     Discovery(LanProbe &probe, QByteArray publicKey, QString name, Factory factory = nativeDnsSd);
     QList<NearbyDevice> devices() const;
+    const QMap<QByteArray, NearbyDevice> &devicesByKey() const;
     QString issue() const
     {
         return issue_;
@@ -55,6 +57,7 @@ public:
     void changed();
 
 private:
+    void refreshOn(const QList<LanAddress> &links);
     void resolved(unsigned index, const QString &instance, quint16 port, const ServiceFields &fields);
     LanProbe &probe_;
     QByteArray key_;
@@ -64,6 +67,7 @@ private:
     QList<LanAddress> links_;
     QList<LocalEndpoint> listening_;
     QMap<QPair<unsigned, QString>, NearbyDevice> seen_;
+    mutable std::optional<QMap<QByteArray, NearbyDevice>> byKey_;
     QString issue_;
     QElapsedTimer started_;
 };

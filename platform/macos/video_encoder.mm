@@ -112,18 +112,25 @@ void MacVideoEncoder::encoded(void *context, void *, OSStatus status, VTEncodeIn
         size_t n = CMBlockBufferGetDataLength(block);
         if (!n || n > maxAccessUnit)
             return;
-        QByteArray data(qsizetype(n), Qt::Uninitialized);
-        if (CMBlockBufferCopyDataBytes(block, 0, n, data.data()))
-            return;
+        char *data = nullptr;
+        size_t contiguous = 0;
+        QByteArray storage;
+        if (CMBlockBufferGetDataPointer(block, 0, &contiguous, nullptr, &data) || contiguous < n) {
+            storage.resize(qsizetype(n));
+            if (CMBlockBufferCopyDataBytes(block, 0, n, storage.data()))
+                return;
+            data = storage.data();
+        }
+        result.reserve(result.size() + qsizetype(n));
         for (size_t i = 0; i < n;) {
             if (i + size_t(header) > n)
                 return;
             quint32 size = 0;
             for (int j = 0; j < header; ++j)
-                size = size * 256 + quint8(data[qsizetype(i++)]);
+                size = size * 256 + quint8(data[i++]);
             if (!size || size > n - i)
                 return;
-            result.append(prefix, 4).append(data.constData() + i, size);
+            result.append(prefix, 4).append(data + i, size);
             i += size;
         }
         const auto pts = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample), 1000000,

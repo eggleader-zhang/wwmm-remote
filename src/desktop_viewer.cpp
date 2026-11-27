@@ -1,8 +1,6 @@
 #include "desktop_viewer.h"
 #include "input_window.h"
 #include "transfer_bar.h"
-#include <QComboBox>
-#include <QCheckBox>
 #include <QActionGroup>
 #include <QDragEnterEvent>
 #include <QGridLayout>
@@ -15,7 +13,6 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QTimer>
-#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
 
@@ -24,6 +21,8 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     : QDialog(parent, Qt::Window), surface_(new InputWindow(interactive))
 {
     column_ = new QVBoxLayout(this);
+    column_->setContentsMargins(0, 0, 0, 0);
+    column_->setSpacing(0);
     // The native renderer owns the video surface. Only the toolbar needs Qt's raster backing store.
     pages_ = new QStackedWidget(this);
     picturePage_ = new QWidget(pages_);
@@ -64,24 +63,34 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     column_->addWidget(pages_, 1);
     connect(retry_, &QPushButton::clicked, this, &DesktopViewer::reconnectRequested);
     auto *row = new QHBoxLayout;
+    row->setContentsMargins(10, 4, 10, 4);
     status_ = new QLabel(tr("等待第一帧…"), this);
+    status_->setTextFormat(Qt::PlainText);
     status_->setWordWrap(true);
     row->addWidget(status_, 1);
-    displays_ = new QComboBox(this);
-    displays_->setAccessibleName(tr("远端显示器"));
-    displays_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    displays_->setMinimumContentsLength(12);
-    row->addWidget(displays_);
-    displays_->hide();
-    connect(displays_, &QComboBox::activated, this, [this](int index) {
-        emit displayRequested(displays_->itemData(index).toULongLong());
+    auto *displayOptions = new QPushButton(tr("会话选项"), this);
+    displayOptions->setAutoDefault(false);
+    auto *menu = menu_ = new QMenu(displayOptions);
+    displayOptions->setMenu(menu);
+    displays_ = menu->addMenu(tr("远端显示器"));
+    displays_->setObjectName("displayMenu");
+    connect(displays_, &QMenu::triggered, this, [this](QAction *action) {
+        emit displayRequested(action->data().toULongLong());
         focusVideo();
     });
-    auto *displayOptions = new QToolButton(this);
-    displayOptions->setText(tr("显示"));
-    displayOptions->setPopupMode(QToolButton::InstantPopup);
-    auto *menu = new QMenu(displayOptions);
-    displayOptions->setMenu(menu);
+    quality_ = menu->addMenu(tr("最高画质"));
+    quality_->setObjectName("qualityMenu");
+    auto *qualities = new QActionGroup(quality_);
+    for (int i = 0; i < 3; ++i) {
+        auto *action = quality_->addAction(QString{});
+        action->setCheckable(true);
+        action->setData(i);
+        qualities->addAction(action);
+    }
+    connect(quality_, &QMenu::triggered, this, [this](QAction *action) {
+        emit qualityRequested(VideoQuality(action->data().toInt()));
+        focusVideo();
+    });
     auto *scale = new QActionGroup(menu);
     auto *fit = menu->addAction(tr("适应窗口"));
     original_ = menu->addAction(tr("原始像素（1:1）"));
@@ -95,14 +104,13 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
         updateViewport();
         focusVideo();
     });
-    menu->addSeparator();
     auto *full = menu->addAction(tr("全屏"));
     full->setObjectName("toggleFullScreen");
     connect(menu, &QMenu::aboutToShow, this, [this, full] {
         full->setText(isFullScreen() ? tr("退出全屏") : tr("全屏"));
+        updateStats();
     });
     connect(full, &QAction::triggered, this, &DesktopViewer::toggleFullScreen);
-    row->addWidget(displayOptions);
 
     auto *layoutTimer = new QTimer(this);
     layoutTimer->setSingleShot(true);
@@ -112,25 +120,14 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     connect(surface_, &InputWindow::pixelRatioChanged, this, resized);
     connect(surface_, &InputWindow::pictureSizeChanged, this, &DesktopViewer::updateViewport);
     connect(layoutTimer, &QTimer::timeout, this, &DesktopViewer::updateViewport);
-    {
-        quality_ = new QComboBox(this);
-        quality_->setEnabled(false);
-        quality_->setAccessibleName(tr("最高画质"));
-        quality_->setToolTip(tr("最高传输分辨率，保留屏幕宽高比"));
-        quality_->addItems({tr("1080p · 办公"), tr("1440p"), tr("4K")});
-        row->addWidget(quality_);
-        connect(quality_, &QComboBox::activated, this, [this](int index) {
-            emit qualityRequested(VideoQuality(index));
-            focusVideo();
-        });
-        sound_ = new QCheckBox(tr("远端声音"), this);
-        sound_->setToolTip(tr("共享端同意后，播放对方电脑的系统声音"));
-        row->addWidget(sound_);
-        connect(sound_, &QCheckBox::toggled, this, [this](bool enabled) {
-            emit soundRequested(enabled);
-            focusVideo();
-        });
-    }
+    menu->addSeparator();
+    sound_ = menu->addAction(tr("远端声音"));
+    sound_->setObjectName("remoteSound");
+    sound_->setCheckable(true);
+    connect(sound_, &QAction::triggered, this, [this](bool enabled) {
+        emit soundRequested(enabled);
+        focusVideo();
+    });
     connect(surface_, &InputWindow::fileDropped, this, &DesktopViewer::fileDropped);
     if (interactive) {
         auto *preedit = new QLabel(this);
@@ -141,17 +138,19 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
             preedit->setText(preedit->fontMetrics().elidedText(value, Qt::ElideRight, 220));
             preedit->setVisible(!value.isEmpty());
         });
-        auto *switchApp = switchApp_ = new QPushButton(tr("切换远端应用"), this);
+        auto *switchApp = switchApp_ = menu->addAction(tr("切换远端应用"));
         switchApp->setEnabled(false);
         connect(surface_, &InputWindow::firstPictureShown, switchApp,
                 [switchApp] { switchApp->setEnabled(true); });
-        switchApp->setAutoDefault(false);
-        row->addWidget(switchApp);
-        connect(switchApp, &QPushButton::clicked, this, [this] {
+        connect(switchApp, &QAction::triggered, this, [this] {
             emit switchRequested();
             focusVideo();
         });
     }
+    menu->addSeparator();
+    stats_ = menu->addAction(QString{});
+    stats_->setEnabled(false);
+    row->addWidget(displayOptions);
     auto *end = new QPushButton(interactive ? tr("结束控制") : tr("结束查看"), this);
     end->setAutoDefault(false);
     row->addWidget(end);
@@ -206,32 +205,34 @@ void DesktopViewer::keyPressEvent(QKeyEvent *event)
 
 void DesktopViewer::setDisplays(const QList<DesktopDisplay> &list, quint64 selected)
 {
-    QSignalBlocker block(displays_);
-    displays_->clear();
-    for (const auto &d : list) {
-        const auto title = tr("%1 · %2 · %3 × %4%5")
-                               .arg(displays_->count() + 1)
-                               .arg(d.name)
-                               .arg(d.pixels.width())
-                               .arg(d.pixels.height())
-                               .arg(d.primary ? tr(" · 主屏幕") : QString{});
-        displays_->addItem(title, QVariant::fromValue(d.id));
+    if (displayList_ != list) {
+        displayList_ = list;
+        displays_->clear();
+        for (const auto &d : list) {
+            const auto title = tr("%1 · %2 × %3%4").arg(d.name).arg(d.pixels.width()).arg(d.pixels.height())
+                                   .arg(d.primary ? tr(" · 主屏幕") : QString{});
+            auto *action = displays_->addAction(title);
+            action->setData(QVariant::fromValue(d.id));
+            action->setCheckable(true);
+        }
     }
-    displays_->setCurrentIndex(displays_->findData(QVariant::fromValue(selected)));
-    displays_->setVisible(list.size() > 1);
-    if (quality_)
-        quality_->setEnabled(selected != 0);
+    for (auto *action : displays_->actions())
+        action->setChecked(action->data().toULongLong() == selected);
+    displays_->menuAction()->setVisible(list.size() > 1);
+    quality_->menuAction()->setEnabled(selected != 0);
 }
 
 void DesktopViewer::showQuality(VideoQuality limit, VideoQuality active)
 {
     const QStringList titles{tr("1080p · 办公"), tr("1440p"), tr("4K")};
     const QStringList rates{tr("720p"), tr("1080p"), tr("1440p"), tr("4K")};
-    for (int i = 0; i < titles.size(); ++i)
-        quality_->setItemText(i, i == int(limit) && active != limit
-                                    ? tr("%1（当前 %2）").arg(titles[i], rates[int(active) + 1])
-                                    : titles[i]);
-    quality_->setCurrentIndex(int(limit));
+    for (auto *action : quality_->actions()) {
+        const int i = action->data().toInt();
+        const bool chosen = i == int(limit);
+        action->setText(chosen && active != limit ? tr("%1（当前 %2）").arg(titles[i], rates[int(active) + 1])
+                                                 : titles[i]);
+        action->setChecked(chosen);
+    }
 }
 
 void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
@@ -239,9 +240,10 @@ void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
     pages_->setCurrentIndex(1);
     interrupted_->setText(message);
     retry_->setEnabled(canRetry);
-    displays_->hide();
-    quality_->hide();
-    sound_->hide();
+    displays_->menuAction()->setVisible(false);
+    quality_->menuAction()->setVisible(false);
+    sound_->setVisible(false);
+    stats_->setVisible(false);
     if (switchApp_)
         switchApp_->setEnabled(false);
 }
@@ -249,19 +251,17 @@ void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
 void DesktopViewer::showDesktop(bool rich)
 {
     pages_->setCurrentIndex(0);
-    quality_->setVisible(rich);
+    quality_->menuAction()->setVisible(rich);
+    stats_->setVisible(true);
     sound_->setVisible(rich);
     showQuality(VideoQuality::FullHD, VideoQuality::FullHD);
     setDisplays({}, 0);
     showSound(false, false);
-    setStatus(tr("等待第一帧…"));
+    waitForPicture(tr("等待第一帧…"));
 }
 
 void DesktopViewer::showSound(bool local, bool peer)
 {
-    if (!sound_)
-        return;
-    QSignalBlocker guard(sound_);
     sound_->setChecked(local);
     sound_->setText(local && !peer ? tr("等待共享端开启声音") : tr("远端声音"));
 }
@@ -305,6 +305,35 @@ void DesktopViewer::focusVideo()
 
 void DesktopViewer::setStatus(const QString &text)
 {
+    waitingForPicture_ = false;
     status_->setText(text);
+}
+
+void DesktopViewer::waitForPicture(const QString &message)
+{
+    setStatus(message);
+    waitingForPicture_ = true;
+    setFrameRate(0);
+}
+
+void DesktopViewer::pictureShown()
+{
+    if (waitingForPicture_)
+        setStatus({});
+}
+
+void DesktopViewer::setFrameRate(int frames)
+{
+    if (frameRate_ != frames) {
+        frameRate_ = frames;
+        if (menu_->isVisible())
+            updateStats();
+    }
+}
+
+void DesktopViewer::updateStats()
+{
+    stats_->setText(waitingForPicture_ ? tr("等待画面") : frameRate_ ? tr("H.264 · %1 帧/秒").arg(frameRate_)
+                                                                 : tr("H.264 · 保持当前画面"));
 }
 } // namespace wwmm

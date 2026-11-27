@@ -2,8 +2,7 @@
 #include "desktop_display.h"
 #include "video_packets.h"
 #include <QDialog>
-class QComboBox;
-class QCheckBox;
+class QMenu;
 class QVBoxLayout;
 class QLabel;
 class QPushButton;
@@ -24,6 +23,10 @@ class DesktopViewer final : public QDialog {
 
     void focusVideo();
     void setStatus(const QString &text);
+    void waitForPicture(const QString &message);
+    void pictureShown();
+    void setFrameRate(int frames);
+    QMenu *sessionMenu() const { return menu_; }
     void showQuality(VideoQuality limit, VideoQuality active);
     void showInterrupted(const QString &message, bool canRetry);
     void showDesktop(bool rich);
@@ -56,10 +59,14 @@ class DesktopViewer final : public QDialog {
     void toggleFullScreen();
     QStackedWidget *pages_;
     QLabel *interrupted_;
-    QPushButton *retry_, *switchApp_ = nullptr;
+    QPushButton *retry_;
     QLabel *status_;
-    QComboBox *displays_, *quality_ = nullptr;
-    QCheckBox *sound_ = nullptr;
+    QMenu *menu_, *displays_, *quality_;
+    QAction *sound_, *stats_, *switchApp_ = nullptr;
+    QList<DesktopDisplay> displayList_;
+    int frameRate_ = 0;
+    bool waitingForPicture_ = false;
+    void updateStats();
     QVBoxLayout *column_;
 };
 } // namespace wwmm

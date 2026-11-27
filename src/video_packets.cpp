@@ -120,7 +120,7 @@ bool validAccessUnit(const QByteArray &annexB, bool &keyframe)
 }
 
 QList<QByteArray> packetizeVideo(const QByteArray &annexB, bool keyframe, quint16 &sequence,
-                                 quint32 timestamp)
+                                 quint32 timestamp, quint8 trailerBytes)
 {
     if (annexB.isEmpty() || annexB.size() > maxAccessUnit)
         return {};
@@ -131,12 +131,16 @@ QList<QByteArray> packetizeVideo(const QByteArray &annexB, bool keyframe, quint1
     if (!count || count > maxFragments)
         return {};
     QList<QByteArray> packets;
+    packets.reserve(count);
+    webrtc::RtpPacketToSend packet(nullptr, 1200);
     for (size_t i = 0; i < count; ++i) {
-        webrtc::RtpPacketToSend packet(nullptr, 1200);
+        packet.SetPayloadSize(0);
         if (!split.NextPacket(&packet))
             return {};
         const auto payload = packet.payload();
-        QByteArray out(20 + qsizetype(payload.size()), '\0');
+        const auto size = 20 + qsizetype(payload.size());
+        QByteArray out(size + trailerBytes, Qt::Uninitialized);
+        out.resize(size);
         out[0] = char(0x90); // RTP v2, one RFC 8285 extension.
         out[1] = char(96 | (packet.Marker() ? 0x80 : 0));
         qToBigEndian<quint16>(sequence++, out.data() + 2);
@@ -146,6 +150,7 @@ QList<QByteArray> packetizeVideo(const QByteArray &annexB, bool keyframe, quint1
         qToBigEndian<quint16>(1, out.data() + 14);
         out[16] = 0x10; // RFC 9626 frame marking, negotiated extension ID 1.
         out[17] = char((i == 0 ? 0x80 : 0) | (packet.Marker() ? 0x40 : 0) | (keyframe ? 0x20 : 0));
+        out[18] = out[19] = 0;
         memcpy(out.data() + 20, payload.data(), payload.size());
         packets.append(std::move(out));
     }
@@ -155,6 +160,16 @@ QList<QByteArray> packetizeVideo(const QByteArray &annexB, bool keyframe, quint1
 QByteArray assembleVideo(const QList<QByteArray> &payloads)
 {
     QByteArray out;
+    // Most fragments form one NAL. Reserve the input size once and retain the individual output bounds below.
+    qsizetype size = 0;
+    for (const auto &p : payloads) {
+        if (p.size() > maxAccessUnit)
+            return {};
+        size += p.size() + 4;
+        if (size >= maxAccessUnit)
+            break;
+    }
+    out.reserve(qMin<qsizetype>(size, maxAccessUnit));
     int fragmentHeader = -1;
     for (const auto &p : payloads) {
         if (p.isEmpty() || out.size() + p.size() + 8 > maxAccessUnit)

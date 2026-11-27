@@ -28,6 +28,6 @@ QList<QByteArrayView> h264Units(const QByteArray &annexB);
 QSize h264PictureSize(const QByteArray &annexB);
 bool validAccessUnit(const QByteArray &annexB, bool &keyframe);
 QList<QByteArray> packetizeVideo(const QByteArray &annexB, bool keyframe, quint16 &sequence,
-                                 quint32 timestamp);
+                                 quint32 timestamp, quint8 trailerBytes = 0);
 QByteArray assembleVideo(const QList<QByteArray> &payloads);
 } // namespace wwmm

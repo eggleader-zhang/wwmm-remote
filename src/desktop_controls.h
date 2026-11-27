@@ -51,7 +51,7 @@ class DesktopControls final : public QWidget {
     std::unique_ptr<InputSink> inputSink_;
     std::unique_ptr<HostInput> input_;
     QTimer *focusTimer_;
-    QTimer settleMotion_, topology_;
+    QTimer settleMotion_, topology_, frameTimer_;
     QElapsedTimer lastPolish_;
     bool dragging_ = false;
     std::optional<InputFocus> lastFocus_;

@@ -56,7 +56,8 @@ void LanProbe::setReceiving(bool enabled)
 
 void LanProbe::refresh()
 {
-    if (!receiving_ && listeners_.isEmpty() && listenIssue_.isEmpty() && !busy())
+    if (!receiving_ && listeners_.isEmpty() && listenIssue_.isEmpty() && !busy() &&
+        !isSignalConnected(QMetaMethod::fromSignal(&LanProbe::networkRefreshed)))
         return;
     const auto links = networks_();
     if (outgoingLink_ && !links.contains(*outgoingLink_))
@@ -102,6 +103,7 @@ void LanProbe::refresh()
     }
     if (endpoints() != previous || listenIssue_ != previousIssue)
         emit endpointsChanged();
+    emit networkRefreshed(links);
 }
 
 void LanProbe::acceptConnections(const Listener &listener)

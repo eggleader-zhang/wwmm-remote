@@ -1,19 +1,13 @@
 #include "discovery.h"
 #include "device_store.h"
 #include <QCryptographicHash>
-#include <QTimer>
 
 namespace wwmm
 {
 Discovery::Discovery(LanProbe &probe, QByteArray key, QString name, Factory factory)
     : probe_(probe), key_(std::move(key)), name_(std::move(name)), factory_(std::move(factory))
 {
-    connect(&probe_, &LanProbe::endpointsChanged, this, &Discovery::refresh);
-    auto *timer = new QTimer(this);
-    timer->setInterval(5000);
-    timer->setTimerType(Qt::VeryCoarseTimer);
-    connect(timer, &QTimer::timeout, this, &Discovery::refresh);
-    timer->start();
+    connect(&probe_, &LanProbe::networkRefreshed, this, &Discovery::refreshOn);
     refresh();
 }
 
@@ -29,7 +23,11 @@ void Discovery::restart()
 
 void Discovery::refresh()
 {
-    const auto links = probe_.links();
+    refreshOn(probe_.links());
+}
+
+void Discovery::refreshOn(const QList<LanAddress> &links)
+{
     const auto listening = probe_.endpoints();
     if (key_.size() != 32 || (backend_ && links == links_ && listening == listening_ &&
                               (issue_.isEmpty() || started_.elapsed() < 30000)))
@@ -43,11 +41,14 @@ void Discovery::refresh()
     links_ = links;
     listening_ = listening;
     seen_.clear();
+    byKey_.reset();
     issue_.clear();
     connect(backend_, &DnsSdBackend::resolved, this, &Discovery::resolved);
     connect(backend_, &DnsSdBackend::removed, this, [this](unsigned i, const QString &s) {
-        if (seen_.remove({i, s.toLower()}))
+        if (seen_.remove({i, s.toLower()})) {
+            byKey_.reset();
             emit changed();
+        }
     });
     connect(backend_, &DnsSdBackend::problem, this, [this](const QString &reason) {
         issue_ = reason;
@@ -93,8 +94,10 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
     QHostAddress address;
     const auto source = qMakePair(index, instance.toLower());
     auto discard = [this, &source] {
-        if (seen_.remove(source))
+        if (seen_.remove(source)) {
+            byKey_.reset();
             emit changed();
+        }
     };
     if (instance.isEmpty() || instance.size() > 255 || !port || fields.value("v") != "2" ||
         key.size() != 32 || key.toHex() != keyText || key == key_ || !validDeviceName(name) ||
@@ -123,12 +126,20 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
     if (previous == seen_.cend() ? seen_.size() >= 256 : *previous == peer)
         return;
     seen_.insert(source, peer);
+    byKey_.reset();
     emit changed();
 }
 
 QList<NearbyDevice> Discovery::devices() const
 {
-    QMap<QByteArray, NearbyDevice> unique;
+    return devicesByKey().values();
+}
+
+const QMap<QByteArray, NearbyDevice> &Discovery::devicesByKey() const
+{
+    if (byKey_)
+        return *byKey_;
+    auto &unique = byKey_.emplace();
     for (const auto &peer : seen_) {
         auto existing = unique.constFind(peer.key);
         if (existing == unique.cend() ||
@@ -136,6 +147,6 @@ QList<NearbyDevice> Discovery::devices() const
              peer.endpoint.address.protocol() == QAbstractSocket::IPv4Protocol))
             unique.insert(peer.key, peer);
     }
-    return unique.values();
+    return unique;
 }
 } // namespace wwmm

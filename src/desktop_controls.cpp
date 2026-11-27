@@ -12,7 +12,6 @@
 #include <QLabel>
 #include <QMutex>
 #include <QPushButton>
-#include <QTabWidget>
 #include <QTimer>
 #include <QFutureWatcher>
 #include <QtConcurrentRun>
@@ -135,11 +134,29 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
             capture_->refresh();
         }
     });
+    frameTimer_.setInterval(1000);
+    connect(&frameTimer_, &QTimer::timeout, this, [this] {
+        const auto &gate = callbacks_;
+        if (!gate || !viewer_ || !gate->receivedStamp) {
+            frameTimer_.stop();
+            return;
+        }
+        const int count = gate->presented.exchange(0);
+        const bool outstanding = gate->firstPicture || *gate->receivedStamp != gate->displayedStamp.load();
+        if (!count && outstanding && !viewer_->isMinimized())
+            session_.refreshVideo();
+        if (viewer_)
+            viewer_->setFrameRate(count);
+        if (!count && !outstanding)
+            frameTimer_.stop();
+    });
     connect(&session, &DesktopSession::frame, this, [this](const QByteArray &frame, quint32 time) {
         if (player_) {
             if (!callbacks_->receivedStamp || !viewer_->inputSurface()->hasPictureSize())
                 viewer_->inputSurface()->setPictureSize(h264PictureSize(frame));
             callbacks_->receivedStamp = time;
+            if (!frameTimer_.isActive())
+                frameTimer_.start();
             player_->push(frame, time);
         }
     });
@@ -196,6 +213,7 @@ void DesktopControls::retireMedia(bool keepInput)
         lastFocus_.reset();
     }
     settleMotion_.stop();
+    frameTimer_.stop();
     focusPending_ = false;
     if (callbacks_) {
         QMutexLocker lock(&callbacks_->mutex);
@@ -269,9 +287,10 @@ void DesktopControls::endMedia(bool keepViewer)
 
 std::optional<NearbyDevice> DesktopControls::reconnectPeer() const
 {
-    for (const auto &peer : discovery_.devices())
-        if (peer.key == session_.peerKey() && peer.readonlyDesktop && (!session_.interactive() || peer.keyboardMouse))
-            return peer;
+    const auto &devices = discovery_.devicesByKey();
+    const auto peer = devices.constFind(session_.peerKey());
+    if (peer != devices.cend() && peer->readonlyDesktop && (!session_.interactive() || peer->keyboardMouse))
+        return *peer;
     return {};
 }
 
@@ -324,11 +343,6 @@ void DesktopControls::updateState()
                             : tr("%1 请求查看桌面并切换显示器。"))
                  : (control ? tr("%1 请求查看主屏幕并使用键鼠。") : tr("%1 请求查看主屏幕。")))
                 .arg(name));
-        for (QWidget *parent = parentWidget(); parent; parent = parent->parentWidget())
-            if (auto *tabs = qobject_cast<QTabWidget *>(parent)) {
-                tabs->setCurrentIndex(0);
-                break;
-            }
         QApplication::alert(window());
         break;
     }
@@ -352,15 +366,18 @@ void DesktopControls::updateState()
 void DesktopControls::addTransferBar()
 {
     auto &data = session_.dataLink();
-    transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this);
+    transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this,
+                                viewer_ ? viewer_->sessionMenu() : nullptr);
     if (viewer_) {
         viewer_->addTools(transfer_);
         connect(viewer_, &DesktopViewer::fileDropped, transfer_, [&data](const QString &path) { data.offerFile(path); });
-        connect(&data, &SessionData::changed, transfer_, [this] {
+        auto updateDrops = [this] {
             auto &link = session_.dataLink();
             if (viewer_)
                 viewer_->allowFileDrops(link.ready() && link.fileState() == SessionData::NoFile);
-        });
+        };
+        connect(&data, &SessionData::changed, transfer_, updateDrops);
+        updateDrops();
     } else
         column_->addWidget(transfer_);
 }
@@ -387,7 +404,7 @@ void DesktopControls::switchDisplay(bool formatOnly)
         if (!formatOnly)
             viewer_->inputSurface()->changeDisplay();
         viewer_->setDisplays(session_.displays(), session_.displayId());
-        viewer_->setStatus(formatOnly ? tr("正在调整画质…") : tr("正在切换显示器…"));
+        viewer_->waitForPicture(formatOnly ? tr("正在调整画质…") : tr("正在切换显示器…"));
         startPlayer();
     }
 }
@@ -491,23 +508,6 @@ void DesktopControls::openViewer()
         });
     }
     connect(viewer_, &QDialog::finished, this, [this] { session_.stop(); });
-    auto *timer = new QTimer(viewer_);
-    timer->setInterval(1000);
-    const auto mode = control ? tr("控制") : tr("只读");
-    connect(timer, &QTimer::timeout, viewer_, [this, mode] {
-        auto gate = callbacks_;
-        if (!viewer_ || !gate)
-            return;
-        if (!viewer_->isMinimized() && gate->receivedStamp &&
-            qint32(*gate->receivedStamp - gate->displayedStamp.load()) != 0 && gate->presented.load() == 0)
-            session_.refreshVideo();
-        int count = gate->presented.exchange(0);
-        if (count) {
-            viewer_->setStatus(tr("%1 · H.264 · 最近一秒显示 %2 帧").arg(mode).arg(count));
-        } else if (!gate->firstPicture)
-            viewer_->setStatus(tr("%1 · H.264 · 保持当前画面").arg(mode));
-    });
-    timer->start();
     viewer_->show();
     if (control)
         viewer_->focusVideo();
@@ -524,8 +524,11 @@ void DesktopControls::startPlayer()
             if (gate->firstPicture.exchange(false))
                 Callbacks::post(gate, [](DesktopControls *ui) {
                     ui->session_.picturePresented();
-                    if (ui->viewer_ && ui->session_.interactive())
-                        ui->viewer_->inputSurface()->presented();
+                    if (ui->viewer_) {
+                        ui->viewer_->pictureShown();
+                        if (ui->session_.interactive())
+                            ui->viewer_->inputSurface()->presented();
+                    }
                 });
         },
         Callbacks::error(gate));

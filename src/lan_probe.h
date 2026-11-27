@@ -36,6 +36,7 @@ public:
     void cancel();
 
 signals:
+    void networkRefreshed(const QList<wwmm::LanAddress> &links);
     void endpointsChanged();
     void receivingChanged(bool enabled);
     void busyChanged(bool busy);

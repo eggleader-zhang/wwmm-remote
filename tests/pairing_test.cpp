@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
 #include <QNetworkInterface>
 #include <QProcess>
 #include <QPushButton>
@@ -22,7 +23,6 @@
 #include <QScopeGuard>
 #include <QSemaphore>
 #include <QSignalSpy>
-#include <QTabWidget>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -155,20 +155,20 @@ class PairTest : public QObject
         DeviceStore store(dir.path(), io);
         LanProbe probe([] { return QList<LanAddress>{}; }, 0);
         QSignalSpy finished(&store, &DeviceStore::openFinished);
-        QTabWidget window;
-        auto *devices = createDevicesPage(probe, store);
-        window.addTab(devices, "设备");
-        window.addTab(new MainWindow(probe), "连接检测");
-        window.show();
+        std::unique_ptr<QWidget> devices(createDevicesPage(probe, store));
+        devices->show();
         QTRY_COMPARE(vault->reads.load(), 1);
         store.openAsync(); // Repeated requests share the pending system prompt.
         QCOMPARE(finished.size(), 0);
         QVERIFY(devices->findChild<QLabel *>("identityStatus")->isVisible());
-        window.setCurrentIndex(1);
-        auto *receive = window.findChild<QCheckBox *>("receiveToggle");
+        QVERIFY(!devices->findChild<MainWindow *>());
+        devices->findChild<QPushButton *>("openDiagnostics")->click();
+        auto *diagnostics = devices->findChild<MainWindow *>();
+        QVERIFY(diagnostics && diagnostics->isVisible());
+        auto *receive = diagnostics->findChild<QCheckBox *>("receiveToggle");
         receive->click();
         QCOMPARE(probe.receiving(), receive->isChecked());
-        window.setCurrentIndex(0);
+        diagnostics->close();
         auto *retry = devices->findChild<QPushButton *>("retryIdentity");
         QVERIFY(retry->isHidden());
         vault->release.release();
@@ -177,7 +177,7 @@ class PairTest : public QObject
         QCOMPARE(vault->reads.load(), 1);
         QVERIFY(retry->isVisible());
         retry->click();
-        QTRY_VERIFY(devices->findChild<QListWidget *>("nearbyDevices"));
+        QTRY_VERIFY(devices->findChild<QListWidget *>("deviceList"));
         QCOMPARE(finished.size(), 2);
         QVERIFY(finished.last()[0].toString().isEmpty());
         QVERIFY(DeviceStore::verify(store.publicKey(), "ready", store.sign("ready")));
@@ -439,21 +439,29 @@ class PairTest : public QObject
         right.show();
         const auto ad = two->advertisements.first();
         emit one->resolved(ad.local.link.interfaceIndex, ad.instance, ad.local.port, ad.fields);
-        auto *near = left.findChild<QListWidget *>("nearbyDevices");
-        QCOMPARE(near->count(), 1);
+        auto *near = left.findChild<QListWidget *>("deviceList");
+        QTRY_COMPARE(near->count(), 1);
         QVERIFY(near->item(0)->text().contains(b.name));
+        auto *original = near->currentItem();
+        QSignalSpy resets(near->model(), &QAbstractItemModel::modelReset);
         QTest::mouseClick(right.findChild<QPushButton *>("offerCode"), Qt::LeftButton);
         QTRY_VERIFY(!b.pairing.code().isEmpty());
         QVERIFY(right.findChild<QLabel *>("localPairCode")->text().contains(b.pairing.code()));
         auto *entry = left.findChild<QLineEdit *>("peerCode");
         QTest::keyClicks(entry, b.pairing.code());
         QTest::keyClick(entry, Qt::Key_Return);
-        auto *saved = left.findChild<QListWidget *>("trustedDevices");
-        QTRY_COMPARE(saved->count(), 1);
-        QCOMPARE(right.findChild<QListWidget *>("trustedDevices")->count(), 1);
-        saved->setCurrentRow(0);
-        QTest::mouseClick(left.findChild<QPushButton *>("forgetDevice"), Qt::LeftButton);
-        QCOMPARE(saved->count(), 0);
+        QTRY_VERIFY(near->item(0)->data(Qt::AccessibleTextRole).toString().contains("已配对"));
+        QCOMPARE(near->count(), 1);
+        QCOMPARE(near->currentItem(), original);
+        auto *other = right.findChild<QListWidget *>("deviceList");
+        QTRY_COMPARE(other->count(), 1);
+        QVERIFY(other->item(0)->data(Qt::AccessibleTextRole).toString().contains("离线"));
+        emit one->removed(ad.local.link.interfaceIndex, ad.instance);
+        QTRY_VERIFY(near->item(0)->data(Qt::AccessibleTextRole).toString().contains("离线"));
+        QCOMPARE(near->currentItem(), original);
+        left.findChild<QAction *>("forgetDevice")->trigger();
+        QTRY_COMPARE(near->count(), 0);
+        QCOMPARE(resets.size(), 0);
         QVERIFY(a.store.peers().isEmpty());
     }
 
@@ -471,23 +479,26 @@ class PairTest : public QObject
         left.show();
         right.show();
         auto ad = two->advertisements.first();
-        auto *button = left.findChild<QPushButton *>("viewDesktop");
-        auto *control = left.findChild<QPushButton *>("controlDesktop");
+        auto *primary = left.findChild<QPushButton *>("connectDesktop");
+        auto *view = left.findChild<QAction *>("viewDesktop");
         auto *allow = right.findChild<QPushButton *>("allowDesktop");
         auto *decline = right.findChild<QPushButton *>("endDesktop");
-        QVERIFY(button && control && allow && decline);
+        QVERIFY(primary && view && allow && decline);
         auto legacy = ad.fields;
         legacy.remove("desk");
         emit one->resolved(ad.local.link.interfaceIndex, ad.instance, ad.local.port, legacy);
-        QVERIFY(!button->isEnabled());
-        QVERIFY(!control->isEnabled());
+        QTRY_VERIFY(left.findChild<QListWidget *>("deviceList")->item(0)->data(Qt::AccessibleTextRole)
+                        .toString().contains("已配对"));
+        QVERIFY(primary->isHidden());
         legacy = ad.fields;
         legacy.remove("input");
         emit one->resolved(ad.local.link.interfaceIndex, ad.instance, ad.local.port, legacy);
-        QVERIFY(button->isEnabled() && !control->isEnabled());
+        QTRY_VERIFY(primary->isVisible() && primary->isEnabled());
+        QCOMPARE(primary->text(), QStringLiteral("查看桌面"));
         emit one->resolved(ad.local.link.interfaceIndex, ad.instance, ad.local.port, ad.fields);
-        QVERIFY(button->isEnabled() && control->isEnabled());
-        QTest::mouseClick(button, Qt::LeftButton);
+        QTRY_COMPARE(primary->text(), QStringLiteral("控制桌面"));
+        QVERIFY(view->isVisible() && view->isEnabled());
+        view->trigger();
         QTRY_VERIFY(allow->isVisible());
         QCOMPARE(allow->text(), QStringLiteral("允许本次查看"));
         QVERIFY(decline->isVisible());
@@ -495,12 +506,12 @@ class PairTest : public QObject
         QTest::mouseClick(decline, Qt::LeftButton);
         QTRY_VERIFY(left.findChild<QLabel *>("pairStatus")->text().contains("拒绝"));
         QVERIFY(!allow->isVisible());
-        QVERIFY(button->isEnabled());
-        QTest::mouseClick(control, Qt::LeftButton);
+        QVERIFY(primary->isEnabled());
+        QTest::mouseClick(primary, Qt::LeftButton);
         QTRY_VERIFY(allow->isVisible());
         QCOMPARE(allow->text(), QStringLiteral("允许本次控制"));
         QTest::mouseClick(decline, Qt::LeftButton);
-        QTRY_VERIFY(control->isEnabled());
+        QTRY_VERIFY(primary->isEnabled());
     }
 
     void viewerComposition()
@@ -554,6 +565,24 @@ class PairTest : public QObject
         QVERIFY(dialog.isFullScreen());
         full->trigger();
         QVERIFY(!dialog.isFullScreen());
+        dialog.showDesktop(true);
+        auto *monitors = dialog.findChild<QMenu *>("displayMenu");
+        auto *quality = dialog.findChild<QMenu *>("qualityMenu");
+        auto *sound = dialog.findChild<QAction *>("remoteSound");
+        QVERIFY(monitors && quality && sound);
+        QVERIFY(!monitors->menuAction()->isVisible());
+        dialog.setDisplays({{10, "A", {1920, 1080}, true}, {20, "B", {2560, 1440}, false}}, 10);
+        QVERIFY(monitors->menuAction()->isVisible() && monitors->actions().first()->isChecked());
+        QSignalSpy displayRequest(&dialog, &DesktopViewer::displayRequested);
+        monitors->actions().last()->trigger();
+        QCOMPARE(displayRequest.last().first().toULongLong(), quint64(20));
+        dialog.showQuality(VideoQuality::QHD, VideoQuality::FullHD);
+        QVERIFY(quality->actions().at(1)->text().contains("1080p"));
+        QSignalSpy soundRequest(&dialog, &DesktopViewer::soundRequested);
+        dialog.showSound(true, false);
+        QVERIFY(sound->isChecked() && soundRequest.isEmpty());
+        sound->trigger();
+        QCOMPARE(soundRequest.last().first().toBool(), false);
     }
 
     void nativeDnsSd()

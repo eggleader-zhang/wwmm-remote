@@ -2,12 +2,12 @@
 #include "video_packets.h"
 #include <QElapsedTimer>
 #include <QMap>
-#include <QNetworkDatagram>
 #include <QNetworkProxy>
 #include <QRandomGenerator>
 #include <QTimer>
 #include <QUdpSocket>
 #include <QtEndian>
+#include <array>
 #include <deque>
 #include <srtp.h>
 #include "modules/pacing/interval_budget.h"
@@ -70,6 +70,7 @@ struct VideoLink::Impl {
     bool sending;
     QUdpSocket udp;
     QTimer timer, audioTimer;
+    QTimer historyExpiry;
     std::shared_ptr<AudioStream> audio;
     srtp_t audioContext = nullptr;
     quint16 audioSequence = quint16(QRandomGenerator::global()->generate());
@@ -117,6 +118,16 @@ struct VideoLink::Impl {
 
 VideoLink::VideoLink(bool sender, QObject *parent) : QObject(parent), p_(std::make_unique<Impl>(sender))
 {
+    p_->historyExpiry.setSingleShot(true);
+    connect(&p_->historyExpiry, &QTimer::timeout, this, [this] {
+        if (p_->history.empty())
+            return;
+        const auto age = p_->clock.elapsed() - p_->history.back().sent;
+        if (age >= 100)
+            p_->history.clear();
+        else if (!p_->timer.isActive())
+            p_->historyExpiry.start(int(101 - age));
+    });
     p_->audioTimer.setTimerType(Qt::PreciseTimer);
     p_->audioTimer.setInterval(10);
     connect(&p_->audioTimer, &QTimer::timeout, this, &VideoLink::pumpAudio);
@@ -233,7 +244,7 @@ void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
         p_->wake();
         return;
     }
-    auto packets = packetizeVideo(annexB, key, p_->sequence, timestamp);
+    auto packets = packetizeVideo(annexB, key, p_->sequence, timestamp, SRTP_MAX_TRAILER_LEN + 4);
     if (packets.isEmpty()) {
         p_->needIdr = true;
         emit keyframeNeeded();
@@ -282,35 +293,37 @@ void VideoLink::tick()
         p_->refreshAfterDrain = false;
         emit keyframeNeeded();
     }
-    if (p_->pending.empty() && !p_->refreshAfterDrain)
+    if (p_->pending.empty() && !p_->refreshAfterDrain) {
         p_->timer.stop();
+        if (!p_->history.empty() && !p_->historyExpiry.isActive())
+            p_->historyExpiry.start(101);
+    }
 }
 
 void VideoLink::receive()
 {
+    alignas(4) std::array<char, 1600> wire;
+    QHostAddress source;
+    quint16 port = 0;
     for (int i = 0; i < 256 && p_->udp.hasPendingDatagrams(); ++i) {
-        auto datagram = p_->udp.receiveDatagram(1600);
-        if (!p_->inbound || datagram.senderPort() != p_->peer.port ||
-            !datagram.senderAddress().isEqual(p_->peer.address, QHostAddress::ConvertV4MappedToIPv4) ||
-            datagram.data().size() > 1350 || datagram.data().size() < 14)
+        int len = int(p_->udp.readDatagram(wire.data(), wire.size(), &source, &port));
+        if (!p_->inbound || len < 14 || len > 1350 || port != p_->peer.port ||
+            !source.isEqual(p_->peer.address, QHostAddress::ConvertV4MappedToIPv4))
             continue;
-        auto data = datagram.data();
-        int len = int(data.size());
-        if (!p_->sending && quint8(data[0]) == 0x80 && quint8(data[1]) == 111) {
+        if (!p_->sending && quint8(wire[0]) == 0x80 && quint8(wire[1]) == 111) {
             if (p_->audio && p_->audioContext && len > 20 &&
-                qFromBigEndian<quint32>(data.constData() + 8) == audioSsrc &&
-                srtp_unprotect(p_->audioContext, data.data(), &len) == srtp_err_status_ok && len > 20 &&
-                qFromBigEndian<quint64>(data.constData() + 12) == p_->audio->generation()) {
-                data.resize(len);
-                p_->audio->receive(qFromBigEndian<quint32>(data.constData() + 4), data.mid(20));
+                qFromBigEndian<quint32>(wire.data() + 8) == audioSsrc &&
+                srtp_unprotect(p_->audioContext, wire.data(), &len) == srtp_err_status_ok && len > 20 &&
+                qFromBigEndian<quint64>(wire.data() + 12) == p_->audio->generation()) {
+                p_->audio->receive(qFromBigEndian<quint32>(wire.data() + 4), QByteArray(wire.data() + 20, len - 20));
             }
             continue;
         }
-        auto status = p_->sending ? srtp_unprotect_rtcp(p_->inbound, data.data(), &len)
-                                  : srtp_unprotect(p_->inbound, data.data(), &len);
+        auto status = p_->sending ? srtp_unprotect_rtcp(p_->inbound, wire.data(), &len)
+                                  : srtp_unprotect(p_->inbound, wire.data(), &len);
         if (status != srtp_err_status_ok)
             continue;
-        data.resize(len);
+        const QByteArrayView data(wire.data(), len);
         if (p_->sending)
             onFeedback(data);
         else
@@ -320,7 +333,7 @@ void VideoLink::receive()
         QTimer::singleShot(0, this, &VideoLink::receive);
 }
 
-void VideoLink::onRtp(const QByteArray &data)
+void VideoLink::onRtp(QByteArrayView data)
 {
     if (data.size() <= 20 || quint8(data[0]) != 0x90 || (quint8(data[1]) & 127) != 96 ||
         qFromBigEndian<quint32>(data.constData() + 8) != videoSsrc ||
@@ -352,7 +365,7 @@ void VideoLink::onRtp(const QByteArray &data)
         f->first = seq;
     if (flags & 0x40)
         f->last = seq;
-    f->parts.insert(seq, data.mid(20));
+    f->parts.insert(seq, data.sliced(20).toByteArray());
     f->size += data.size() - 20;
     f->lastPart = p_->clock.elapsed();
     f->keyframe = (flags & 0x20) != 0;
@@ -369,6 +382,7 @@ void VideoLink::deliver()
         int count = f.first && f.last ? int(quint16(*f.last - *f.first)) + 1 : 0;
         if (count && count <= maxFragments && f.parts.size() == count) {
             QList<QByteArray> parts;
+            parts.reserve(count);
             for (int i = 0; i < count; ++i) {
                 auto p = f.parts.constFind(quint16(*f.first + i));
                 if (p == f.parts.cend())
@@ -410,8 +424,8 @@ void VideoLink::deliver()
         auto first = f.first ? f.first : p_->nextSeq;
         if (first && now - f.arrived >= 3 && now - f.lastNack >= 7) {
             int extent = 0;
-            for (auto seq : f.parts.keys()) {
-                const int distance = quint16(seq - *first);
+            for (auto it = f.parts.keyBegin(); it != f.parts.keyEnd(); ++it) {
+                const int distance = quint16(*it - *first);
                 if (distance < maxFragments)
                     extent = qMax(extent, distance);
             }
@@ -506,13 +520,13 @@ void VideoLink::sendPointer(const QByteArray &input)
     if (seal(p_->outbound, packet, true))
         p_->write(packet);
 }
-void VideoLink::onFeedback(const QByteArray &data)
+void VideoLink::onFeedback(QByteArrayView data)
 {
     if (data.size() == 28 && quint8(data[0]) == 0x80 && quint8(data[1]) == 204 &&
         qFromBigEndian<quint16>(data.constData()+2) == 6 &&
         qFromBigEndian<quint32>(data.constData()+4) == viewerSsrc &&
-        QByteArrayView(data).sliced(8,4) == "WMI4") {
-        emit pointerReceived(data.mid(12,14));
+        data.sliced(8,4) == "WMI4") {
+        emit pointerReceived(data.sliced(12,14).toByteArray());
         return;
     }
     if (data.size() < 12 || quint8(data[0]) != 0x81 ||

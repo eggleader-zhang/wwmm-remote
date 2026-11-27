@@ -8,10 +8,10 @@
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QLocale>
 #include <QMimeData>
 #include <QPushButton>
-#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <algorithm>
 
@@ -26,14 +26,31 @@ QString droppedFile(const QMimeData *mime)
     return urls.first().toLocalFile();
 }
 
-TransferBar::TransferBar(SessionData &data, QWidget *parent) : QWidget(parent), data_(data)
+TransferBar::TransferBar(SessionData &data, QWidget *parent, QMenu *sessionMenu) : QWidget(parent), data_(data)
 {
     setAcceptDrops(true);
     auto *row = new QHBoxLayout(this);
     row->setContentsMargins(0, 0, 0, 0);
-    clipboard_ = new QCheckBox(tr("同步文字剪贴板"), this);
-    clipboard_->setToolTip(tr("双方勾选后，仅同步本次会话中新复制的文字。"));
-    row->addWidget(clipboard_);
+    clipboard_ = new QAction(this);
+    clipboard_->setCheckable(true);
+    if (sessionMenu) {
+        // Parent actions to this session so reconnecting removes the previous tools.
+        send_ = new QAction(tr("发送文件…"), this);
+        sessionMenu->addAction(clipboard_);
+        sessionMenu->addAction(send_);
+        connect(send_, &QAction::triggered, this, [this] { chooseFile(false); });
+        row->setContentsMargins(10, 0, 10, 4);
+    } else {
+        auto *check = new QCheckBox(this);
+        row->addWidget(check);
+        connect(check, &QCheckBox::clicked, &data, &SessionData::enableClipboard);
+        connect(clipboard_, &QAction::changed, check, [this, check] {
+            check->setText(clipboard_->text());
+            check->setToolTip(clipboard_->toolTip());
+            check->setChecked(clipboard_->isChecked());
+            check->setEnabled(clipboard_->isEnabled());
+        });
+    }
     status_ = new QLabel(this);
     status_->setTextFormat(Qt::PlainText);
     status_->setWordWrap(true);
@@ -44,7 +61,7 @@ TransferBar::TransferBar(SessionData &data, QWidget *parent) : QWidget(parent), 
         button->setAutoDefault(false);
         row->addWidget(button);
     }
-    connect(clipboard_, &QCheckBox::toggled, &data, &SessionData::enableClipboard);
+    connect(clipboard_, &QAction::triggered, &data, &SessionData::enableClipboard);
     connect(file_, &QPushButton::clicked, this,
             [this] { chooseFile(data_.fileState() == SessionData::Offered); });
     connect(cancel_, &QPushButton::clicked, &data, &SessionData::cancelFile);
@@ -132,13 +149,12 @@ void TransferBar::update()
 {
     const bool ready = data_.ready();
     clipboard_->setEnabled(ready);
-    clipboard_->setText(data_.supportsImages() ? tr("同步文字和截图") : tr("同步文字剪贴板"));
+    const auto name = data_.supportsImages() ? tr("同步文字和截图") : tr("同步文字剪贴板");
+    const bool waiting = data_.localClipboard() && !data_.clipboardEnabled();
+    clipboard_->setText(send_ && waiting ? tr("%1（等待对方开启）").arg(name) : name);
     clipboard_->setToolTip(data_.supportsImages() ? tr("双方开启后，同步本次会话中新复制的文字和图片。")
                                                   : tr("双方开启后，同步本次会话中新复制的文字。"));
-    {
-        QSignalBlocker block(clipboard_);
-        clipboard_->setChecked(data_.localClipboard());
-    }
+    clipboard_->setChecked(data_.localClipboard());
     if (watching_ != data_.clipboardEnabled()) {
         watching_ = data_.clipboardEnabled();
         previous_.reset();
@@ -149,6 +165,11 @@ void TransferBar::update()
             poll_.stop();
     }
     const auto state = data_.fileState();
+    if (send_) {
+        send_->setEnabled(ready && state == SessionData::NoFile);
+        file_->setVisible(state == SessionData::Offered);
+        setVisible(state != SessionData::NoFile || data_.imagePending());
+    }
     if (dialog_ && (!ready || (saving_ && state != SessionData::Offered)))
         dialog_->reject();
     file_->setEnabled(ready && (state == SessionData::NoFile || state == SessionData::Offered));
@@ -164,17 +185,17 @@ void TransferBar::update()
                                                                         : tr("可拖入一个文件发送")));
         return;
     }
-    const auto name = fontMetrics().elidedText(data_.fileName(), Qt::ElideMiddle, 175);
+    const auto fileName = fontMetrics().elidedText(data_.fileName(), Qt::ElideMiddle, 175);
     const auto size = QLocale().formattedDataSize(data_.fileSize());
     if (state == SessionData::Offered)
-        status_->setText(tr("对方发来 %1（%2）").arg(name, size));
+        status_->setText(tr("对方发来 %1（%2）").arg(fileName, size));
     else if (state == SessionData::Offering)
-        status_->setText(tr("等待对方接收 %1").arg(name));
+        status_->setText(tr("等待对方接收 %1").arg(fileName));
     else {
         const auto progress = QLocale().formattedDataSize(data_.progress());
         status_->setText(
             tr("%1 %2 · %3 / %4")
-                .arg(state == SessionData::Sending ? tr("发送") : tr("接收"), name, progress, size));
+                .arg(state == SessionData::Sending ? tr("发送") : tr("接收"), fileName, progress, size));
     }
 }
 

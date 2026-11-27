@@ -1,40 +1,89 @@
 #include "devices_panel.h"
 #include "desktop_controls.h"
-#include <QSettings>
-#include <QSet>
+#include "main_window.h"
 #include <QApplication>
-#include <QCheckBox>
-#include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
+#include <QPainter>
 #include <QPushButton>
 #include <QRegularExpressionValidator>
+#include <QScrollBar>
+#include <QSettings>
+#include <QSignalBlocker>
+#include <QStyledItemDelegate>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <algorithm>
 
 namespace wwmm
 {
 namespace
 {
-QByteArray selected(QListWidget *list)
-{
-    return list->currentItem() ? list->currentItem()->data(Qt::UserRole).toByteArray() : QByteArray{};
-}
-void addDevice(QListWidget *list, const QString &title, const QByteArray &key, const QByteArray &previous)
-{
-    auto *item = new QListWidgetItem(title, list);
-    item->setData(Qt::UserRole, key);
-    if (key == previous)
-        list->setCurrentItem(item);
-}
+constexpr int detailRole = Qt::UserRole + 1;
+
 QLabel *label(QWidget *parent)
 {
     auto *view = new QLabel(parent);
     view->setTextFormat(Qt::PlainText);
     view->setWordWrap(true);
     return view;
+}
+
+// Let the platform draw selection and focus. Two text columns need no per-device widgets.
+class DeviceDelegate final : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        auto size = QStyledItemDelegate::sizeHint(option, index);
+        size.setHeight(qMax(36, size.height() + 12));
+        return size;
+    }
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        QStyleOptionViewItem opt(option);
+        initStyleOption(&opt, index);
+        const QString name = opt.text, detail = index.data(detailRole).toString();
+        opt.text.clear();
+        auto *style = opt.widget ? opt.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+        const auto rect = opt.rect.adjusted(10, 0, -10, 0);
+        const auto &fm = opt.fontMetrics;
+        const int right = qMin(fm.horizontalAdvance(detail), rect.width() / 2);
+        const bool selected = opt.state.testFlag(QStyle::State_Selected);
+        painter->save();
+        painter->setFont(opt.font);
+        painter->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
+        painter->drawText(rect.adjusted(0, 0, -right - 10, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                          fm.elidedText(name, Qt::ElideRight, qMax(0, rect.width() - right - 10)));
+        painter->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::PlaceholderText));
+        painter->drawText(rect, Qt::AlignVCenter | Qt::AlignRight, fm.elidedText(detail, Qt::ElideRight, right));
+        painter->restore();
+    }
+};
+
+void showDiagnostics(LanProbe &probe, QWidget *owner)
+{
+    auto *window = owner->window();
+    auto *diagnostics = window->findChild<MainWindow *>();
+    if (!diagnostics) {
+        diagnostics = new MainWindow(probe, window);
+        diagnostics->setWindowFlag(Qt::Window);
+        diagnostics->setAttribute(Qt::WA_DeleteOnClose);
+    }
+    diagnostics->showNormal();
+    diagnostics->raise();
+    diagnostics->activateWindow();
+}
+
+QPushButton *menuButton(const QString &title, QWidget *parent)
+{
+    auto *button = new QPushButton(title, parent);
+    button->setMenu(new QMenu(button));
+    return button;
 }
 } // namespace
 
@@ -49,16 +98,20 @@ QWidget *createDevicesPage(LanProbe &probe, DeviceStore &store)
     status->setObjectName("identityStatus");
     auto *retry = new QPushButton(QObject::tr("重新读取"), loading);
     retry->setObjectName("retryIdentity");
+    auto *diagnostics = new QPushButton(QObject::tr("连接检测"), loading);
+    diagnostics->setObjectName("openDiagnostics");
+    QObject::connect(diagnostics, &QPushButton::clicked, page, [page, &probe] { showDiagnostics(probe, page); });
     loadingLayout->addWidget(status);
     loadingLayout->addWidget(retry, 0, Qt::AlignLeft);
+    loadingLayout->addWidget(diagnostics, 0, Qt::AlignLeft);
     loadingLayout->addStretch();
     layout->addWidget(loading);
 
     auto readIdentity = [&store, status, retry] {
 #ifdef Q_OS_MACOS
-        status->setText(QObject::tr("正在读取本机设备身份。若钥匙串询问，请在系统弹窗中确认。"));
+        status->setText(QObject::tr("正在读取设备身份。如钥匙串询问，请在系统弹窗中确认。"));
 #else
-        status->setText(QObject::tr("正在读取本机设备身份…"));
+        status->setText(QObject::tr("正在读取设备身份…"));
 #endif
         retry->hide();
         store.openAsync();
@@ -91,273 +144,338 @@ QWidget *createDevicesPage(LanProbe &probe, DeviceStore &store)
 
 DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairing, DeviceStore &store,
                            QWidget *parent)
-    : QWidget(parent)
+    : QWidget(parent), recentSetting_(QStringLiteral("desktop/recent/") + store.publicKey().toHex()),
+      probe_(probe), discovery_(discovery), pairing_(pairing), store_(store),
+      desktop_(new DesktopSession(probe, store, this))
 {
+    recent_ = QSettings().value(recentSetting_).toStringList().mid(0, 5);
     auto *layout = new QVBoxLayout(this);
-    auto *desktop = new DesktopSession(probe, store, this);
-    auto *local = new QGroupBox(tr("本机 · %1").arg(localDeviceName()), this);
-    auto *localLayout = new QVBoxLayout(local);
-    auto *localRow = new QHBoxLayout;
-    auto *receive = new QCheckBox(tr("允许局域网设备发现和检测本机"), local);
+    layout->setContentsMargins(18, 16, 18, 14);
+    layout->setSpacing(8);
+    auto *header = new QHBoxLayout;
+    auto *title = new QLabel(tr("设备"), this);
+    auto font = title->font();
+    font.setPointSizeF(font.pointSizeF() + 4);
+    font.setWeight(QFont::DemiBold);
+    title->setFont(font);
+    header->addWidget(title);
+    header->addStretch();
+    offer_ = new QPushButton(this);
+    offer_->setObjectName("offerCode");
+    header->addWidget(offer_);
+    auto *local = menuButton(tr("本机"), this);
+    header->addWidget(local);
+    layout->addLayout(header);
+    local->menu()->addAction(localDeviceName())->setEnabled(false);
+    auto *receive = local->menu()->addAction(tr("允许局域网发现本机"));
+    receive->setCheckable(true);
     receive->setChecked(probe.receiving());
-    connect(receive, &QCheckBox::toggled, &probe, &LanProbe::setReceiving);
-    connect(&probe, &LanProbe::receivingChanged, receive, &QCheckBox::setChecked);
-    auto *offer = new QPushButton(local);
-    offer->setObjectName("offerCode");
-    localRow->addWidget(receive);
-    localRow->addStretch();
-    localRow->addWidget(offer);
-    localLayout->addLayout(localRow);
-    auto *codeView = label(local);
-    codeView->setObjectName("localPairCode");
-    codeView->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    localLayout->addWidget(codeView);
-    layout->addWidget(local);
-    layout->addWidget(new DesktopControls(*desktop, discovery, this));
+    connect(receive, &QAction::toggled, &probe, &LanProbe::setReceiving);
+    connect(&probe, &LanProbe::receivingChanged, receive, &QAction::setChecked);
+    auto *diagnostics = local->menu()->addAction(tr("连接检测…"));
+    connect(diagnostics, &QAction::triggered, this, [this] { showDiagnostics(probe_, this); });
+    localCode_ = label(this);
+    localCode_->setObjectName("localPairCode");
+    localCode_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    layout->addWidget(localCode_);
 
-    auto *near = new QGroupBox(tr("附近设备"), this);
-    auto *nearLayout = new QVBoxLayout(near);
-    auto *nearby = new QListWidget(near);
-    nearby->setObjectName("nearbyDevices");
-    nearby->setAccessibleName(tr("附近设备"));
-    nearLayout->addWidget(nearby);
-    auto *info = label(near);
-    nearLayout->addWidget(info);
-    auto *pairRow = new QHBoxLayout;
-    auto *code = new QLineEdit(near);
-    code->setObjectName("peerCode");
-    code->setAccessibleName(tr("对方的配对码"));
-    code->setPlaceholderText(tr("对方显示的 8 位配对码"));
-    code->setMaxLength(8);
-    code->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-9]{0,8}"), code));
-    auto *pair = new QPushButton(tr("配对"), near);
-    pair->setObjectName("pairButton");
-    pairRow->addWidget(code, 1);
-    pairRow->addWidget(pair);
-    auto *view = new QPushButton(tr("查看桌面"), near);
-    view->setObjectName("viewDesktop");
-    pairRow->addWidget(view);
-    auto *control = new QPushButton(tr("控制桌面"), near);
-    control->setObjectName("controlDesktop");
-    pairRow->addWidget(control);
-    nearLayout->addLayout(pairRow);
-    layout->addWidget(near, 2);
-
-    const auto recentSetting =
-        QStringLiteral("desktop/recent/") + QString::fromLatin1(store.publicKey().toHex());
-    auto recent = std::make_shared<QStringList>(QSettings().value(recentSetting).toStringList().mid(0, 5));
-    auto lastMode = [recent](const QByteArray &key) -> QChar {
-        for (const auto &record : *recent)
-            if (record.size() == 65 && record.mid(1).toLatin1() == key.toHex())
-                return record.at(0);
-        return {};
-    };
-    auto *trusted = new QGroupBox(tr("已配对设备 · 最近使用优先"), this);
-    auto *trustedLayout = new QVBoxLayout(trusted);
-    auto *saved = new QListWidget(trusted);
-    saved->setObjectName("trustedDevices");
-    saved->setAccessibleName(tr("本机信任的设备"));
-    auto *forget = new QPushButton(tr("撤销本机信任"), trusted);
-    forget->setObjectName("forgetDevice");
-    trustedLayout->addWidget(saved);
-    auto *reconnect = new QPushButton(tr("重新连接"), trusted);
-    auto *savedActions = new QHBoxLayout;
-    savedActions->addWidget(reconnect);
-    savedActions->addStretch();
-    savedActions->addWidget(forget);
-    trustedLayout->addLayout(savedActions);
-    layout->addWidget(trusted, 1);
-    auto *status = label(this);
-    status->setObjectName("pairStatus");
-    layout->addWidget(status);
-
-    auto buttons = [=, &pairing, &probe, &store, &discovery] {
-        const bool ready = !store.publicKey().isEmpty();
-        offer->setEnabled(ready && !pairing.preparing() && probe.receiving() && !probe.endpoints().isEmpty());
-        offer->setText(pairing.preparing()        ? tr("正在生成…")
-                       : pairing.code().isEmpty() ? tr("显示本机配对码")
-                                                  : tr("取消配对码"));
-        pair->setText(pairing.busy() ? tr("取消配对") : tr("配对"));
-        pair->setEnabled(pairing.busy() ||
-                         (ready && !selected(nearby).isEmpty() && code->text().size() == 8));
-        code->setEnabled(!pairing.busy());
-        forget->setEnabled(!selected(saved).isEmpty());
-        const auto selectedKey = selected(nearby);
-        const auto devices = discovery.devices();
-        const auto peer = std::find_if(devices.cbegin(), devices.cend(), [&](const NearbyDevice &d) {
-            return d.key == selectedKey;
-        });
-        const bool capable = peer != devices.cend() && peer->readonlyDesktop;
-        const bool available = desktop->state() == DesktopSession::Idle && capable && store.peers().contains(selectedKey);
-        const auto savedKey = selected(saved);
-        const auto mode = lastMode(savedKey);
-        const auto online =
-            std::find_if(devices.cbegin(), devices.cend(), [&](const auto &d) { return d.key == savedKey; });
-        const bool reconnectable = mode != QChar{} && desktop->state() == DesktopSession::Idle &&
-                                   store.peers().contains(savedKey) && online != devices.cend() &&
-                                   online->readonlyDesktop && (mode != u'c' || online->keyboardMouse);
-        reconnect->setEnabled(reconnectable);
-        reconnect->setToolTip(reconnectable ? tr("使用上次的模式重新请求本次授权")
-                                            : tr("最近使用的设备上线后可重新连接"));
-        view->setEnabled(available);
-        control->setEnabled(available && peer->keyboardMouse);
-        control->setToolTip(capable && peer->keyboardMouse ? tr("请求使用对方的键盘和鼠标")
-                                                         : tr("控制桌面需要两端都使用 0.4.0 或更新版本"));
-        view->setToolTip(capable ? tr("请求查看这台已配对设备的主屏幕")
-                                 : tr("查看桌面需要两端都使用 0.3.0 或更新版本"));
-    };
-    auto clock = [=, &pairing] {
-        const auto value = pairing.code();
-        codeView->setVisible(!value.isEmpty());
-        codeView->setText(value.isEmpty() ? QString{}
-                                          : tr("配对码 %1　剩余 %2 秒　可尝试 %3 次")
-                                                .arg(value)
-                                                .arg(pairing.secondsLeft())
-                                                .arg(pairing.attemptsLeft()));
-    };
-    auto *timer = new QTimer(this);
-    timer->setInterval(1000);
-    connect(timer, &QTimer::timeout, this, clock);
-    auto state = [=, &pairing] {
-        if (pairing.code().isEmpty())
-            timer->stop();
-        else if (!timer->isActive())
-            timer->start();
-        clock();
-        buttons();
-    };
-    auto refreshNearby = [=, &discovery] {
-        const auto was = selected(nearby);
-        nearby->clear();
-        for (const auto &peer : discovery.devices())
-            addDevice(nearby, tr("%1 · %2 · %3").arg(peer.name, osName(peer.os), fingerprint(peer.key)),
-                      peer.key, was);
-        if (!nearby->currentItem() && nearby->count() == 1)
-            nearby->setCurrentRow(0);
-        const auto issue = discovery.issue();
-        QString hint = issue;
-        if (hint.isEmpty() && nearby->count() == 0) {
+    layout->addWidget(new DesktopControls(*desktop_, discovery, this));
+    list_ = new QListWidget(this);
+    list_->setObjectName("deviceList");
+    list_->setAccessibleName(tr("局域网设备"));
+    list_->setFrameShape(QFrame::NoFrame);
+    list_->setItemDelegate(new DeviceDelegate(list_));
+    list_->setUniformItemSizes(true);
+    list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    layout->addWidget(list_, 1);
+    empty_ = label(this);
+    empty_->setAlignment(Qt::AlignCenter);
 #ifdef Q_OS_MACOS
-            hint = tr("等待附近设备。首次使用时，请在系统弹窗中允许访问本地网络。");
+    empty_->setText(tr("等待局域网设备…\n请在另一台电脑打开 WWMM Remote，并允许访问本地网络。"));
 #else
-            hint = tr("等待同一局域网内开启接收的设备…");
+    empty_->setText(tr("等待局域网设备…\n请在同一网络的另一台电脑打开 WWMM Remote。"));
 #endif
-        }
-        info->setText(hint);
-        info->setVisible(!info->text().isEmpty());
-        buttons();
+    layout->addWidget(empty_, 1);
+    issue_ = label(this);
+    layout->addWidget(issue_);
+
+    auto *actions = new QHBoxLayout;
+    code_ = new QLineEdit(this);
+    code_->setObjectName("peerCode");
+    code_->setAccessibleName(tr("对方的配对码"));
+    code_->setPlaceholderText(tr("对方的 8 位配对码"));
+    code_->setMaxLength(8);
+    code_->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-9]{0,8}"), code_));
+    actions->addWidget(code_, 1);
+    actions->addStretch();
+    more_ = menuButton(tr("更多"), this);
+    more_->setAccessibleName(tr("设备操作"));
+    actions->addWidget(more_);
+    view_ = more_->menu()->addAction(tr("查看桌面"));
+    view_->setObjectName("viewDesktop");
+    control_ = more_->menu()->addAction(tr("控制桌面"));
+    control_->setObjectName("controlDesktop");
+    repair_ = more_->menu()->addAction(tr("重新配对…"));
+    forget_ = more_->menu()->addAction(tr("撤销本机信任"));
+    forget_->setObjectName("forgetDevice");
+    primary_ = new QPushButton(this);
+    primary_->setObjectName("connectDesktop");
+    actions->addWidget(primary_);
+    pair_ = new QPushButton(this);
+    pair_->setObjectName("pairButton");
+    actions->addWidget(pair_);
+    layout->addLayout(actions);
+    status_ = label(this);
+    status_->setObjectName("pairStatus");
+    status_->hide();
+    layout->addWidget(status_);
+
+    refresh_.setSingleShot(true);
+    auto schedule = [this] {
+        if (!refresh_.isActive())
+            refresh_.start(0);
     };
-    auto refreshSaved = [=, &store, &discovery] {
-        const auto was = selected(saved);
-        saved->clear();
-        const auto before = *recent;
-        recent->removeIf([&store](const QString &record) {
-            return record.size() != 65 || (record[0] != u'c' && record[0] != u'v') ||
-                   !store.peers().contains(QByteArray::fromHex(record.mid(1).toLatin1()));
-        });
-        if (*recent != before)
-            QSettings().setValue(recentSetting, *recent);
-        QSet<QByteArray> online;
-        for (const auto &d : discovery.devices())
-            online.insert(d.key);
-        QList<QByteArray> keys;
-        for (const auto &record : *recent)
-            keys.append(QByteArray::fromHex(record.mid(1).toLatin1()));
-        for (auto it = store.peers().cbegin(); it != store.peers().cend(); ++it)
-            if (!keys.contains(it.key()))
-                keys.append(it.key());
-        for (const auto &key : keys)
-            addDevice(saved,
-                      tr("%1 · %2 · %3")
-                          .arg(store.peers().value(key), online.contains(key) ? tr("在线") : tr("离线"),
-                               fingerprint(key)),
-                      key, was);
-        if (!saved->currentItem() && !recent->isEmpty())
-            saved->setCurrentRow(0);
-        buttons();
-    };
-    connect(desktop, &DesktopSession::notice, status, &QLabel::setText);
-    connect(desktop, &DesktopSession::changed, this, [=] {
-        if (desktop->state() == DesktopSession::Viewing) {
-            const auto key = QString::fromLatin1(desktop->peerKey().toHex());
-            recent->removeIf([&key](const QString &r) { return r.mid(1) == key; });
-            recent->prepend((desktop->interactive() ? QStringLiteral("c") : QStringLiteral("v")) + key);
-            if (recent->size() > 5)
-                recent->removeLast();
-            QSettings().setValue(recentSetting, *recent);
-            refreshSaved();
-        }
-        buttons();
-    });
-    connect(reconnect, &QPushButton::clicked, this, [=, &discovery, &store] {
-        const auto key = selected(saved);
-        const auto mode = lastMode(key);
-        if (!store.peers().contains(key) || mode.isNull())
-            return;
-        for (const auto &d : discovery.devices())
-            if (d.key == key && d.readonlyDesktop) {
-                desktop->view(d, mode == u'c');
-                break;
-            }
-    });
-    watchDesktopPower(this, [desktop, status, &probe, &discovery](bool awake) {
-        desktop->interrupt(QObject::tr("电脑已休眠，本次桌面授权已结束。"));
-        if (awake) {
-            probe.refresh();
-            discovery.restart();
-            status->setText(QObject::tr("已唤醒。最近用过的电脑上线后，可以重新连接。"));
-        }
-    });
-    auto requestDesktop = [=, &discovery](bool withInput) {
-        for (const auto &peer : discovery.devices())
-            if (peer.key == selected(nearby)) {
-                desktop->view(peer, withInput);
-                break;
-            }
-    };
-    connect(view, &QPushButton::clicked, this, [requestDesktop] { requestDesktop(false); });
-    connect(control, &QPushButton::clicked, this, [requestDesktop] { requestDesktop(true); });
-    connect(&probe, &LanProbe::endpointsChanged, this, buttons);
-    connect(&probe, &LanProbe::receivingChanged, this, buttons);
-    connect(&discovery, &Discovery::changed, this, refreshNearby);
-    connect(&discovery, &Discovery::changed, this, refreshSaved);
-    connect(&store, &DeviceStore::changed, this, refreshSaved);
-    connect(&store, &DeviceStore::openFinished, status, [status](const QString &error) {
+    connect(&refresh_, &QTimer::timeout, this, &DevicesPanel::refreshList);
+    connect(&discovery, &Discovery::changed, this, schedule);
+    connect(&store, &DeviceStore::changed, this, schedule);
+    connect(&store, &DeviceStore::openFinished, this, [this](const QString &error) {
         if (!error.isEmpty())
-            status->setText(error);
+            showStatus(error);
     });
-    connect(&pairing, &Pairing::stateChanged, this, state);
-    connect(&pairing, &Pairing::notice, status, &QLabel::setText);
-    connect(nearby, &QListWidget::itemSelectionChanged, this, buttons);
-    connect(saved, &QListWidget::itemSelectionChanged, this, buttons);
-    connect(code, &QLineEdit::textChanged, this, buttons);
-    connect(code, &QLineEdit::returnPressed, pair, &QPushButton::click);
-    connect(offer, &QPushButton::clicked, this, [&pairing] {
-        if (pairing.code().isEmpty())
-            pairing.offer();
-        else
-            pairing.cancelOffer();
+    connect(list_, &QListWidget::currentItemChanged, this, &DevicesPanel::updateActions);
+    connect(code_, &QLineEdit::textChanged, this, &DevicesPanel::updateActions);
+    connect(code_, &QLineEdit::returnPressed, pair_, &QPushButton::click);
+    connect(primary_, &QPushButton::clicked, this, [this] { requestDesktop(primaryControl_); });
+    connect(view_, &QAction::triggered, this, [this] { requestDesktop(false); });
+    connect(control_, &QAction::triggered, this, [this] { requestDesktop(true); });
+    connect(repair_, &QAction::triggered, this, [this] {
+        repairKey_ = repairKey_.isEmpty() ? selectedKey() : QByteArray{};
+        code_->clear();
+        updateActions();
+        if (!repairKey_.isEmpty())
+            code_->setFocus();
     });
-    connect(pair, &QPushButton::clicked, this, [=, &pairing, &discovery] {
-        if (pairing.busy()) {
-            pairing.cancelPair();
+    connect(forget_, &QAction::triggered, this, [this] {
+        QString error;
+        showStatus(store_.forget(selectedKey(), error) ? tr("已撤销本机对该设备的信任。") : error);
+    });
+    connect(pair_, &QPushButton::clicked, this, [this] {
+        if (pairing_.busy()) {
+            pairing_.cancelPair();
             return;
         }
-        for (const auto &peer : discovery.devices()) {
-            if (peer.key == selected(nearby)) {
-                status->setText(tr("正在验证设备身份…"));
-                pairing.pair(peer, code->text());
-                code->clear();
-                break;
-            }
+        const auto key = selectedKey();
+        const auto &online = discovery_.devicesByKey();
+        const auto peer = online.constFind(key);
+        if (peer != online.cend() && (!store_.peers().contains(key) || key == repairKey_) &&
+            code_->text().size() == 8 && code_->hasAcceptableInput()) {
+            const auto target = *peer;
+            repairKey_.clear();
+            showStatus(tr("正在验证设备身份…"));
+            pairing_.pair(target, code_->text());
+            code_->clear();
         }
     });
-    connect(forget, &QPushButton::clicked, this, [=, &store] {
-        QString error;
-        status->setText(store.forget(selected(saved), error) ? tr("已撤销本机对该设备的信任。") : error);
+    connect(offer_, &QPushButton::clicked, this, [this] {
+        if (pairing_.code().isEmpty())
+            pairing_.offer();
+        else
+            pairing_.cancelOffer();
     });
-    refreshNearby();
-    refreshSaved();
-    state();
+    countdown_.setInterval(1000);
+    connect(&countdown_, &QTimer::timeout, this, &DevicesPanel::updateOffer);
+    connect(&pairing, &Pairing::stateChanged, this, [this] {
+        updateOffer();
+        updateActions();
+    });
+    connect(&probe, &LanProbe::endpointsChanged, this, &DevicesPanel::updateOffer);
+    connect(&probe, &LanProbe::receivingChanged, this, &DevicesPanel::updateOffer);
+    connect(&pairing, &Pairing::notice, this, &DevicesPanel::showStatus);
+    connect(desktop_, &DesktopSession::notice, this, &DevicesPanel::showStatus);
+    connect(desktop_, &DesktopSession::changed, this, [this, schedule] {
+        if (desktop_->state() == DesktopSession::Viewing) {
+            const auto key = QString::fromLatin1(desktop_->peerKey().toHex());
+            const auto record = (desktop_->interactive() ? QStringLiteral("c") : QStringLiteral("v")) + key;
+            if (recent_.value(0) != record) {
+                recent_.removeIf([&key](const QString &r) { return r.mid(1) == key; });
+                recent_.prepend(record);
+                if (recent_.size() > 5)
+                    recent_.removeLast();
+                QSettings().setValue(recentSetting_, recent_);
+                schedule();
+            }
+        }
+        updateActions();
+    });
+    watchDesktopPower(this, [this](bool awake) {
+        desktop_->interrupt(tr("电脑已休眠，本次桌面授权已结束。"));
+        if (awake) {
+            probe_.refresh();
+            discovery_.restart();
+            showStatus(tr("已唤醒。设备上线后可重新连接。"));
+        }
+    });
+    refreshList();
+    updateOffer();
+}
+
+void DevicesPanel::showStatus(const QString &message)
+{
+    status_->setText(message);
+    status_->setVisible(!message.isEmpty());
+}
+
+QByteArray DevicesPanel::selectedKey() const
+{
+    return list_->currentItem() ? list_->currentItem()->data(Qt::UserRole).toByteArray() : QByteArray{};
+}
+
+void DevicesPanel::refreshList()
+{
+    const auto &online = discovery_.devicesByKey();
+    const auto &trusted = store_.peers();
+    if (recent_.removeIf([&trusted](const QString &record) {
+            return record.size() != 65 || (record[0] != u'c' && record[0] != u'v') ||
+                   !trusted.contains(QByteArray::fromHex(record.mid(1).toLatin1()));
+        }))
+        QSettings().setValue(recentSetting_, recent_);
+
+    struct Row { QByteArray key; QString name, detail; int group, recency; };
+    QList<Row> rows;
+    QHash<QString, int> names;
+    auto append = [&](const QByteArray &key, const QString &name, const QString &detail, int group) {
+        const auto hex = key.toHex();
+        const int rank = recent_.indexOf(QStringLiteral("c") + hex);
+        const int recent = rank < 0 ? recent_.indexOf(QStringLiteral("v") + hex) : rank;
+        rows.append({key, name, detail, group, recent < 0 ? 5 : recent});
+        ++names[name];
+    };
+    for (const auto &peer : online) {
+        const auto saved = trusted.constFind(peer.key);
+        const bool paired = saved != trusted.cend();
+        append(peer.key, paired ? *saved : peer.name,
+               tr("%1 · %2").arg(osName(peer.os), paired ? tr("已配对") : tr("待配对")), paired ? 0 : 1);
+    }
+    for (auto it = trusted.cbegin(); it != trusted.cend(); ++it)
+        if (!online.contains(it.key()))
+            append(it.key(), *it, tr("离线"), 2);
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
+        if (a.group != b.group)
+            return a.group < b.group;
+        if (a.recency != b.recency)
+            return a.recency < b.recency;
+        const int order = QString::localeAwareCompare(a.name, b.name);
+        return order ? order < 0 : a.key < b.key;
+    });
+
+    const auto previous = selectedKey();
+    const bool wasEmpty = list_->count() == 0;
+    const auto scroll = list_->verticalScrollBar()->value();
+    QSignalBlocker block(list_);
+    QHash<QByteArray, QListWidgetItem *> items;
+    for (int i = list_->count() - 1; i >= 0; --i) {
+        auto *item = list_->item(i);
+        const auto key = item->data(Qt::UserRole).toByteArray();
+        if (!online.contains(key) && !trusted.contains(key))
+            delete list_->takeItem(i);
+        else
+            items.insert(key, item);
+    }
+    for (int i = 0; i < rows.size(); ++i) {
+        const auto &row = rows[i];
+        auto *item = items.value(row.key);
+        if (!item) {
+            item = new QListWidgetItem;
+            item->setData(Qt::UserRole, row.key);
+            item->setToolTip(fingerprint(row.key));
+            list_->insertItem(i, item);
+        } else if (list_->item(i) != item) {
+            list_->insertItem(i, list_->takeItem(list_->row(item)));
+        }
+        const auto name = names.value(row.name) > 1 ? tr("%1 · %2").arg(row.name, fingerprint(row.key)) : row.name;
+        if (item->text() != name || item->data(detailRole).toString() != row.detail) {
+            item->setText(name);
+            item->setData(detailRole, row.detail);
+            item->setData(Qt::AccessibleTextRole, name + QStringLiteral(" · ") + row.detail);
+        }
+    }
+    if (!previous.isEmpty())
+        list_->setCurrentItem(items.value(previous));
+    else if (wasEmpty && list_->count())
+        list_->setCurrentRow(0);
+    list_->verticalScrollBar()->setValue(scroll);
+    list_->setVisible(!rows.isEmpty());
+    empty_->setVisible(rows.isEmpty());
+    issue_->setText(discovery_.issue());
+    issue_->setVisible(!issue_->text().isEmpty());
+    updateActions();
+}
+
+void DevicesPanel::updateActions()
+{
+    const auto key = selectedKey();
+    if (key != actionKey_) {
+        actionKey_ = key;
+        repairKey_.clear();
+        QSignalBlocker block(code_);
+        code_->clear();
+    }
+    const auto &online = discovery_.devicesByKey();
+    const auto peer = online.constFind(key);
+    const bool present = peer != online.cend();
+    const bool trusted = store_.peers().contains(key);
+    const bool repairing = trusted && present && key == repairKey_;
+    const bool pairable = present && (!trusted || repairing);
+    const bool busy = pairing_.busy();
+    const bool canView = trusted && present && peer->readonlyDesktop;
+    const bool canControl = canView && peer->keyboardMouse;
+    const bool idle = desktop_->state() == DesktopSession::Idle;
+    primaryControl_ = canControl && !recent_.contains(QStringLiteral("v") + key.toHex());
+    primary_->setText(primaryControl_ ? tr("控制桌面") : tr("查看桌面"));
+    primary_->setVisible(canView && !busy && !repairing);
+    primary_->setEnabled(idle);
+    more_->setVisible(trusted && !busy);
+    view_->setVisible(primaryControl_);
+    view_->setEnabled(canView && idle);
+    control_->setVisible(canControl && !primaryControl_);
+    control_->setEnabled(canControl && idle);
+    repair_->setVisible(trusted && present);
+    repair_->setText(repairing ? tr("取消重新配对") : tr("重新配对…"));
+    forget_->setEnabled(trusted);
+    code_->setVisible(pairable && !busy);
+    pair_->setVisible(pairable || busy);
+    pair_->setText(busy ? tr("取消配对") : tr("配对"));
+    pair_->setEnabled(busy || (pairable && code_->text().size() == 8));
+}
+
+void DevicesPanel::updateOffer()
+{
+    const auto code = pairing_.code();
+    offer_->setText(pairing_.preparing() ? tr("正在生成…") : code.isEmpty() ? tr("本机配对码") : tr("取消配对码"));
+    offer_->setEnabled(!store_.publicKey().isEmpty() && !pairing_.preparing() && probe_.receiving() &&
+                       !probe_.endpoints().isEmpty());
+    offer_->setToolTip(!probe_.receiving() ? tr("在「本机」菜单中开启局域网发现") : QString{});
+    localCode_->setVisible(!code.isEmpty());
+    if (code.isEmpty()) {
+        countdown_.stop();
+        localCode_->clear();
+    } else {
+        localCode_->setText(tr("配对码 %1　·　剩余 %2 秒　·　可尝试 %3 次")
+                                .arg(code).arg(pairing_.secondsLeft()).arg(pairing_.attemptsLeft()));
+        if (!countdown_.isActive())
+            countdown_.start();
+    }
+}
+
+void DevicesPanel::requestDesktop(bool control)
+{
+    const auto key = selectedKey();
+    const auto &online = discovery_.devicesByKey();
+    const auto peer = online.constFind(key);
+    if (desktop_->state() == DesktopSession::Idle && store_.peers().contains(key) && peer != online.cend() &&
+        peer->readonlyDesktop && (!control || peer->keyboardMouse)) {
+        const auto target = *peer;
+        desktop_->view(target, control);
+    }
 }
 } // namespace wwmm

@@ -67,6 +67,7 @@ MainWindow::MainWindow(LanProbe &probe, QWidget *parent) : QWidget(parent), prob
     layout->addStretch();
 
     connect(receive_, &QCheckBox::toggled, &probe_, &LanProbe::setReceiving);
+    connect(&probe_, &LanProbe::receivingChanged, this, &MainWindow::updateLocalAddresses);
     connect(refresh, &QPushButton::clicked, &probe_, &LanProbe::refresh);
     connect(copy_, &QPushButton::clicked, this, [this] {
         QApplication::clipboard()->setText(addresses_->currentData().toString());

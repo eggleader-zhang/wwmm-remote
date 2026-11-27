@@ -5,7 +5,8 @@
 
 class QLabel;
 class QPushButton;
-class QCheckBox;
+class QAction;
+class QMenu;
 class QFileDialog;
 class QMimeData;
 
@@ -15,7 +16,7 @@ QString droppedFile(const QMimeData *mime);
 class ClipboardImages;
 class TransferBar final : public QWidget {
   public:
-    explicit TransferBar(SessionData &data, QWidget *parent);
+    explicit TransferBar(SessionData &data, QWidget *parent, QMenu *sessionMenu = nullptr);
     void pollClipboard();
 
   protected:
@@ -27,7 +28,7 @@ class TransferBar final : public QWidget {
     void chooseFile(bool saving);
     SessionData &data_;
     ClipboardImages *images_;
-    QCheckBox *clipboard_;
+    QAction *clipboard_, *send_ = nullptr;
     QLabel *status_;
     QPushButton *file_, *cancel_;
     QFileDialog *dialog_ = nullptr;

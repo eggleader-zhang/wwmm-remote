@@ -33,9 +33,9 @@ private:
   void pumpAudio();
   void receive();
   void tick();
-  void onRtp(const QByteArray &data);
+  void onRtp(QByteArrayView data);
   void reportReception(quint16 seq, quint32 stamp);
-  void onFeedback(const QByteArray &data);
+  void onFeedback(QByteArrayView data);
   void deliver();
   void sendFeedback(bool pli, quint16 seq = 0, quint16 mask = 0);
   struct Impl;
