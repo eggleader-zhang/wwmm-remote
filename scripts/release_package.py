@@ -65,7 +65,8 @@ def package_mac(stage, archive, arch):
         raise ValueError(f"Expected {arch} executable, found {actual}")
     require_file(contents / "Frameworks/QtWidgets.framework/QtWidgets")
     require_file(contents / "Resources/WWMM.icns")
-    require_file(contents / "Helpers/wwmm-update")
+    helper = require_file(contents / "Helpers/wwmm-update")
+    subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none", helper], check=True)
     require_file(contents / "PlugIns/platforms/libqcocoa.dylib")
     for framework in (contents / "Frameworks").glob("*.framework"):
         subprocess.run(["lipo", framework / framework.stem, "-verify_arch", arch], check=True)
@@ -126,7 +127,8 @@ def main():
         helper.parent.mkdir(exist_ok=True)
         goenv = dict(os.environ, CGO_ENABLED="0", GOOS="windows" if windows else "darwin",
                      GOARCH="arm64" if arch == "arm64" else "amd64")
-        subprocess.run(["go", "build", "-mod=readonly", "-trimpath", "-ldflags=-s -w",
+        linker_flags = "-s -w -H=windowsgui" if windows else "-s -w"
+        subprocess.run(["go", "build", "-mod=readonly", "-trimpath", "-ldflags=" + linker_flags,
                         "-o", helper, "."], cwd=ROOT / "installer/update", env=goenv, check=True)
         from release_installers import helper_notices
         helper_notices(notices, goenv)

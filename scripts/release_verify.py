@@ -182,6 +182,15 @@ def main(target, version):
         if bogus.returncode == 0 or (stage / "ready").exists():
             raise RuntimeError("Unsigned update accepted")
         evidence.write_bytes(original)
+        payload = stage / ("install.exe" if windows else f"{BUNDLE}/Contents/Info.plist")
+        original_size = payload.stat().st_size
+        with payload.open("ab") as f:
+            f.write(b"wrong release content")
+        rejected = subprocess.run([helper, "apply", dest, stage, str(build - 1), str(os.getpid()), "check"])
+        if rejected.returncode == 0 or (stage / "ready").exists():
+            raise RuntimeError("Changed payload passed release verification")
+        with payload.open("rb+") as f:
+            f.truncate(original_size)
         if (
             subprocess.run([helper, "apply", dest, stage, str(build), str(os.getpid()), "check"]).returncode
             == 0

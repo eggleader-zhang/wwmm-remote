@@ -54,6 +54,14 @@ func checkDestination(target string) error {
 	if !filepath.IsAbs(target) || !strings.HasSuffix(target, ".app") {
 		return errors.New("请从已安装的应用程序启动更新")
 	}
+	st, err := os.Lstat(target)
+	if err != nil || !st.IsDir() {
+		return errors.New("无效的应用程序目录")
+	}
+	id, err := exec.Command("/usr/bin/plutil", "-extract", "CFBundleIdentifier", "raw", "-o", "-", filepath.Join(target, "Contents/Info.plist")).Output()
+	if err != nil || strings.TrimSpace(string(id)) != "dev.wwmm.remote" {
+		return errors.New("目标应用不是 WWMM Remote")
+	}
 	dir, e := os.MkdirTemp(filepath.Dir(target), ".wwmm-check-")
 	if e != nil {
 		return errors.New("此位置不可写。请从磁盘映像将应用拖入可写的「应用程序」目录")
