@@ -612,17 +612,20 @@ class PairTest : public QObject
         QList<InputEvent> sent;
         connect(surface, &InputWindow::input, &view, [&](const InputEvent &e) { sent << e; });
         view.show();
+        QTRY_VERIFY(view.windowHandle()->isExposed());
+        const auto target = reinterpret_cast<HWND>(surface->winId());
+        const auto window = GetAncestor(target, GA_ROOT);
         view.activateWindow();
+        QTRY_COMPARE(GetForegroundWindow(), window);
         view.focusVideo();
+        QTRY_VERIFY(GetFocus() == target || IsChild(target, GetFocus()));
         surface->setMacKeyboard(true);
         surface->setInputFocus(InputFocus::Text);
         surface->presented();
         QTRY_COMPARE(QGuiApplication::focusObject(), surface);
         QTRY_VERIFY(surface->keyboardGrabbed());
-        const auto target = reinterpret_cast<HWND>(surface->winId());
-        const auto window = GetAncestor(target, GA_ROOT);
         auto press = [&](WORD scan, bool down) {
-            if (GetForegroundWindow() != window || GetFocus() != target)
+            if (GetForegroundWindow() != window || (GetFocus() != target && !IsChild(target, GetFocus())))
                 return false;
             INPUT in{};
             in.type = INPUT_KEYBOARD;

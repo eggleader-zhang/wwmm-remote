@@ -129,7 +129,15 @@ def main():
     for binary, cases in [("wwmm_pair_tests", gui_cases),
                           ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess", "updateWaitsForIdle",
                                                   "shortcutMapping", "mappedMacKeyboard"])]:
-        subprocess.run([build / (binary + suffix), *cases], env=env, check=True, timeout=90)
+        # Qt GUI tests on Windows can send their default output to the debugger.
+        report = build / (binary + "-results.txt")
+        report.unlink(missing_ok=True)
+        try:
+            subprocess.run([build / (binary + suffix), "-o", f"{report},txt", *cases],
+                           env=env, check=True, timeout=90)
+        finally:
+            if report.is_file():
+                print(report.read_text(encoding="utf-8", errors="replace"), flush=True)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)
     output = ROOT / "dist" / version
