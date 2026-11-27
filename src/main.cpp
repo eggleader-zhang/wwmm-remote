@@ -1,5 +1,13 @@
 #include "devices_panel.h"
 #include "desktop_tray.h"
+#include "release_version.h"
+#include <QJsonObject>
+#include <QJsonDocument>
+#include <QFile>
+#include <QSysInfo>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
 #include <QApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -21,6 +29,13 @@ int main(int argc, char **argv)
     app.setOrganizationName(QStringLiteral("WWMM"));
     app.setOrganizationDomain(QStringLiteral("wwmm.dev"));
     app.setApplicationName(QStringLiteral("WWMM Remote"));
+    if (app.arguments().contains("--installation-info")) {
+        QFile out;
+        if (!out.open(stdout, QIODevice::WriteOnly) || QIcon(":/icons/wwmm.png").pixmap(32).isNull()) return 1;
+        out.write(QJsonDocument(QJsonObject{{"Product","dev.wwmm.remote"},{"Version",WWMM_VERSION_STRING},
+            {"Build",WWMM_BUILD_NUMBER},{"CPU",QSysInfo::buildCpuArchitecture()}}).toJson(QJsonDocument::Compact));
+        return out.flush() ? 0 : 1;
+    }
     const auto directory = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     const auto socketName = QStringLiteral("wwmm-remote-") + QString::fromLatin1(
         QCryptographicHash::hash(directory.toUtf8(), QCryptographicHash::Sha256).toHex().left(24));
@@ -42,6 +57,13 @@ int main(int argc, char **argv)
         return 1;
     }
     QLocalServer launcher;
+#ifdef Q_OS_WIN
+    // The per-user installer detects this mutex and asks for a graceful tray exit.
+    const auto runningMutex = CreateMutexW(nullptr, FALSE, L"Local\\WWMMRemote-Desktop");
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [runningMutex] {
+        if (runningMutex) CloseHandle(runningMutex);
+    });
+#endif
     launcher.setSocketOptions(QLocalServer::UserAccessOption);
     QLocalServer::removeServer(socketName);
     if (!launcher.listen(socketName)) {

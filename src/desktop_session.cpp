@@ -68,7 +68,7 @@ DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, std::functio
     : QObject(parent), probe_(probe), store_(store), allowInput_(std::move(allowInput)), data_(store, this)
 {
     connect(&probe, &LanProbe::desktopRequested, this, [this](QTcpSocket *socket, const LanAddress &link) {
-        if (state_ != Idle || store_.peers().isEmpty() || !probe_.receiving() ||
+        if (installing_ || state_ != Idle || store_.peers().isEmpty() || !probe_.receiving() ||
             !isOnLink(socket->peerAddress(), link)) {
             socket->abort();
             socket->deleteLater();
@@ -139,7 +139,7 @@ void DesktopSession::setState(State s)
 
 void DesktopSession::view(const NearbyDevice &peer, bool withInput)
 {
-    if (control_ || (state_ == Interrupted && (peer.key != selected_ || withInput != interactive_)))
+    if (installing_ || control_ || (state_ == Interrupted && (peer.key != selected_ || withInput != interactive_)))
         return;
     if (!peer.canRequestDesktop(withInput)) {
         emit notice(tr("对方不支持所选的桌面模式。"));

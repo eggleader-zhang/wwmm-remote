@@ -21,6 +21,9 @@ class DesktopSession final : public QObject {
     ~DesktopSession() override;
 
     State state() const { return state_; }
+    bool canInstallUpdate() const { return state_ == Idle && !control_ && data_.fileState() == SessionData::NoFile; }
+    bool reserveUpdate() { return installing_ = canInstallUpdate(); }
+    void releaseUpdate() { installing_ = false; }
 
     QString peerName() const;
     void view(const NearbyDevice &peer, bool withInput = false);
@@ -105,6 +108,7 @@ class DesktopSession final : public QObject {
     TrustedChannel *control_ = nullptr;
     std::unique_ptr<Network> network_;
     State state_ = Idle;
+    bool installing_ = false;
     LanAddress link_;
     Endpoint remote_;
     QByteArray selected_;

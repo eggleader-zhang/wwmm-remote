@@ -1,5 +1,6 @@
 #include "desktop_tray.h"
 #include "desktop_session.h"
+#include "desktop_update.h"
 #include <QApplication>
 
 namespace wwmm {
@@ -29,6 +30,7 @@ DesktopTray::DesktopTray(QWidget &window) : QObject(&window), window_(window), i
     stop_ = menu_.addAction(tr("停止共享"));
     stop_->setVisible(false);
     menu_.addSeparator();
+    update_ = new DesktopUpdate(menu_, window, this);
     auto *quit = menu_.addAction(tr("退出 WWMM Remote"));
     quit->setMenuRole(QAction::NoRole);
     connect(quit, &QAction::triggered, qApp, &QCoreApplication::quit);
@@ -45,6 +47,7 @@ DesktopTray::DesktopTray(QWidget &window) : QObject(&window), window_(window), i
 
 void DesktopTray::watch(DesktopSession &session)
 {
+    update_->watch(session);
     connect(stop_, &QAction::triggered, &session, [&session] { session.stop(); });
     connect(qApp, &QCoreApplication::aboutToQuit, &session, [&session] { session.stop(); });
     connect(&session, &DesktopSession::changed, this, [this, &session] {

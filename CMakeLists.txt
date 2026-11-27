@@ -2,8 +2,9 @@ cmake_minimum_required(VERSION 3.24)
 if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS deployment target")
 endif()
-project(WWMMRemote VERSION 1.5.2 LANGUAGES C CXX)
+project(WWMMRemote VERSION 1.5.3 LANGUAGES C CXX)
 set(WWMM_BUILD_NUMBER 0 CACHE STRING "Native package build number")
+configure_file(src/release_version.h.in release_version.h @ONLY)
 set(wwmm_bundle_build "${PROJECT_VERSION}")
 if(WWMM_BUILD_NUMBER GREATER 0)
     set(wwmm_bundle_build "${WWMM_BUILD_NUMBER}")
@@ -50,9 +51,11 @@ endif()
 
 add_library(wwmm_widgets STATIC src/main_window.cpp src/main_window.h src/devices_panel.cpp src/devices_panel.h
     src/desktop_tray.cpp src/desktop_tray.h
+    src/desktop_update.cpp src/desktop_update.h
     src/desktop_controls.cpp src/desktop_controls.h src/desktop_viewer.cpp src/desktop_viewer.h
     src/input_window.cpp src/input_window.h src/transfer_bar.cpp src/transfer_bar.h src/clipboard_images.cpp src/clipboard_images.h)
 target_link_libraries(wwmm_widgets PUBLIC wwmm_lan Qt6::Widgets)
+target_include_directories(wwmm_widgets PUBLIC "${CMAKE_CURRENT_BINARY_DIR}")
 if(APPLE)
     enable_language(OBJCXX)
     set(CMAKE_OBJCXX_STANDARD 20)

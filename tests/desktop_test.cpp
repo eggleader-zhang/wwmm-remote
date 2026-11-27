@@ -510,6 +510,31 @@ class DesktopTest final : public QObject
         QCOMPARE(received.size(), 5);
     }
 
+    void updateWaitsForIdle()
+    {
+        Node host, viewer;
+        host.trust(viewer);
+        viewer.trust(host);
+        viewer.session.view(host.target());
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        QVERIFY(!host.session.reserveUpdate());
+        host.session.accept();
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Viewing);
+        QVERIFY(!host.session.reserveUpdate());
+        QVERIFY(!viewer.session.reserveUpdate());
+        host.session.stop();
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+        QVERIFY(host.session.reserveUpdate());
+        viewer.session.view(host.target());
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+        QCOMPARE(host.session.state(), DesktopSession::Idle);
+        host.session.releaseUpdate();
+        viewer.session.view(host.target());
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        host.session.stop();
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+    }
+
     void rememberedAccess()
     {
         Node viewer, host, other;

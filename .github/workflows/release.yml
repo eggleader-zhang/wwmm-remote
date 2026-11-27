@@ -12,6 +12,8 @@ on:
       - 'cmake/*.cmake'
       - 'src/**'
       - 'platform/**'
+      - 'installer/**'
+      - 'tests/**'
 
 concurrency:
   group: desktop-releases
@@ -76,6 +78,10 @@ jobs:
             msvc: arm64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: installer/update/go.sum
       - name: Build and package macOS
         if: runner.os == 'macOS'
         run: python3 scripts/release_package.py "${{ matrix.target }}"
@@ -87,33 +93,109 @@ jobs:
           call "%vs%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=${{ matrix.msvc }} -host_arch=${{ matrix.msvc }}
           if errorlevel 1 exit /b 1
           python scripts\release_package.py "${{ matrix.target }}"
-      - name: Sign macOS package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/${{ needs.version.outputs.number }}/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  installers:
+    needs: [version, build]
+    name: Assemble ${{ matrix.os }} installer
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: darwin, prefix: macos, runner: macos-26 }
+          - { os: windows, prefix: windows, runner: windows-2022 }
+    env:
+      VERSION: ${{ needs.version.outputs.number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-${{ matrix.prefix }}-*
+          path: packages
+          merge-multiple: true
+      - name: Assemble universal Mac app
         if: runner.os == 'macOS'
-        env:
+        env: &apple_signing
           MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
           APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: python3 scripts/release_sign.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
-      - name: Sign Windows package
+        run: python3 scripts/release_installers.py prepare darwin "$VERSION"
+      - name: Assemble native Windows payloads
         if: runner.os == 'Windows'
-        env:
+        env: &windows_signing
           WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: python scripts/release_sign.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
+        run: python scripts/release_installers.py prepare windows $env:VERSION
+      - name: Sign offline update manifest with this workflow identity
+        id: provenance
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: build-installer/release.json
+      - name: Create Mac disk image
+        if: runner.os == 'macOS'
+        env: *apple_signing
+        run: python3 scripts/release_installers.py finish darwin "$VERSION" --bundle "${{ steps.provenance.outputs.bundle-path }}"
+      - name: Create Windows setup EXE
+        if: runner.os == 'Windows'
+        shell: cmd
+        env: *windows_signing
+        run: |
+          for /f "usebackq tokens=*" %%v in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set "vs=%%v"
+          call "%vs%\Common7\Tools\VsDevCmd.bat" -no_logo -arch=x86 -host_arch=x64
+          if errorlevel 1 exit /b 1
+          python scripts\release_installers.py finish windows "%VERSION%" --bundle "${{ steps.provenance.outputs.bundle-path }}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: package-${{ matrix.target }}
-          path: |
-            dist/${{ needs.version.outputs.number }}/WWMM-Remote-${{ needs.version.outputs.number }}-${{ matrix.target }}.zip
-            dist/${{ needs.version.outputs.number }}/signing-${{ matrix.target }}.txt
+          name: installer-${{ matrix.os }}
+          path: dist/installers/*
           if-no-files-found: error
           compression-level: 0
-          retention-days: 3
+          retention-days: 7
+
+  install-test:
+    needs: [version, installers]
+    name: Install and upgrade · ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: darwin, target: macos-arm64, runner: macos-26 }
+          - { os: darwin, target: macos-x86_64, runner: macos-26-intel }
+          - { os: windows, target: windows-x64, runner: windows-2022 }
+          - { os: windows, target: windows-arm64, runner: windows-11-arm }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installer-${{ matrix.os }}
+          path: packages
+      - name: Load previously published portable edition for migration
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v1.5.2-r2 --pattern "*-${{ matrix.target }}.zip" --dir previous
+      - name: Exercise native installation, offline upgrade and preserved profile
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then py=python; else py=python3; fi
+          "$py" scripts/release_verify.py "${{ matrix.target }}" "${{ needs.version.outputs.number }}"
 
   publish:
-    needs: [version, build]
+    needs: [version, install-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,47 +205,11 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: package-*
+          pattern: installer-*
           path: packages
           merge-multiple: true
-      - name: Publish verified downloads
-        working-directory: packages
+      - name: Publish the tested installers
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.version.outputs.number }}
           TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          set -euo pipefail
-          tag="$TAG"
-          release="${tag#v}"
-          notes="$RUNNER_TEMP/release-notes.md"
-          cp "../docs/releases/$tag.md" "$notes"
-          printf '\n## 发布签名\n\n' >> "$notes"
-          for target in macos-arm64 macos-x86_64 windows-x64 windows-arm64; do
-            test -s "WWMM-Remote-$VERSION-$target.zip"
-            if [[ "$release" != "$VERSION" ]]; then
-              mv "WWMM-Remote-$VERSION-$target.zip" "WWMM-Remote-$release-$target.zip"
-            fi
-            test -s "signing-$target.txt"
-            cat "signing-$target.txt" >> "$notes"
-          done
-          test "$(find . -name '*.zip' | wc -l)" -eq 4
-          sha256sum *.zip > SHA256SUMS.txt
-          if git rev-parse --verify --quiet "refs/tags/$tag" > /dev/null; then
-            test "$(git rev-parse "refs/tags/$tag^{commit}")" = "$GITHUB_SHA"
-          fi
-          releases=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100")
-          existing=$(jq -c --arg tag "$tag" 'add[] | select(.tag_name == $tag)' <<< "$releases")
-          if [[ -z "$existing" ]]; then
-            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "WWMM Remote $release" --notes-file "$notes"
-          else
-            jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<< "$existing" >/dev/null
-          fi
-          gh release upload "$tag" *.zip SHA256SUMS.txt --clobber
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-            jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag) | .assets[] | [.digest, .name] | @tsv' |
-            sort > "$RUNNER_TEMP/uploaded"
-          sha256sum *.zip SHA256SUMS.txt | awk '{ print "sha256:" $1 "\t" $2 }' | sort > "$RUNNER_TEMP/expected"
-          diff -u "$RUNNER_TEMP/expected" "$RUNNER_TEMP/uploaded"
-          gh release edit "$tag" --draft=false --latest --notes-file "$notes"
-          gh release view "$tag" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"
+        run: python3 scripts/release_publish.py

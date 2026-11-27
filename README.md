@@ -2,7 +2,14 @@
 
 一款面向办公的纯局域网远程桌面工具。macOS 和 Windows 共用 C++20、Qt 6 Widgets 界面和网络核心。
 
-在 GitHub Releases 可按芯片下载 macOS 或 Windows 的原生包。Mac 在「关于本机」中查看芯片或处理器，Windows 在「设置 → 系统 → 系统信息」中查看系统类型。[下载最新版本](https://github.com/eggleader-zhang/wwmm-remote/releases/latest)
+## 安装和升级
+
+从发布页选择 Windows 或 Mac，两份安装包均可离线使用。[下载最新版](https://github.com/eggleader-zhang/wwmm-remote/releases/latest)
+
+- **Windows** 双击 `WWMM-Remote-Setup.exe`，完成后从开始菜单打开应用。安装程序自动选择 x64 或 ARM64，并带齐运行库。
+- **macOS** 打开 `WWMM-Remote.dmg`，把 WWMM Remote 拖进「应用程序」后打开。Apple 芯片和 Intel Mac 共用一个包。
+- **已有 1.5.2-r2** 从系统托盘或菜单栏退出旧版，使用对应的新安装包。原用户的配对和免确认设置会保留。
+- **从 1.5.3 起** 托盘或菜单栏的「安装更新…」可从本地或局域网共享目录选择新版安装包。安装前会离线核验来源和构建号，并等待会话和传输结束。[发布签名配置](docs/release-signing.md)
 
 ## 连接另一台电脑（1.5.2）
 

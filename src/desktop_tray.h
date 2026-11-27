@@ -4,6 +4,7 @@
 
 namespace wwmm {
 class DesktopSession;
+class DesktopUpdate;
 
 void showDevicesWindow(QWidget &window);
 
@@ -17,5 +18,6 @@ class DesktopTray final : public QObject {
     QMenu menu_;
     QSystemTrayIcon icon_;
     QAction *stop_;
+    DesktopUpdate *update_;
 };
 } // namespace wwmm

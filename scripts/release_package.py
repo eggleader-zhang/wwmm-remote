@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -34,7 +35,7 @@ def windows_machine(path):
 
 def package_windows(stage, archive, arch):
     required = [f"{APP}.exe", "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll",
-                "plugins/platforms/qwindows.dll", f"vc_redist.{arch}.exe"]
+                "plugins/platforms/qwindows.dll", "wwmm-update.exe", "vcruntime140.dll", "msvcp140.dll"]
     for name in required:
         require_file(stage / name)
     machine = {"x64": 0x8664, "arm64": 0xaa64}[arch]
@@ -47,7 +48,7 @@ def package_windows(stage, archive, arch):
     # Template-only uses of QtConcurrent can be fully inlined. Check the linked imports.
     imports = subprocess.check_output(["dumpbin", "/nologo", "/dependents", *binaries],
                                       text=True, errors="replace")
-    for name in set(re.findall(r"^\s*(Qt6[\w-]+\.dll)\s*$", imports, re.IGNORECASE | re.MULTILINE)):
+    for name in set(re.findall(r"^\s*((?:Qt6|msvcp140|vcruntime140|concrt140)[\w-]*\.dll)\s*$", imports, re.IGNORECASE | re.MULTILINE)):
         require_file(stage / name)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
         for path in sorted(stage.rglob("*")):
@@ -64,6 +65,7 @@ def package_mac(stage, archive, arch):
         raise ValueError(f"Expected {arch} executable, found {actual}")
     require_file(contents / "Frameworks/QtWidgets.framework/QtWidgets")
     require_file(contents / "Resources/WWMM.icns")
+    require_file(contents / "Helpers/wwmm-update")
     require_file(contents / "PlugIns/platforms/libqcocoa.dylib")
     for framework in (contents / "Frameworks").glob("*.framework"):
         subprocess.run(["lipo", framework / framework.stem, "-verify_arch", arch], check=True)
@@ -105,7 +107,7 @@ def main():
     env = dict(os.environ, QT_QPA_PLATFORM="windows" if windows else "offscreen", QT_PLUGIN_PATH=str(qt / "plugins"))
     suffix = ".exe" if windows else ""
     for binary, cases in [("wwmm_pair_tests", ["readOnlyRequestButtons", "trayLifecycle", "storeAndRevocation"]),
-                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess"])]:
+                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess", "updateWaitsForIdle"])]:
         subprocess.run([build / (binary + suffix), *cases], env=env, check=True, timeout=90)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)
@@ -120,6 +122,22 @@ def main():
                      "libSRTP-LICENSE", "Opus-LICENSE", f"qtbase-{QT_VERSION}.spdx"]:
             require_file(notices / name)
         install_license_files(notices)
+        helper = (stage / "wwmm-update.exe" if windows else stage / f"{APP}.app/Contents/Helpers/wwmm-update")
+        helper.parent.mkdir(exist_ok=True)
+        goenv = dict(os.environ, CGO_ENABLED="0", GOOS="windows" if windows else "darwin",
+                     GOARCH="arm64" if arch == "arm64" else "amd64")
+        subprocess.run(["go", "build", "-mod=readonly", "-trimpath", "-ldflags=-s -w",
+                        "-o", helper, "."], cwd=ROOT / "installer/update", env=goenv, check=True)
+        from release_installers import helper_notices
+        helper_notices(notices, goenv)
+        if windows:
+            redist = Path(os.environ["VCToolsRedistDir"]) / arch
+            crt = next(redist.glob("Microsoft.VC*.CRT"))
+            for dll in crt.glob("*.dll"):
+                shutil.copy2(dll, stage / dll.name)
+            for setup in stage.glob("vc_redist.*.exe"):
+                setup.unlink()
+            (stage / "wwmm-install.id").write_bytes(b"dev.wwmm.remote\n")
         packed = Path(temp) / archive.name
         if os_name == "windows":
             package_windows(stage, packed, arch)
