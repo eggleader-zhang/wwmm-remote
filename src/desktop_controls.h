@@ -6,6 +6,8 @@
 #include <QWidget>
 class QLabel;
 class QCheckBox;
+class QAction;
+class QMenu;
 class QPushButton;
 class QTimer;
 class QVBoxLayout;
@@ -16,12 +18,13 @@ class TransferBar;
 
 class DesktopControls final : public QWidget {
   public:
-    DesktopControls(DesktopSession &session, Discovery &discovery, QWidget *parent);
+    DesktopControls(DesktopSession &session, Discovery &discovery, QMenu *settings, QWidget *parent);
     ~DesktopControls() override;
 
   private:
     struct Callbacks;
     void updateState();
+    void updateCursorAction();
     void startCapture();
     void openViewer();
     void switchDisplay(bool formatOnly);
@@ -45,6 +48,7 @@ class DesktopControls final : public QWidget {
     TransferBar *transfer_ = nullptr;
     QPushButton *yes_, *stop_;
     DesktopViewer *viewer_ = nullptr;
+    QAction *localCursor_, *remoteCursor_;
     std::shared_ptr<Callbacks> callbacks_;
     std::unique_ptr<DesktopCapture> capture_;
     std::unique_ptr<DesktopPlayer> player_;

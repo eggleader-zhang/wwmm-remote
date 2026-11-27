@@ -16,12 +16,14 @@ class InputWindow;
 class DesktopViewer final : public QDialog {
     Q_OBJECT
   public:
-    explicit DesktopViewer(QWidget *parent = nullptr, bool interactive = false, bool rich = false);
+    explicit DesktopViewer(QWidget *parent = nullptr, bool interactive = false, bool rich = false,
+                           const QList<QAction *> &cursorActions = {});
     quintptr videoView() const;
 
     InputWindow *inputSurface() const { return surface_; }
 
     void focusVideo();
+    void setLocalCursorVisible(bool visible);
     void setStatus(const QString &text);
     void waitForPicture(const QString &message);
     void pictureShown();

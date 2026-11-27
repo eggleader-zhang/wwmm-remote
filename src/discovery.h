@@ -24,6 +24,7 @@ struct NearbyDevice {
     bool richMedia = false;
     bool adaptiveVideo = false;
     bool macKeyboard = false;
+    bool cursorVisibility = false;
     // Missing DNS-SD hints still allow an explicit, authenticated session request.
     bool canRequestDesktop(bool withInput) const
     {

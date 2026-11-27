@@ -40,6 +40,7 @@ public:
 };
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError failure, quint64 display = 0,
-                                               VideoQuality quality = VideoQuality::FullHD);
+                                               VideoQuality quality = VideoQuality::FullHD, bool showCursor = true,
+                                               std::function<void()> cursorUnavailable = {});
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr nativeView, PresentedFrame presented, MediaError failure);
 } // namespace wwmm

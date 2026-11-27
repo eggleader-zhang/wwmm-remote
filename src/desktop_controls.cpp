@@ -11,7 +11,9 @@
 #include <QSignalBlocker>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QMenu>
 #include <QMutex>
+#include <QSettings>
 #include <QPushButton>
 #include <QTimer>
 #include <QFutureWatcher>
@@ -55,9 +57,38 @@ struct DesktopControls::Callbacks {
     }
 };
 
-DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, QWidget *parent)
+DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, QMenu *settings, QWidget *parent)
     : QWidget(parent), session_(session), discovery_(discovery)
 {
+    auto cursorAction = [this, settings](const QString &label, const QString &key) {
+        auto *action = new QAction(label, this);
+        action->setCheckable(true);
+        action->setChecked(QSettings().value(key, true).toBool());
+        settings->addAction(action);
+        connect(action, &QAction::triggered, this, [key](bool visible) { QSettings().setValue(key, visible); });
+        return action;
+    };
+    localCursor_ = cursorAction(tr("是否显示本机鼠标"), QStringLiteral("viewer/showLocalCursor"));
+    remoteCursor_ = cursorAction(tr("是否显示远程鼠标"), QStringLiteral("viewer/showRemoteCursor"));
+    localCursor_->setToolTip(tr("在远控画面中显示这台电脑的指针"));
+    session.setRemoteCursorVisible(remoteCursor_->isChecked());
+    updateCursorAction();
+    connect(localCursor_, &QAction::triggered, this, [this](bool visible) {
+        if (viewer_)
+            viewer_->setLocalCursorVisible(visible);
+    });
+    connect(remoteCursor_, &QAction::triggered, &session, &DesktopSession::setRemoteCursorVisible);
+    connect(&session, &DesktopSession::remoteCursorUnavailable, this, [this] {
+        updateCursorAction();
+        if (viewer_)
+            viewer_->setStatus(tr("共享端无法隐藏系统指针，已恢复显示远程鼠标。"));
+    });
+    connect(&session, &DesktopSession::captureCursorChanged, this, [this] {
+        if (capture_) {
+            retireMedia(true);
+            startCapture();
+        }
+    });
     column_ = new QVBoxLayout(this);
     column_->setContentsMargins(0, 0, 0, 0);
     auto *row = new QHBoxLayout;
@@ -305,10 +336,20 @@ void DesktopControls::updateReconnect()
     viewer_->showInterrupted(text.arg(session_.peerName()), online);
 }
 
+void DesktopControls::updateCursorAction()
+{
+    const bool available = session_.state() != DesktopSession::Viewing || session_.canSetRemoteCursor();
+    remoteCursor_->setChecked(!available || session_.prefersRemoteCursor());
+    remoteCursor_->setEnabled(available);
+    remoteCursor_->setToolTip(available ? tr("在远程画面中显示共享端的系统指针")
+                                        : tr("当前共享端不支持隐藏鼠标指针"));
+}
+
 void DesktopControls::updateState()
 {
     const auto s = session_.state();
     const bool control = session_.interactive();
+    updateCursorAction();
     setVisible(s != DesktopSession::Idle);
     yes_->setVisible(s == DesktopSession::Requested);
     rememberAccess_->setVisible(s == DesktopSession::Requested && control);
@@ -476,7 +517,9 @@ void DesktopControls::startCapture()
                 });
             });
         },
-        session_.displayId(), session_.quality());
+        session_.displayId(), session_.quality(), session_.captureCursorVisible(), [gate] {
+            Callbacks::post(gate, [](DesktopControls *ui) { ui->session_.reportCursorUnavailable(); });
+        });
 }
 
 void DesktopControls::openViewer()
@@ -489,7 +532,8 @@ void DesktopControls::openViewer()
             viewer_->focusVideo();
         return;
     }
-    viewer_ = new DesktopViewer(this, control, session_.richMedia());
+    viewer_ = new DesktopViewer(this, control, session_.richMedia(), {localCursor_, remoteCursor_});
+    viewer_->setLocalCursorVisible(localCursor_->isChecked());
     connect(viewer_, &DesktopViewer::reconnectRequested, this, [this] {
         if (session_.state() == DesktopSession::Interrupted)
             if (auto peer = reconnectPeer())

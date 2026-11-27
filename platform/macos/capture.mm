@@ -71,7 +71,7 @@ class MacCapture final : public DesktopCapture
     std::shared_ptr<MacCaptureState> s_ = std::make_shared<MacCaptureState>();
 
   public:
-    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected, VideoQuality quality)
+    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected, VideoQuality quality, bool showCursor)
     {
         auto s = s_;
         s->output = std::move(output);
@@ -112,7 +112,7 @@ class MacCapture final : public DesktopCapture
                                          cfg.minimumFrameInterval = CMTimeMake(1, videoFps);
                                          cfg.captureResolution = SCCaptureResolutionBest;
                                          cfg.queueDepth = 3;
-                                         cfg.showsCursor = YES;
+                                         cfg.showsCursor = showCursor;
                                          cfg.capturesAudio = NO;
                                          cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
                                          cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
@@ -204,10 +204,10 @@ QList<DesktopDisplay> desktopDisplays()
 }
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
-                                               VideoQuality quality)
+                                               VideoQuality quality, bool showCursor, std::function<void()>)
 {
     return std::make_unique<MacCapture>(std::move(output), std::move(error),
-                                        display ? CGDirectDisplayID(display) : CGMainDisplayID(), quality);
+                                        display ? CGDirectDisplayID(display) : CGMainDisplayID(), quality, showCursor);
 }
 } // namespace wwmm
 @implementation WWMMScreenOutput

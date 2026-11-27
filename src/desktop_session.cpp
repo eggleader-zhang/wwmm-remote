@@ -162,8 +162,10 @@ void DesktopSession::view(const NearbyDevice &peer, bool withInput)
     extended_ = peer.extendedDesktop;
     rich_ = extended_ && peer.richMedia;
     adaptive_ = rich_ && peer.adaptiveVideo;
+    cursorProtocol_ = adaptive_ && peer.cursorVisibility;
+    captureCursor_ = !cursorProtocol_ || preferCursor_;
     macKeyboardProtocol_ = adaptive_ && withInput && localOS() == DesktopOS::windows &&
-                           peer.os == DesktopOS::macOS && peer.macKeyboard;
+                           peer.os == DesktopOS::macOS && (peer.macKeyboard || cursorProtocol_);
     retrying_ = state_ == Interrupted;
     attach(socket, peer.link, peer.key, withInput);
     connect(socket, &QTcpSocket::connected, control_, &TrustedChannel::start);
@@ -175,8 +177,11 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
     ++epoch_;
     host_ = expected.isEmpty();
     interactive_ = withInput;
-    if (host_)
-        macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
+    if (host_) {
+        cursorProtocol_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
+        captureCursor_ = true;
+    }
+    cursorUnavailable_ = false;
     pointerSequence_ = pointerFence_ = lastPosition_ = 0;
     latestPosition_.reset();
     selected_ = expected;
@@ -200,8 +205,7 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
             auto request = portMessage(op, network_->port);
             if (interactive_)
                 request.append(char(localOS()));
-            if (rich_)
-                request.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
+            appendMediaOptions(request);
             if (!control_->send(request))
                 return stop(tr("无法准备局域网视频接收。"));
             setState(Waiting);
@@ -373,11 +377,13 @@ void DesktopSession::handle(const QByteArray &data)
     const bool modern = op == 'v' || op == 'y' || op == 'c' || op == 'a';
     const bool controlOffer = op == 'C' || op == 'A' || op == 'c' || op == 'a';
     const int baseSize = controlOffer ? 4 : 3;
-    // v15 extends the adaptive control handshake only for a Windows viewer and a Mac host.
-    const bool macKeysOffer = modern && controlOffer && data.size() == baseSize + 1 && quint8(data.back()) == 15 &&
+    // v16 carries the initial cursor preference before the first captured frame.
+    const bool cursorOffer = modern && data.size() == baseSize + 2 && data[baseSize] == 16 && quint8(data.back()) <= 1;
+    const bool v15 = modern && data.size() == baseSize + 1 && data.back() == 15;
+    const bool macKeysOffer = (cursorOffer || v15) && controlOffer &&
         ((host_ && localOS() == DesktopOS::macOS && quint8(data[3]) == quint8(DesktopOS::windows)) ||
          (!host_ && localOS() == DesktopOS::windows && quint8(data[3]) == quint8(DesktopOS::macOS)));
-    const bool adaptiveOffer = macKeysOffer || (modern && data.size() == baseSize + 1 && quint8(data.back()) == 14);
+    const bool adaptiveOffer = cursorOffer || macKeysOffer || (modern && data.size() == baseSize + 1 && quint8(data.back()) == 14);
     const bool richOffer = adaptiveOffer || (modern && data.size() == baseSize + 1 && quint8(data.back()) == 13);
     if ((!richOffer && data.size() != baseSize) ||
         (controlOffer && quint8(data[3]) != quint8(DesktopOS::macOS) &&
@@ -392,6 +398,8 @@ void DesktopSession::handle(const QByteArray &data)
         rich_ = richOffer;
         adaptive_ = adaptiveOffer;
         macKeyboardProtocol_ = macKeysOffer;
+        cursorProtocol_ = cursorOffer;
+        captureCursor_ = !cursorOffer || data.back() != 0;
         interactive_ = controlOffer;
         if (interactive_)
             peerOS_ = DesktopOS(quint8(data[3]));
@@ -402,7 +410,8 @@ void DesktopSession::handle(const QByteArray &data)
             setState(Requested);
         }
     } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ && adaptiveOffer == adaptive_ &&
-               macKeysOffer == macKeyboardProtocol_ &&
+               macKeysOffer == macKeyboardProtocol_ && cursorOffer == cursorProtocol_ &&
+               (!cursorOffer || (data.back() != 0) == captureCursor_) &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
         if (interactive_)
@@ -411,6 +420,7 @@ void DesktopSession::handle(const QByteArray &data)
             return stop(tr("无法启动加密视频接收。"));
         retrying_ = false;
         setState(Viewing);
+        setRemoteCursorVisible(preferCursor_);
     } else
         stop(tr("桌面请求状态已改变。"));
 }
@@ -439,8 +449,7 @@ void DesktopSession::startSharing(bool rememberDevice)
     auto reply = portMessage(op, network_->port);
     if (interactive_)
         reply.append(char(localOS()));
-    if (rich_)
-        reply.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
+    appendMediaOptions(reply);
     if (!control_->send(reply))
         return stop(tr("无法在当前局域网共享桌面。"));
     setState(Sharing);
@@ -714,7 +723,9 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     announced_.clear();
     display_ = 0;
     rememberOnPresent_.clear();
-    macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
+    cursorProtocol_ = cursorUnavailable_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
+    displayReady_ = needDisplayIdr_ = listing_ = false;
+    captureCursor_ = true;
     qualityLimit_ = quality_ = VideoQuality::FullHD;
     hardwareLimit_ = VideoQuality::UHD;
     resolution_ = {};

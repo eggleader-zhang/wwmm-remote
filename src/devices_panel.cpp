@@ -175,9 +175,9 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     receive->setChecked(probe.receiving());
     connect(receive, &QAction::toggled, &probe, &LanProbe::setReceiving);
     connect(&probe, &LanProbe::receivingChanged, receive, &QAction::setChecked);
-#ifdef Q_OS_WIN
     auto *settings = local->menu()->addMenu(tr("设置"));
     settings->setToolTipsVisible(true);
+#ifdef Q_OS_WIN
     auto *macKeys = settings->addAction(tr("自动映射 Mac 按键关系"));
     macKeys->setObjectName("autoMapMacKeys");
     macKeys->setCheckable(true);
@@ -197,7 +197,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     localCode_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(localCode_);
 
-    layout->addWidget(new DesktopControls(*desktop_, discovery, this));
+    layout->addWidget(new DesktopControls(*desktop_, discovery, settings, this));
     list_ = new QListWidget(this);
     list_->setObjectName("deviceList");
     list_->setAccessibleName(tr("局域网设备"));

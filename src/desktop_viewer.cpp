@@ -2,6 +2,7 @@
 #include "input_window.h"
 #include "transfer_bar.h"
 #include <QActionGroup>
+#include <QCursor>
 #include <QDragEnterEvent>
 #include <QGridLayout>
 #include <QKeyEvent>
@@ -17,7 +18,7 @@
 #include <QWindow>
 
 namespace wwmm {
-DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
+DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich, const QList<QAction *> &cursorActions)
     : QDialog(parent, Qt::Window), surface_(new InputWindow(interactive))
 {
     column_ = new QVBoxLayout(this);
@@ -97,6 +98,13 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
         emit qualityRequested(VideoQuality(action->data().toInt()));
         focusVideo();
     });
+    menu->setToolTipsVisible(true);
+    menu->addActions(cursorActions);
+    for (auto *action : cursorActions)
+        connect(action, &QAction::triggered, this, [this, interactive] {
+            if (interactive && isActiveWindow())
+                focusVideo();
+        });
     auto *scale = new QActionGroup(menu);
     auto *fit = menu->addAction(tr("适应窗口"));
     original_ = menu->addAction(tr("原始像素（1:1）"));
@@ -301,6 +309,17 @@ void DesktopViewer::dropEvent(QDropEvent *event)
 quintptr DesktopViewer::videoView() const
 {
     return quintptr(surface_->winId());
+}
+
+void DesktopViewer::setLocalCursorVisible(bool visible)
+{
+    if (visible) {
+        video_->unsetCursor();
+        surface_->unsetCursor();
+    } else {
+        video_->setCursor(Qt::BlankCursor);
+        surface_->setCursor(Qt::BlankCursor);
+    }
 }
 
 void DesktopViewer::focusVideo()

@@ -3,6 +3,36 @@
 #include <QtEndian>
 
 namespace wwmm {
+void DesktopSession::appendMediaOptions(QByteArray &message) const
+{
+    if (cursorProtocol_) {
+        message.append(char(16));
+        message.append(char(captureCursor_));
+    } else if (rich_) {
+        message.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
+    }
+}
+
+void DesktopSession::setRemoteCursorVisible(bool visible)
+{
+    preferCursor_ = visible;
+    if (state_ != Viewing || !canSetRemoteCursor() || captureCursor_ == visible)
+        return;
+    if (!control_->send(QByteArray("P") + char(visible)))
+        return interrupt(tr("鼠标显示设置连接已断开。"));
+    captureCursor_ = visible;
+}
+
+void DesktopSession::reportCursorUnavailable()
+{
+    if (state_ != Sharing || !canSetRemoteCursor() || captureCursor_)
+        return;
+    if (!control_->send("p"))
+        return interrupt(tr("鼠标显示设置连接已断开。"));
+    cursorUnavailable_ = captureCursor_ = true;
+    emit captureCursorChanged();
+}
+
 void DesktopSession::chooseQuality(VideoQuality quality)
 {
     if (!rich_ || state_ != Viewing || !display_ || quality == qualityLimit_ ||
@@ -72,6 +102,19 @@ void DesktopSession::syncSound()
 
 bool DesktopSession::mediaMessage(const QByteArray &data)
 {
+    if (cursorProtocol_ && state_ == Sharing && data.size() == 2 && data[0] == 'P' && quint8(data[1]) <= 1) {
+        const bool visible = data[1] != 0;
+        if (!cursorUnavailable_ && captureCursor_ != visible) {
+            captureCursor_ = visible;
+            emit captureCursorChanged();
+        }
+        return true;
+    }
+    if (cursorProtocol_ && state_ == Viewing && data == "p") {
+        cursorUnavailable_ = captureCursor_ = true;
+        emit remoteCursorUnavailable();
+        return true;
+    }
     if (data.size() == 5 && data[0] == 'U') {
         peerSound_ = qFromBigEndian<quint32>(data.constData() + 1);
         syncSound();

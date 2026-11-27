@@ -64,6 +64,11 @@ class DesktopSession final : public QObject {
 
     bool usesMacKeyboard() const { return state_ == Viewing && macKeyboardProtocol_ && autoMacKeys_; }
     void setAutoMacKeys(bool enabled);
+    bool canSetRemoteCursor() const { return cursorProtocol_ && !cursorUnavailable_; }
+    bool prefersRemoteCursor() const { return preferCursor_; }
+    bool captureCursorVisible() const { return captureCursor_; }
+    void setRemoteCursorVisible(bool visible);
+    void reportCursorUnavailable();
 
     void sendInput(InputEvent event);
     void reportFocus(InputFocus focus);
@@ -86,6 +91,8 @@ class DesktopSession final : public QObject {
     void inputReceived(const wwmm::InputEvent &event);
     void focusReceived(wwmm::InputFocus focus);
     void macKeyboardChanged(bool enabled);
+    void captureCursorChanged();
+    void remoteCursorUnavailable();
 
   private:
     struct Network;
@@ -94,6 +101,7 @@ class DesktopSession final : public QObject {
     bool startNetwork();
     bool displayMessage(const QByteArray &data);
     bool mediaMessage(const QByteArray &data);
+    void appendMediaOptions(QByteArray &message) const;
     void applyQuality(VideoQuality quality, bool keepEstimate = false);
     void syncSound();
     void attachSound();
@@ -125,6 +133,8 @@ class DesktopSession final : public QObject {
     std::shared_ptr<AudioStream> sound_;
     bool interactive_ = false, extended_ = false, displayReady_ = false, needDisplayIdr_ = false;
     bool macKeyboardProtocol_ = false, autoMacKeys_ = true;
+    bool cursorProtocol_ = false, cursorUnavailable_ = false;
+    bool preferCursor_ = true, captureCursor_ = true;
     QList<DesktopDisplay> displays_, announced_;
     quint64 display_ = 0;
     QString rememberOnPresent_;

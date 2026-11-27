@@ -1,7 +1,9 @@
 #include "native_desktop.h"
+#include "graphics_capture.h"
 #include "pointer.h"
 #include "video_packets.h"
 #include <windows.h>
+#include <roapi.h>
 #include <d3d11_1.h>
 #include <d3d10.h>
 #include <dxgi1_2.h>
@@ -37,17 +39,17 @@ void check(HRESULT hr, const char *where)
 struct Runtime {
     Runtime()
     {
-        check(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM 初始化失败");
+        check(RoInitialize(RO_INIT_MULTITHREADED), "Windows 运行时初始化失败");
         auto hr = MFStartup(MF_VERSION);
         if (FAILED(hr)) {
-            CoUninitialize();
+            RoUninitialize();
             check(hr, "Media Foundation 启动失败");
         }
     }
     ~Runtime()
     {
         MFShutdown();
-        CoUninitialize();
+        RoUninitialize();
     }
 };
 ComPtr<IMFMediaType> videoType(GUID subtype, QSize size)
@@ -467,6 +469,8 @@ class WinCapture final : public DesktopCapture
     MediaError failure_;
     quint64 display_;
     VideoQuality quality_;
+    bool showCursor_;
+    std::function<void()> cursorUnavailable_;
     std::atomic_bool stopped_{false}, refresh_{true};
     std::atomic_int requestedRate_{0};
     std::atomic<qint64> responsiveUntil_{0};
@@ -476,14 +480,28 @@ class WinCapture final : public DesktopCapture
         Runtime runtime;
         Gpu gpu(true, display_);
         ComPtr<IDXGIOutputDuplication> dup;
-        check(gpu.output->DuplicateOutput(gpu.device.Get(), &dup), "无法复制当前用户的桌面");
+        CursorlessCapture cursorless;
+        ComPtr<ID3D11Texture2D> desktop;
+        QSize inputSize;
+        if (showCursor_) {
+            check(gpu.output->DuplicateOutput(gpu.device.Get(), &dup), "无法复制当前用户的桌面");
+        } else {
+            SIZE source{};
+            const auto hr = cursorless.start(gpu.device.Get(), gpu.screen.Monitor, source);
+            if (cursorUnavailable_ && (hr == E_NOTIMPL || hr == E_NOINTERFACE || hr == REGDB_E_CLASSNOTREG ||
+                                       hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))) {
+                cursorUnavailable_();
+                return;
+            }
+            check(hr, "无法采集无指针桌面");
+            inputSize = {int(source.cx), int(source.cy)};
+            desktop = gpu.texture(inputSize, DXGI_FORMAT_B8G8R8A8_UNORM);
+        }
         auto rect = gpu.screen.DesktopCoordinates;
         auto size = desktopSize({int(rect.right - rect.left), int(rect.bottom - rect.top)}, quality_);
         DesktopPointer pointer(gpu.device.Get(), gpu.context.Get(), gpu.screen.Rotation);
         auto encoder = hardwareEncoder(gpu, size, qualityBitrate(quality_));
         auto pool = encoderSurfaces(gpu, *encoder, size);
-        ComPtr<ID3D11Texture2D> desktop;
-        QSize inputSize;
         int lengthSize = 4;
         auto params = parameterSets(encoder->mft.Get(), encoder->outID, lengthSize);
         auto encoded = [&](IMFSample *sample) {
@@ -510,20 +528,25 @@ class WinCapture final : public DesktopCapture
             output_(std::move(data), rtpTime(time / 10), idr);
         };
         qint64 next = 0;
-        bool dirty = false;
+        bool dirty = false, havePicture = false;
         while (!stopped_) {
             if (int rate = requestedRate_.exchange(0))
                 codecValue(encoder->mft.Get(), CODECAPI_AVEncCommonMeanBitRate, ULONG(rate));
             encoder->poll();
             encoder->drain([] { throw Failure{QStringLiteral("硬件编码输出格式已变化，请重新共享。")}; },
                            encoded);
-            ComPtr<IDXGIResource> resource;
-            DXGI_OUTDUPL_FRAME_INFO info{};
             const bool idle = next && !dirty && !refresh_.load() && videoClockUs() - next > 100000;
             const bool responding = videoClockUs() < responsiveUntil_.load(std::memory_order_relaxed);
-            auto hr = dup->AcquireNextFrame(responding ? 1 : (idle ? 32 : 4), &info, &resource);
+            const DWORD timeout = responding ? 1 : (idle ? 32 : 4);
+            DXGI_OUTDUPL_FRAME_INFO info{};
+            ComPtr<IDXGIResource> resource;
+            auto hr = showCursor_ ? dup->AcquireNextFrame(timeout, &info, &resource)
+                                  : cursorless.copyNext(gpu.context.Get(), desktop.Get(), timeout);
             if (hr != DXGI_ERROR_WAIT_TIMEOUT) {
                 check(hr, "当前桌面或显示器已改变，请重新共享");
+                dirty = havePicture = true;
+            }
+            if (hr == S_OK && showCursor_) {
                 struct ReleaseFrame {
                     IDXGIOutputDuplication *dup;
                     ~ReleaseFrame() { dup->ReleaseFrame(); }
@@ -541,10 +564,9 @@ class WinCapture final : public DesktopCapture
                     // A pointer-only update reuses the retained desktop texture.
                     gpu.context->CopyResource(desktop.Get(), acquired.Get());
                 }
-                dirty = true;
             }
             const auto now = videoClockUs();
-            if (!desktop || (!dirty && !refresh_.load()) || now < next || !encoder->inputReady())
+            if (!havePicture || (!dirty && !refresh_.load()) || now < next || !encoder->inputReady())
                 continue;
             ComPtr<IMFSample> sample;
             hr = pool->AllocateSample(&sample);
@@ -559,9 +581,12 @@ class WinCapture final : public DesktopCapture
             check(buf.As(&dx), "编码纹理池未提供 GPU 表面");
             check(dx->GetResource(IID_PPV_ARGS(&nv12)), "读取 NV12 编码纹理失败");
             check(dx->GetSubresourceIndex(&slice), "读取编码纹理层失败");
-            check(pointer.draw(desktop.Get()), "绘制桌面指针失败");
-            gpu.blit(desktop.Get(), 0, inputSize, nv12.Get(), size, true, gpu.screen.Rotation, slice);
-            pointer.restore(desktop.Get());
+            if (showCursor_)
+                check(pointer.draw(desktop.Get()), "绘制桌面指针失败");
+            const auto rotation = showCursor_ ? gpu.screen.Rotation : DXGI_MODE_ROTATION_IDENTITY;
+            gpu.blit(desktop.Get(), 0, inputSize, nv12.Get(), size, true, rotation, slice);
+            if (showCursor_)
+                pointer.restore(desktop.Get());
             check(buf->SetCurrentLength(DWORD(size.width() * size.height() * 3 / 2)),
                   "设置 NV12 视频长度失败");
             check(sample->SetSampleTime(now * 10), "设置视频时间失败");
@@ -579,8 +604,10 @@ class WinCapture final : public DesktopCapture
     }
 
   public:
-    WinCapture(EncodedFrame output, MediaError failure, quint64 display, VideoQuality quality)
+    WinCapture(EncodedFrame output, MediaError failure, quint64 display, VideoQuality quality, bool showCursor,
+               std::function<void()> cursorUnavailable)
         : output_(std::move(output)), failure_(std::move(failure)), display_(display), quality_(quality),
+          showCursor_(showCursor), cursorUnavailable_(std::move(cursorUnavailable)),
           thread_([this] {
               try {
                   run();
@@ -850,9 +877,10 @@ QList<DesktopDisplay> desktopDisplays()
 }
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
-                                               VideoQuality quality)
+                                               VideoQuality quality, bool showCursor, std::function<void()> cursorUnavailable)
 {
-    return std::make_unique<WinCapture>(std::move(output), std::move(error), display, quality);
+    return std::make_unique<WinCapture>(std::move(output), std::move(error), display, quality, showCursor,
+                                        std::move(cursorUnavailable));
 }
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr view, PresentedFrame present, MediaError failure)
 {
