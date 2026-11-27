@@ -9,6 +9,11 @@ constexpr quint8 ctrl = 0x11, shift = 0x22, alt = 0x44, gui = 0x88;
 constexpr quint8 backspaceKey = 42, homeKey = 74, deleteKey = 76, endKey = 77;
 constexpr quint8 rightKey = 79, leftKey = 80, downKey = 81, upKey = 82;
 
+quint8 macModifiers(quint8 held)
+{
+    return quint8((held & (ctrl | shift)) | ((held & alt) << 1) | ((held & gui) >> 1));
+}
+
 quint8 sided(quint8 original, quint8 left)
 {
     return original & 0xf0 ? quint8(left << 4) : left;
@@ -43,10 +48,25 @@ std::optional<ScreenPoint> screenPoint(QPointF local, QSize view, QSize picture,
                        axis(point.y(), dest.height(), source.y(), source.height(), picture.height())};
 }
 
+bool InputEvent::carriesModifiers() const
+{
+    return kind == InputKind::KeyDown || kind == InputKind::KeyUp || kind == InputKind::ButtonDown ||
+           kind == InputKind::ButtonUp || kind == InputKind::Wheel;
+}
+
+bool InputEvent::isPasteShortcut(DesktopOS source) const
+{
+    if (kind != InputKind::KeyDown || (letter != 'V' && key != 25))
+        return false;
+    if (macKeyboard)
+        return (mods & alt) && !(mods & ~alt);
+    return mods & (source == DesktopOS::macOS ? gui : ctrl);
+}
+
 QByteArray packInput(const InputEvent &e)
 {
     QByteArray b("I", 1);
-    b.append(char(e.kind));
+    b.append(char(quint8(e.kind) | (e.macKeyboard && e.carriesModifiers() ? 0x80 : 0)));
     switch (e.kind) {
     case InputKind::KeyDown:
     case InputKind::KeyUp:
@@ -90,7 +110,10 @@ std::optional<InputEvent> readInput(const QByteArray &b)
         return {};
     const char *p = b.constData();
     InputEvent e;
-    e.kind = InputKind(quint8(b[1]));
+    e.kind = InputKind(quint8(b[1]) & 0x7f);
+    e.macKeyboard = quint8(b[1]) & 0x80;
+    if (e.macKeyboard && !e.carriesModifiers())
+        return {};
     switch (e.kind) {
     case InputKind::KeyDown:
     case InputKind::KeyUp:
@@ -202,7 +225,7 @@ HostInput::Binding HostInput::binding(const InputEvent &e)
     for (int i = 0; i < 8; i++)
         if (e.mods & (1u << i))
             b.modifiers[i] = quint8(1u << i);
-    if (source_ == target_)
+    if (macKeyboard_ || source_ == target_)
         return b;
     const bool mac = source_ == DesktopOS::macOS, terminal = focus_ == InputFocus::Terminal;
     const quint8 primary = mac ? gui : ctrl;
@@ -267,6 +290,8 @@ HostInput::Binding HostInput::binding(const InputEvent &e)
 
 quint8 HostInput::usedModifiers() const
 {
+    if (macKeyboard_)
+        return sourceMods_;
     quint8 mask = buttons_ ? sourceMods_ : 0;
     for (const auto &b : keys_)
         mask |= b.mask(sourceMods_);
@@ -291,8 +316,10 @@ bool HostInput::keyEvent(const InputEvent &e)
 {
     const bool down = e.kind == InputKind::KeyDown;
     const auto bit = modifierBit(e.key);
-    sourceMods_ = e.mods;
+    sourceMods_ = macKeyboard_ ? macModifiers(e.mods) : e.mods;
     if (bit) {
+        if (macKeyboard_)
+            return sync(sourceMods_);
         if (down) {
             if (!(usedModifiers() & bit))
                 unusedMods_ |= bit;
@@ -350,6 +377,12 @@ bool HostInput::apply(const InputEvent &e)
         release();
         return true;
     }
+    if (e.carriesModifiers() && macKeyboard_ != e.macKeyboard) {
+        if (e.macKeyboard && (source_ != DesktopOS::windows || target_ != DesktopOS::macOS))
+            return false;
+        release();
+        macKeyboard_ = e.macKeyboard;
+    }
     if (e.kind == InputKind::KeyDown || e.kind == InputKind::KeyUp)
         return keyEvent(e);
     if (e.kind == InputKind::SwitchApp)
@@ -361,7 +394,7 @@ bool HostInput::apply(const InputEvent &e)
     lastPoint_ = e.point;
     if (e.kind == InputKind::Move)
         return sink_.pointer(e.point, MouseButton::Left, e.kind);
-    sourceMods_ = e.mods;
+    sourceMods_ = macKeyboard_ ? macModifiers(e.mods) : e.mods;
     unusedMods_ &= ~sourceMods_;
     if (!sync(sourceMods_ | usedModifiers()))
         return false;

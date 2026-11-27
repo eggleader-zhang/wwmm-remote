@@ -483,6 +483,7 @@ void DesktopControls::openViewer()
 {
     const bool control = session_.interactive();
     if (viewer_) {
+        viewer_->inputSurface()->setMacKeyboard(session_.usesMacKeyboard());
         viewer_->showDesktop(session_.richMedia());
         if (control)
             viewer_->focusVideo();
@@ -504,6 +505,8 @@ void DesktopControls::openViewer()
     });
     if (control) {
         auto *surface = viewer_->inputSurface();
+        surface->setMacKeyboard(session_.usesMacKeyboard());
+        connect(&session_, &DesktopSession::macKeyboardChanged, surface, &InputWindow::setMacKeyboard);
         connect(surface, &InputWindow::input, this, [this](const InputEvent &e) { session_.sendInput(e); });
         connect(viewer_, &DesktopViewer::switchRequested, this, [this] {
             InputEvent event;

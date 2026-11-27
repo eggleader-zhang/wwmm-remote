@@ -217,6 +217,53 @@ class DesktopTest final : public QObject
             QVERIFY(sink.keys.contains(-usage));
     }
 
+    void mappedMacKeyboard()
+    {
+        RecordingSink sink;
+        HostInput host(DesktopOS::windows, DesktopOS::macOS, sink);
+        host.setFocus(InputFocus::Text);
+        auto send = [&](InputKind kind, quint8 usage, quint8 mods) {
+            auto key = keyEvent(kind, usage, mods);
+            key.macKeyboard = true;
+            auto packet = readInput(packInput(key));
+            return packet && packet->macKeyboard && host.apply(*packet);
+        };
+        using enum InputKind;
+        QVERIFY(send(KeyDown, 226, 4));     // Left Alt immediately presses Command.
+        QVERIFY(send(KeyDown, 43, 4));
+        QVERIFY(send(KeyUp, 43, 4));
+        QCOMPARE(sink.keys, QList<int>({227, 43, -43}));
+        QVERIFY(send(KeyDown, 225, 6));     // Reverse direction during the same switch.
+        QVERIFY(send(KeyDown, 43, 6));
+        QVERIFY(send(KeyUp, 43, 6));
+        QVERIFY(send(KeyUp, 225, 4));
+        QVERIFY(send(KeyUp, 226, 0));
+        QCOMPARE(sink.keys, QList<int>({227, 43, -43, 225, 43, -43, -225, -227}));
+        sink.keys.clear();
+        QVERIFY(send(KeyDown, 230, 0x40));
+        QVERIFY(send(KeyDown, 231, 0xc0)); // Right Alt + right Win + K, no action lookup.
+        QVERIFY(send(KeyDown, 14, 0xc0));
+        QVERIFY(host.apply(InputEvent{}));
+        QCOMPARE(sink.keys, QList<int>({231, 230, 14, -14, -230, -231}));
+        sink.keys.clear();
+        QVERIFY(send(KeyDown, 224, 1));
+        QVERIFY(send(KeyDown, 6, 1));      // Control+C in a text field remains Control+C.
+        QVERIFY(send(KeyUp, 6, 1));
+        QVERIFY(send(KeyUp, 224, 0));
+        QCOMPARE(sink.keys, QList<int>({224, 6, -6, -224}));
+        sink.keys.clear();
+        QVERIFY(host.apply(keyEvent(KeyDown, 6, 1, 'C'))); // Toggle back to office mode.
+        QCOMPARE(sink.keys, QList<int>({227, 6}));
+
+        auto paste = keyEvent(KeyDown, 25, 4, 'V');
+        paste.macKeyboard = true;
+        QVERIFY(paste.isPasteShortcut(DesktopOS::windows));
+        paste.mods = 1;
+        QVERIFY(!paste.isPasteShortcut(DesktopOS::windows));
+        paste.mods = 12;
+        QVERIFY(!paste.isPasteShortcut(DesktopOS::windows));
+    }
+
     void textAndRelease()
     {
         RecordingSink sink;

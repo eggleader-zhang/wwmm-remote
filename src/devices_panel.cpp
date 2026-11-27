@@ -175,6 +175,21 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     receive->setChecked(probe.receiving());
     connect(receive, &QAction::toggled, &probe, &LanProbe::setReceiving);
     connect(&probe, &LanProbe::receivingChanged, receive, &QAction::setChecked);
+#ifdef Q_OS_WIN
+    auto *settings = local->menu()->addMenu(tr("设置"));
+    settings->setToolTipsVisible(true);
+    auto *macKeys = settings->addAction(tr("自动映射 Mac 按键关系"));
+    macKeys->setObjectName("autoMapMacKeys");
+    macKeys->setCheckable(true);
+    macKeys->setToolTip(tr("Windows 控制 Mac 时，Alt 对应 ⌘，Win 对应 ⌥。Ctrl+Alt+Shift+F12 释放键盘。"));
+    constexpr auto preference = "keyboard/autoMapMacKeys";
+    macKeys->setChecked(QSettings().value(preference, true).toBool());
+    desktop_->setAutoMacKeys(macKeys->isChecked());
+    connect(macKeys, &QAction::toggled, this, [this, preference](bool enabled) {
+        QSettings().setValue(preference, enabled);
+        desktop_->setAutoMacKeys(enabled);
+    });
+#endif
     auto *diagnostics = local->menu()->addAction(tr("连接检测…"));
     connect(diagnostics, &QAction::triggered, this, [this] { showDiagnostics(probe_, this); });
     localCode_ = label(this);

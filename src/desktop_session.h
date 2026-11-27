@@ -62,6 +62,9 @@ class DesktopSession final : public QObject {
 
     DesktopOS peerOS() const { return peerOS_; }
 
+    bool usesMacKeyboard() const { return state_ == Viewing && macKeyboardProtocol_ && autoMacKeys_; }
+    void setAutoMacKeys(bool enabled);
+
     void sendInput(InputEvent event);
     void reportFocus(InputFocus focus);
     void accept(bool rememberDevice = false);
@@ -82,6 +85,7 @@ class DesktopSession final : public QObject {
     void bitrateChanged(int bitsPerSecond);
     void inputReceived(const wwmm::InputEvent &event);
     void focusReceived(wwmm::InputFocus focus);
+    void macKeyboardChanged(bool enabled);
 
   private:
     struct Network;
@@ -120,6 +124,7 @@ class DesktopSession final : public QObject {
     quint32 localSound_ = 0, peerSound_ = 0;
     std::shared_ptr<AudioStream> sound_;
     bool interactive_ = false, extended_ = false, displayReady_ = false, needDisplayIdr_ = false;
+    bool macKeyboardProtocol_ = false, autoMacKeys_ = true;
     QList<DesktopDisplay> displays_, announced_;
     quint64 display_ = 0;
     QString rememberOnPresent_;
@@ -127,6 +132,7 @@ class DesktopSession final : public QObject {
     bool listing_ = false;
     QList<InputEvent> afterPaste_;
     std::optional<InputEvent> imagePaste_;
+    quint8 imagePasteHeldMods_ = 0;
     quint64 pasteRevision_ = 0;
     DesktopOS peerOS_ = DesktopOS::macOS;
     quint32 pointerSequence_ = 0, pointerFence_ = 0, lastPosition_ = 0;

@@ -123,8 +123,12 @@ def main():
                     str(min(os.cpu_count() or 2, 8))], check=True)
     env = dict(os.environ, QT_QPA_PLATFORM="windows" if windows else "offscreen", QT_PLUGIN_PATH=str(qt / "plugins"))
     suffix = ".exe" if windows else ""
-    for binary, cases in [("wwmm_pair_tests", ["readOnlyRequestButtons", "trayLifecycle", "storeAndRevocation"]),
-                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess", "updateWaitsForIdle"])]:
+    gui_cases = ["readOnlyRequestButtons", "trayLifecycle", "storeAndRevocation"]
+    if windows:
+        gui_cases += ["macKeyPreferences", "foregroundMacShortcuts"]
+    for binary, cases in [("wwmm_pair_tests", gui_cases),
+                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess", "updateWaitsForIdle",
+                                                  "shortcutMapping", "mappedMacKeyboard"])]:
         subprocess.run([build / (binary + suffix), *cases], env=env, check=True, timeout=90)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)

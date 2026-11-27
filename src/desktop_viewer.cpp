@@ -70,6 +70,12 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich)
     row->addWidget(status_, 1);
     auto *displayOptions = new QPushButton(tr("会话选项"), this);
     displayOptions->setAutoDefault(false);
+    connect(surface_, &InputWindow::keyboardReleaseRequested, displayOptions, [displayOptions] {
+        displayOptions->setFocus(Qt::OtherFocusReason);
+    });
+    connect(surface_, &InputWindow::keyboardGrabFailed, this, [this] {
+        setStatus(tr("Windows 未能接管系统快捷键。请切出后重新点入远控画面。"));
+    });
     auto *menu = menu_ = new QMenu(displayOptions);
     displayOptions->setMenu(menu);
     displays_ = menu->addMenu(tr("远端显示器"));

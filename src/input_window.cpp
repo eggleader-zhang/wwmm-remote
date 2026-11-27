@@ -1,5 +1,9 @@
 #include "input_window.h"
 #include "transfer_bar.h"
+#ifdef Q_OS_WIN
+#include "../platform/windows/keyboard_grab.h"
+#include <QApplication>
+#endif
 #include <QDragEnterEvent>
 #include <QGuiApplication>
 #include <QInputMethod>
@@ -157,14 +161,83 @@ InputWindow::InputWindow(bool interactive) : interactive_(interactive)
         }
     });
     connect(qApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+        updateKeyboardGrab();
         if (state != Qt::ApplicationActive && interactive_)
             resetInput();
     });
+    connect(qApp, &QGuiApplication::focusObjectChanged, this, [this] { updateKeyboardGrab(); });
+}
+
+InputWindow::~InputWindow() = default;
+
+void InputWindow::setMacKeyboard(bool enabled)
+{
+    if (macKeyboard_ == enabled)
+        return;
+    macKeyboard_ = enabled;
+    resetInput(false); // The session fences the old mode with a reliable Reset.
+    updateKeyboardGrab();
+}
+
+bool InputWindow::keyboardGrabbed() const
+{
+#ifdef Q_OS_WIN
+    return grab_ && grab_->installed();
+#else
+    return false;
+#endif
+}
+
+void InputWindow::updateKeyboardGrab()
+{
+#ifdef Q_OS_WIN
+    const bool active = macKeyboard_ && interactive_ && ready_ && focused_ && isVisible() &&
+                        QGuiApplication::applicationState() == Qt::ApplicationActive &&
+                        QGuiApplication::focusObject() == this && !QApplication::activePopupWidget();
+    if (!active) {
+        if (grab_) {
+            ++grabGeneration_;
+            grab_.reset();
+            resetInput();
+        }
+        return;
+    }
+    if (grab_) {
+        grab_->setAcceptsText(acceptsText());
+        return;
+    }
+    const auto generation = ++grabGeneration_;
+    grab_ = std::make_unique<WindowsKeyboardGrab>(reinterpret_cast<HWND>(winId()), acceptsText());
+    connect(grab_.get(), &WindowsKeyboardGrab::key, this, [this, generation](quint8 usage, bool down, quint8 mods) {
+        if (generation != grabGeneration_)
+            return;
+        mods_ = mods;
+        InputEvent event;
+        event.kind = down ? InputKind::KeyDown : InputKind::KeyUp;
+        event.key = usage;
+        event.mods = mods;
+        emit input(event);
+    }, Qt::QueuedConnection);
+    connect(grab_.get(), &WindowsKeyboardGrab::releaseRequested, this, [this, generation] {
+        if (generation == grabGeneration_) {
+            focused_ = false;
+            updateKeyboardGrab();
+            resetInput();
+            emit keyboardReleaseRequested();
+        }
+    }, Qt::QueuedConnection);
+    connect(grab_.get(), &WindowsKeyboardGrab::unavailable, this, [this, generation] {
+        if (generation == grabGeneration_)
+            emit keyboardGrabFailed();
+    }, Qt::QueuedConnection);
+    grab_->start();
+#endif
 }
 
 void InputWindow::presented()
 {
     ready_ = true;
+    updateKeyboardGrab();
     if (focused_)
         QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
     emit firstPictureShown();
@@ -174,6 +247,7 @@ void InputWindow::changeDisplay()
 {
     resetInput();
     ready_ = false;
+    updateKeyboardGrab();
     picture_ = {};
     emit pictureSizeChanged();
 }
@@ -195,18 +269,19 @@ void InputWindow::setInputFocus(InputFocus kind)
         return;
     cancelPreedit();
     focus_ = kind;
+    updateKeyboardGrab();
     if (QGuiApplication::focusObject() == this)
         QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
 }
 
-void InputWindow::resetInput()
+void InputWindow::resetInput(bool notify)
 {
     motion_.stop();
     pendingMove_.reset();
     held_.clear();
     mods_ = buttons_ = 0;
     cancelPreedit();
-    if (ready_) {
+    if (notify && ready_) {
         InputEvent e;
         e.kind = InputKind::Reset;
         emit input(e);
@@ -222,14 +297,15 @@ void InputWindow::handleKey(QKeyEvent *event)
     const auto bit = modifierBit(code);
     InputEvent e;
     if (bit) {
-        if (event->isAutoRepeat())
+        if (keyboardGrabbed() || event->isAutoRepeat())
             return;
         if (down)
             mods_ |= bit;
         else
             mods_ &= ~bit;
     } else {
-        mods_ = currentModifiers(event->modifiers(), mods_, event->nativeModifiers());
+        if (!keyboardGrabbed())
+            mods_ = currentModifiers(event->modifiers(), mods_, event->nativeModifiers());
         if (!down) {
             if (!held_.contains(code))
                 return;
@@ -240,7 +316,7 @@ void InputWindow::handleKey(QKeyEvent *event)
             bool allowsLetters = !(mods_ & (0x11 | 0x88));
 #ifdef Q_OS_WIN
             const bool altGr = (mods_ & 0x40) || event->modifiers().testFlag(Qt::GroupSwitchModifier);
-            allowsLetters = (allowsLetters && !(mods_ & 0x44)) || (altGr && !(mods_ & 0x88));
+            allowsLetters = (allowsLetters && !(mods_ & 0x44)) || (!macKeyboard_ && altGr && !(mods_ & 0x88));
 #endif
             if (acceptsText() && allowsLetters && printable(event->text()) && !held_.contains(code)) {
                 e.kind = InputKind::Text;
@@ -312,7 +388,7 @@ bool InputWindow::mouse(QMouseEvent *m)
     e.kind = down ? InputKind::ButtonDown : InputKind::ButtonUp;
     e.button = *b;
     e.point = *p;
-    e.mods = currentModifiers(m->modifiers(), mods_);
+    e.mods = keyboardGrabbed() ? mods_ : currentModifiers(m->modifiers(), mods_);
     emit input(e);
     return true;
 }
@@ -334,7 +410,7 @@ bool InputWindow::wheel(QWheelEvent *w)
     e.dx = qint16(qBound(-32767, delta.x(), 32767));
     e.dy = qint16(qBound(-32767, delta.y(), 32767));
     e.point = *p;
-    e.mods = currentModifiers(w->modifiers(), mods_);
+    e.mods = keyboardGrabbed() ? mods_ : currentModifiers(w->modifiers(), mods_);
     pendingMove_.reset();
     motion_.stop();
     emit input(e);
@@ -374,10 +450,12 @@ bool InputWindow::event(QEvent *ev)
     }
     if (ev->type() == QEvent::FocusIn) {
         focused_ = true;
+        updateKeyboardGrab();
         QGuiApplication::inputMethod()->update(Qt::ImQueryAll);
     }
     if (ev->type() == QEvent::FocusOut || ev->type() == QEvent::Hide) {
         focused_ = false;
+        updateKeyboardGrab();
         resetInput();
     }
     if (!ready_)

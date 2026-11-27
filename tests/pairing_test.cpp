@@ -23,6 +23,7 @@
 #include <QSaveFile>
 #include <QScopeGuard>
 #include <QSemaphore>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
@@ -32,6 +33,9 @@
 #include <memory>
 #ifdef Q_OS_MACOS
 #include <Security/Security.h>
+#elif defined(Q_OS_WIN)
+#include <qt_windows.h>
+#undef near
 #endif
 
 using namespace wwmm;
@@ -573,6 +577,91 @@ class PairTest : public QObject
         QTest::mouseClick(decline, Qt::LeftButton);
         QTRY_VERIFY(primary->isEnabled());
     }
+
+#ifdef Q_OS_WIN
+    void macKeyPreferences()
+    {
+        const auto org = QCoreApplication::organizationName();
+        const auto app = QCoreApplication::applicationName();
+        QCoreApplication::setOrganizationName("WWMM Tests");
+        QCoreApplication::setApplicationName(QUuid::createUuid().toString(QUuid::WithoutBraces));
+        auto restore = qScopeGuard([&] {
+            QSettings().clear();
+            QCoreApplication::setOrganizationName(org);
+            QCoreApplication::setApplicationName(app);
+        });
+        Node node("Windows");
+        QVERIFY(node.open());
+        Discovery discovery(node.probe, node.store.publicKey(), node.name, [](QObject *p) { return new FakeDns(p); });
+        for (bool expected : {true, false, true}) {
+            DevicesPanel panel(node.probe, discovery, node.pairing, node.store);
+            auto *toggle = panel.findChild<QAction *>("autoMapMacKeys");
+            QVERIFY(toggle && toggle->isCheckable());
+            QCOMPARE(toggle->text(), QStringLiteral("自动映射 Mac 按键关系"));
+            QCOMPARE(toggle->isChecked(), expected);
+            toggle->trigger();
+        }
+    }
+
+    void foregroundMacShortcuts()
+    {
+        if (qgetenv("GITHUB_ACTIONS") != "true" || qgetenv("RUNNER_ENVIRONMENT") != "github-hosted")
+            QSKIP("Native keyboard input is exercised only on a disposable hosted Windows runner");
+        DesktopViewer view(nullptr, true, false);
+        auto *surface = view.inputSurface();
+        QList<InputEvent> sent;
+        connect(surface, &InputWindow::input, &view, [&](const InputEvent &e) { sent << e; });
+        view.show();
+        view.activateWindow();
+        view.focusVideo();
+        surface->setMacKeyboard(true);
+        surface->setInputFocus(InputFocus::Text);
+        surface->presented();
+        QTRY_COMPARE(QGuiApplication::focusObject(), surface);
+        QTRY_VERIFY(surface->keyboardGrabbed());
+        const auto target = reinterpret_cast<HWND>(surface->winId());
+        const auto window = GetAncestor(target, GA_ROOT);
+        auto press = [&](WORD scan, bool down) {
+            if (GetForegroundWindow() != window || GetFocus() != target)
+                return false;
+            INPUT in{};
+            in.type = INPUT_KEYBOARD;
+            in.ki.wScan = scan;
+            in.ki.dwFlags = KEYEVENTF_SCANCODE | (down ? 0 : KEYEVENTF_KEYUP);
+            return SendInput(1, &in, sizeof(in)) == 1;
+        };
+        sent.clear();
+        QVERIFY(press(0x38, true));
+        auto releaseAlt = qScopeGuard([] {
+            INPUT up{};
+            up.type = INPUT_KEYBOARD;
+            up.ki.wScan = 0x38;
+            up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+            SendInput(1, &up, sizeof(up));
+        });
+        QTRY_COMPARE(sent.size(), 1);
+        QCOMPARE(sent[0].key, quint8(226));
+        for (int i = 0; i < 2; ++i) {
+            QVERIFY(press(0x0f, true));
+            QVERIFY(press(0x0f, false));
+            QTRY_COMPARE(sent.size(), 3 + 2 * i);
+            QCOMPARE(sent.last().key, quint8(43));
+            QCOMPARE(sent.last().mods, quint8(4));
+            QCOMPARE(sent.last().kind, InputKind::KeyUp);
+        }
+        QVERIFY(press(0x38, false));
+        releaseAlt.dismiss();
+        QTRY_COMPARE(sent.size(), 6);
+        QCOMPARE(sent.last().mods, quint8(0));
+        QCOMPARE(GetForegroundWindow(), window);
+        surface->setMacKeyboard(false);
+        QVERIFY(!surface->keyboardGrabbed());
+        surface->setMacKeyboard(true);
+        QTRY_VERIFY(surface->keyboardGrabbed());
+        view.hide();
+        QTRY_VERIFY(!surface->keyboardGrabbed());
+    }
+#endif
 
     void viewerComposition()
     {

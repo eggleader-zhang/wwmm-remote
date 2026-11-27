@@ -25,7 +25,9 @@ struct InputEvent {
     ScreenPoint point;
     quint32 sequence = 0, fence = 0;
     qint16 dx = 0, dy = 0;
-    bool pixels = false;
+    bool pixels = false, macKeyboard = false;
+    bool carriesModifiers() const;
+    bool isPasteShortcut(DesktopOS source) const;
     QString text;
 };
 
@@ -77,6 +79,7 @@ class HostInput {
     InputFocus focus_ = InputFocus::Raw;
     QMap<quint8, Binding> keys_;
     quint8 sourceMods_ = 0, postedMods_ = 0, unusedMods_ = 0, buttons_ = 0;
+    bool macKeyboard_ = false;
     ScreenPoint lastPoint_;
 };
 } // namespace wwmm

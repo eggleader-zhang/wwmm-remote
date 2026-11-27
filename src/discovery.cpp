@@ -87,6 +87,7 @@ void Discovery::refreshOn(const QList<LanAddress> &links)
                      {"office", "1"},
                      {"media", "13"},
                      {"adapt", "1"},
+                     {"mackeys", "1"},
                      {"pk", QString::fromLatin1(key_.toHex())},
                      {"addr", local.link.address.toString()},
                      {"name", QString::fromLatin1(name_.toUtf8().toBase64(QByteArray::Base64UrlEncoding |
@@ -136,7 +137,8 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
                       desktopAccess(fields),
                       fields.value("office") == "1",
                       fields.value("media") == "13",
-                      fields.value("adapt") == "1"};
+                      fields.value("adapt") == "1",
+                      fields.value("mackeys") == "1"};
     const auto previous = seen_.constFind(source);
     if (previous == seen_.cend() ? seen_.size() >= 256 : *previous == peer)
         return;
@@ -156,7 +158,7 @@ const QMap<QByteArray, NearbyDevice> &Discovery::devicesByKey() const
         return *byKey_;
     auto &unique = byKey_.emplace();
     auto preference = [](const NearbyDevice &d) {
-        return std::tuple{d.desktop, d.extendedDesktop, d.richMedia, d.adaptiveVideo,
+        return std::tuple{d.desktop, d.extendedDesktop, d.richMedia, d.adaptiveVideo, d.macKeyboard,
                           d.endpoint.address.protocol() == QAbstractSocket::IPv4Protocol};
     };
     for (const auto &peer : seen_) {

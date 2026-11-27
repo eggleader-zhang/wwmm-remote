@@ -162,6 +162,8 @@ void DesktopSession::view(const NearbyDevice &peer, bool withInput)
     extended_ = peer.extendedDesktop;
     rich_ = extended_ && peer.richMedia;
     adaptive_ = rich_ && peer.adaptiveVideo;
+    macKeyboardProtocol_ = adaptive_ && withInput && localOS() == DesktopOS::windows &&
+                           peer.os == DesktopOS::macOS && peer.macKeyboard;
     retrying_ = state_ == Interrupted;
     attach(socket, peer.link, peer.key, withInput);
     connect(socket, &QTcpSocket::connected, control_, &TrustedChannel::start);
@@ -174,7 +176,7 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
     host_ = expected.isEmpty();
     interactive_ = withInput;
     if (host_)
-        adaptive_ = rich_ = extended_ = false;
+        macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
     pointerSequence_ = pointerFence_ = lastPosition_ = 0;
     latestPosition_.reset();
     selected_ = expected;
@@ -199,7 +201,7 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
             if (interactive_)
                 request.append(char(localOS()));
             if (rich_)
-                request.append(char(adaptive_ ? 14 : 13));
+                request.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
             if (!control_->send(request))
                 return stop(tr("无法准备局域网视频接收。"));
             setState(Waiting);
@@ -358,7 +360,7 @@ void DesktopSession::handle(const QByteArray &data)
         return stop(tr("对方拒绝了本次桌面请求。"));
     if (state_ == Sharing && interactive_ && data.startsWith('I')) {
         auto input = readInput(data);
-        if (!input)
+        if (!input || (input->macKeyboard && !macKeyboardProtocol_))
             return stop(tr("对方发送了无效的输入事件。"));
         return receiveInput(*input);
     }
@@ -371,7 +373,11 @@ void DesktopSession::handle(const QByteArray &data)
     const bool modern = op == 'v' || op == 'y' || op == 'c' || op == 'a';
     const bool controlOffer = op == 'C' || op == 'A' || op == 'c' || op == 'a';
     const int baseSize = controlOffer ? 4 : 3;
-    const bool adaptiveOffer = modern && data.size() == baseSize + 1 && quint8(data.back()) == 14;
+    // v15 extends the adaptive control handshake only for a Windows viewer and a Mac host.
+    const bool macKeysOffer = modern && controlOffer && data.size() == baseSize + 1 && quint8(data.back()) == 15 &&
+        ((host_ && localOS() == DesktopOS::macOS && quint8(data[3]) == quint8(DesktopOS::windows)) ||
+         (!host_ && localOS() == DesktopOS::windows && quint8(data[3]) == quint8(DesktopOS::macOS)));
+    const bool adaptiveOffer = macKeysOffer || (modern && data.size() == baseSize + 1 && quint8(data.back()) == 14);
     const bool richOffer = adaptiveOffer || (modern && data.size() == baseSize + 1 && quint8(data.back()) == 13);
     if ((!richOffer && data.size() != baseSize) ||
         (controlOffer && quint8(data[3]) != quint8(DesktopOS::macOS) &&
@@ -385,6 +391,7 @@ void DesktopSession::handle(const QByteArray &data)
         extended_ = modern;
         rich_ = richOffer;
         adaptive_ = adaptiveOffer;
+        macKeyboardProtocol_ = macKeysOffer;
         interactive_ = controlOffer;
         if (interactive_)
             peerOS_ = DesktopOS(quint8(data[3]));
@@ -395,6 +402,7 @@ void DesktopSession::handle(const QByteArray &data)
             setState(Requested);
         }
     } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ && adaptiveOffer == adaptive_ &&
+               macKeysOffer == macKeyboardProtocol_ &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
         if (interactive_)
@@ -432,7 +440,7 @@ void DesktopSession::startSharing(bool rememberDevice)
     if (interactive_)
         reply.append(char(localOS()));
     if (rich_)
-        reply.append(char(adaptive_ ? 14 : 13));
+        reply.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
     if (!control_->send(reply))
         return stop(tr("无法在当前局域网共享桌面。"));
     setState(Sharing);
@@ -443,19 +451,29 @@ void DesktopSession::startSharing(bool rememberDevice)
     }
 }
 
+void DesktopSession::setAutoMacKeys(bool enabled)
+{
+    if (autoMacKeys_ == enabled)
+        return;
+    if (state_ == Viewing && macKeyboardProtocol_)
+        sendInput(InputEvent{});
+    autoMacKeys_ = enabled;
+    emit macKeyboardChanged(usesMacKeyboard());
+}
+
 void DesktopSession::sendInput(InputEvent input)
 {
     if (state_ != Viewing || !interactive_ || !network_ ||
         (extended_ && !displayReady_ && input.kind != InputKind::Reset))
         return;
     data_.noteActivity();
+    input.macKeyboard = usesMacKeyboard() && input.carriesModifiers();
     if (input.kind == InputKind::Reset) {
         imagePaste_.reset();
         pasteTimer_.stop();
         afterPaste_.clear();
     } else {
-        const bool paste = input.kind == InputKind::KeyDown && (input.letter == 'V' || input.key == 25) &&
-                           (input.mods & (localOS() == DesktopOS::macOS ? 0x88 : 0x11));
+        const bool paste = input.isPasteShortcut(localOS());
         if (paste)
             emit beforePaste();
         if (paste && data_.imagePending()) {
@@ -464,14 +482,18 @@ void DesktopSession::sendInput(InputEvent input)
             if (!control_)
                 return;
             imagePaste_ = input;
+            imagePasteHeldMods_ = input.mods;
             pasteRevision_ = data_.clipboardRevisionId();
             return;
         }
         // Keep typing and pointer traffic live while a large screenshot is in flight.
         // An action that changes the insertion target cancels a deferred paste.
-        if (imagePaste_ && input.kind != InputKind::Move &&
-            !(input.kind == InputKind::KeyUp && (input.key == imagePaste_->key || modifierBit(input.key))))
-            imagePaste_.reset();
+        if (imagePaste_ && input.kind != InputKind::Move) {
+            if (input.kind == InputKind::KeyUp && (input.key == imagePaste_->key || modifierBit(input.key)))
+                imagePasteHeldMods_ = input.mods;
+            else
+                imagePaste_.reset();
+        }
         if ((paste && data_.clipboardPending()) || !afterPaste_.isEmpty()) {
             if (input.kind == InputKind::Move)
                 return;
@@ -539,7 +561,7 @@ void DesktopSession::drainPaste()
         state_ == Viewing && displayReady_) {
         auto release = *imagePaste;
         release.kind = InputKind::KeyUp;
-        release.mods = 0;
+        release.mods = imagePaste->macKeyboard ? imagePasteHeldMods_ : 0;
         if (!control_->send(packInput(*imagePaste)) || !control_->send(packInput(release)))
             return interrupt(tr("截图粘贴连接已断开。"));
     }
@@ -692,7 +714,7 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     announced_.clear();
     display_ = 0;
     rememberOnPresent_.clear();
-    adaptive_ = rich_ = extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
+    macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = displayReady_ = needDisplayIdr_ = listing_ = false;
     qualityLimit_ = quality_ = VideoQuality::FullHD;
     hardwareLimit_ = VideoQuality::UHD;
     resolution_ = {};
