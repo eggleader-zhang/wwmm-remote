@@ -87,16 +87,24 @@ def main():
     qt = args.qt.resolve() if args.qt else install_sdk(args.target, Path(os.getenv("RUNNER_TEMP", build)))
     require_file(qt / "lib/cmake/Qt6/Qt6Config.cmake")
     os.environ["PATH"] = str(qt / "bin") + os.pathsep + os.environ["PATH"]
+    windows = os_name == "windows"
+    targets = ["wwmm_remote"]
     configure = ["cmake", "-S", ROOT, "-B", build, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-                 "-DBUILD_TESTING=OFF", f"-DCMAKE_PREFIX_PATH={qt}"]
-    if os_name == "windows":
+                 f"-DBUILD_TESTING={'ON' if windows else 'OFF'}", f"-DCMAKE_PREFIX_PATH={qt}"]
+    if windows:
+        targets.extend(["wwmm_pair_tests", "wwmm_desktop_tests"])
         configure.extend(["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl", "-DCMAKE_INSTALL_BINDIR=.",
                           f"-DQT_HOST_PATH={qt}"])
     else:
         configure.append(f"-DCMAKE_OSX_ARCHITECTURES={arch}")
     subprocess.run(configure, check=True)
-    subprocess.run(["cmake", "--build", build, "--target", "wwmm_remote", "--parallel",
+    subprocess.run(["cmake", "--build", build, "--target", *targets, "--parallel",
                     str(min(os.cpu_count() or 2, 8))], check=True)
+    if windows:
+        env = dict(os.environ, QT_QPA_PLATFORM="windows", QT_PLUGIN_PATH=str(qt / "plugins"))
+        for binary, case in [("wwmm_pair_tests.exe", "readOnlyRequestButtons"),
+                             ("wwmm_desktop_tests.exe", "controlConsentAndDelivery")]:
+            subprocess.run([build / binary, case], env=env, check=True, timeout=90)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)
     output = ROOT / "dist" / version

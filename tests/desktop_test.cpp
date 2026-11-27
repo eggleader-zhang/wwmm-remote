@@ -385,7 +385,7 @@ class DesktopTest final : public QObject
         QString error;
         QVERIFY(viewer.store.remember(key, "QA host", error));
         QSignalSpy frames(&viewer.session, &DesktopSession::frame);
-        viewer.session.view({key, "QA host", localOS(), {link.address, data[1].toUShort()}, link, true});
+        viewer.session.view({key, "QA host", localOS(), {link.address, data[1].toUShort()}, link, DesktopAccess::ViewOnly});
         QTRY_COMPARE(frames.size(), 1);
         auto received = frames.first().first().toByteArray(), sent = fixture();
         QCOMPARE(h264Units(received), h264Units(sent));
@@ -434,16 +434,24 @@ class DesktopTest final : public QObject
         QTRY_COMPARE(a.session.state(), DesktopSession::Idle);
     }
 
+    void controlConsentAndDelivery_data()
+    {
+        QTest::addColumn<bool>("advertised");
+        QTest::newRow("advertised") << true;
+        QTest::newRow("missing-desktop-fields") << false;
+    }
+
     void controlConsentAndDelivery()
     {
+        QFETCH(bool, advertised);
         Node viewer, host;
         viewer.trust(host);
         host.trust(viewer);
         auto device = host.target();
-        device.readonlyDesktop = true;
+        device.desktop = DesktopAccess::ViewOnly;
         viewer.session.view(device, true);
         QCOMPARE(viewer.session.state(), DesktopSession::Idle);
-        device.keyboardMouse = true;
+        device.desktop = advertised ? DesktopAccess::Control : DesktopAccess::Unspecified;
         QList<InputEvent> received;
         connect(&host.session, &DesktopSession::inputReceived, this,
                 [&](const InputEvent &e) { received << e; });
@@ -453,9 +461,18 @@ class DesktopTest final : public QObject
         auto key = keyEvent(InputKind::KeyDown, 6, 1, 'C');
         viewer.session.sendInput(key);
         QSignalSpy focus(&viewer.session, &DesktopSession::focusReceived);
+        QSignalSpy frames(&viewer.session, &DesktopSession::frame);
+        const auto picture = fixture();
+        QVERIFY(!picture.isEmpty());
+        host.session.sendFrame(picture, 100, true);
         host.session.accept();
         QTRY_COMPARE(viewer.session.state(), DesktopSession::Viewing);
         QVERIFY(viewer.session.interactive());
+        QVERIFY(frames.isEmpty());
+        host.session.sendFrame(picture, 90000, true);
+        QTRY_COMPARE(frames.size(), 1);
+        const auto receivedPicture = frames.first().first().toByteArray();
+        QCOMPARE(h264Units(receivedPicture), h264Units(picture));
         host.session.reportFocus(InputFocus::Text);
         QTRY_COMPARE(focus.size(), 1);
         QCOMPARE(focus.first().first().value<InputFocus>(), InputFocus::Text);
@@ -508,7 +525,8 @@ class DesktopTest final : public QObject
         host.trust(viewer);
         viewer.trust(host);
         auto peer = host.target();
-        peer.readonlyDesktop = peer.keyboardMouse = peer.extendedDesktop = peer.richMedia = peer.adaptiveVideo = true;
+        peer.desktop = DesktopAccess::Control;
+        peer.extendedDesktop = peer.richMedia = peer.adaptiveVideo = true;
         viewer.session.view(peer, true);
         QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
         auto &sender = viewer.session.dataLink();

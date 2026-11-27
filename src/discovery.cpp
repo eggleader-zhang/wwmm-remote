@@ -1,9 +1,25 @@
 #include "discovery.h"
 #include "device_store.h"
 #include <QCryptographicHash>
+#include <tuple>
 
 namespace wwmm
 {
+namespace {
+DesktopAccess desktopAccess(const ServiceFields &fields)
+{
+    const auto desktop = fields.value("desk").trimmed();
+    const auto input = fields.value("input").trimmed();
+    if (!desktop.isEmpty() && desktop != "3")
+        return DesktopAccess::Incompatible;
+    if (input == "1")
+        return DesktopAccess::Control;
+    if (!desktop.isEmpty() || !input.isEmpty())
+        return DesktopAccess::ViewOnly;
+    return DesktopAccess::Unspecified;
+}
+} // namespace
+
 Discovery::Discovery(LanProbe &probe, QByteArray key, QString name, Factory factory)
     : probe_(probe), key_(std::move(key)), name_(std::move(name)), factory_(std::move(factory))
 {
@@ -117,8 +133,7 @@ void Discovery::resolved(unsigned index, const QString &instance, quint16 port, 
                       os == "Windows" ? DesktopOS::windows : DesktopOS::macOS,
                       {socketAddress(address, *link), port},
                       *link,
-                      fields.value("desk") == "3",
-                      fields.value("input") == "1",
+                      desktopAccess(fields),
                       fields.value("office") == "1",
                       fields.value("media") == "13",
                       fields.value("adapt") == "1"};
@@ -140,11 +155,13 @@ const QMap<QByteArray, NearbyDevice> &Discovery::devicesByKey() const
     if (byKey_)
         return *byKey_;
     auto &unique = byKey_.emplace();
+    auto preference = [](const NearbyDevice &d) {
+        return std::tuple{d.desktop, d.extendedDesktop, d.richMedia, d.adaptiveVideo,
+                          d.endpoint.address.protocol() == QAbstractSocket::IPv4Protocol};
+    };
     for (const auto &peer : seen_) {
         auto existing = unique.constFind(peer.key);
-        if (existing == unique.cend() ||
-            (existing->endpoint.address.protocol() == QAbstractSocket::IPv6Protocol &&
-             peer.endpoint.address.protocol() == QAbstractSocket::IPv4Protocol))
+        if (existing == unique.cend() || preference(peer) > preference(*existing))
             unique.insert(peer.key, peer);
     }
     return unique;

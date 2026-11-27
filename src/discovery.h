@@ -12,17 +12,22 @@ struct Advertisement {
     LocalEndpoint local;
     ServiceFields fields;
 };
+enum class DesktopAccess { Incompatible, Unspecified, ViewOnly, Control };
 struct NearbyDevice {
     QByteArray key;
     QString name;
     DesktopOS os;
     Endpoint endpoint;
     LanAddress link;
-    bool readonlyDesktop = false;
-    bool keyboardMouse = false;
+    DesktopAccess desktop = DesktopAccess::Unspecified;
     bool extendedDesktop = false;
     bool richMedia = false;
     bool adaptiveVideo = false;
+    // Missing DNS-SD hints still allow an explicit, authenticated session request.
+    bool canRequestDesktop(bool withInput) const
+    {
+        return desktop != DesktopAccess::Incompatible && (!withInput || desktop != DesktopAccess::ViewOnly);
+    }
     bool operator==(const NearbyDevice &) const = default;
 };
 

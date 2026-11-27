@@ -242,7 +242,7 @@ int splitViewer(QApplication &app, const QList<LanAddress> &links, QByteArray ke
     });
     sample.start();
     auto link = links.first();
-    viewer.session.view({key, "QA host", localOS(), {link.address, port}, link, true});
+    viewer.session.view({key, "QA host", localOS(), {link.address, port}, link, DesktopAccess::ViewOnly});
     QTimer::singleShot((seconds + 15) * 1000, &app, [&app] { app.exit(4); });
     int result = app.exec();
     player.reset();

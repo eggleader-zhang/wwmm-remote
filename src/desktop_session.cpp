@@ -138,11 +138,20 @@ void DesktopSession::setState(State s)
 
 void DesktopSession::view(const NearbyDevice &peer, bool withInput)
 {
-    if (control_ || (state_ == Interrupted && (peer.key != selected_ || withInput != interactive_)) ||
-        (withInput && (!peer.readonlyDesktop || !peer.keyboardMouse)) ||
-        !store_.peers().contains(peer.key) || !peer.endpoint.port || !probe_.links().contains(peer.link) ||
-        !isOnLink(peer.endpoint.address, peer.link))
+    if (control_ || (state_ == Interrupted && (peer.key != selected_ || withInput != interactive_)))
         return;
+    if (!peer.canRequestDesktop(withInput)) {
+        emit notice(tr("对方不支持所选的桌面模式。"));
+        return;
+    }
+    if (!store_.peers().contains(peer.key)) {
+        emit notice(tr("设备的配对记录已改变。请重新选中设备。"));
+        return;
+    }
+    if (!peer.endpoint.port || !probe_.links().contains(peer.link) || !isOnLink(peer.endpoint.address, peer.link)) {
+        emit notice(tr("对方的局域网地址已失效。设备重新上线后请再连接。"));
+        return;
+    }
     auto *socket = new QTcpSocket(this);
     if (!bindLanClient(*socket, peer.link)) {
         socket->deleteLater();

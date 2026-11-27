@@ -289,7 +289,7 @@ std::optional<NearbyDevice> DesktopControls::reconnectPeer() const
 {
     const auto &devices = discovery_.devicesByKey();
     const auto peer = devices.constFind(session_.peerKey());
-    if (peer != devices.cend() && peer->readonlyDesktop && (!session_.interactive() || peer->keyboardMouse))
+    if (peer != devices.cend() && peer->canRequestDesktop(session_.interactive()))
         return *peer;
     return {};
 }

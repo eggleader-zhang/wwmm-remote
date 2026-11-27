@@ -197,6 +197,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
 #endif
     layout->addWidget(empty_, 1);
     issue_ = label(this);
+    issue_->setObjectName("connectionHint");
     layout->addWidget(issue_);
 
     auto *actions = new QHBoxLayout;
@@ -293,6 +294,8 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     connect(&pairing, &Pairing::notice, this, &DevicesPanel::showStatus);
     connect(desktop_, &DesktopSession::notice, this, &DevicesPanel::showStatus);
     connect(desktop_, &DesktopSession::changed, this, [this, schedule] {
+        if (desktop_->state() == DesktopSession::Connecting)
+            showStatus({});
         if (desktop_->state() == DesktopSession::Viewing) {
             const auto key = QString::fromLatin1(desktop_->peerKey().toHex());
             const auto record = (desktop_->interactive() ? QStringLiteral("c") : QStringLiteral("v")) + key;
@@ -406,8 +409,6 @@ void DevicesPanel::refreshList()
     list_->verticalScrollBar()->setValue(scroll);
     list_->setVisible(!rows.isEmpty());
     empty_->setVisible(rows.isEmpty());
-    issue_->setText(discovery_.issue());
-    issue_->setVisible(!issue_->text().isEmpty());
     updateActions();
 }
 
@@ -427,13 +428,13 @@ void DevicesPanel::updateActions()
     const bool repairing = trusted && present && key == repairKey_;
     const bool pairable = present && (!trusted || repairing);
     const bool busy = pairing_.busy();
-    const bool canView = trusted && present && peer->readonlyDesktop;
-    const bool canControl = canView && peer->keyboardMouse;
+    const bool canView = trusted && present && peer->canRequestDesktop(false);
+    const bool canControl = canView && peer->canRequestDesktop(true);
     const bool idle = desktop_->state() == DesktopSession::Idle;
     primaryControl_ = canControl && !recent_.contains(QStringLiteral("v") + key.toHex());
-    primary_->setText(primaryControl_ ? tr("控制桌面") : tr("查看桌面"));
-    primary_->setVisible(canView && !busy && !repairing);
-    primary_->setEnabled(idle);
+    primary_->setText(!canView ? tr("连接") : primaryControl_ ? tr("连接并控制") : tr("连接并查看"));
+    primary_->setVisible(trusted && !busy && !repairing);
+    primary_->setEnabled(idle && canView);
     more_->setVisible(trusted && !busy);
     view_->setVisible(primaryControl_);
     view_->setEnabled(canView && idle);
@@ -446,6 +447,17 @@ void DevicesPanel::updateActions()
     pair_->setVisible(pairable || busy);
     pair_->setText(busy ? tr("取消配对") : tr("配对"));
     pair_->setEnabled(busy || (pairable && code_->text().size() == 8));
+    auto hint = discovery_.issue();
+    if (hint.isEmpty() && trusted && !repairing && idle && !busy) {
+        if (!present)
+            hint = tr("设备已离线。请在对方电脑上打开 WWMM Remote。");
+        else if (!canView)
+            hint = tr("桌面协议不兼容。请将两端的 WWMM Remote 更新到同一最新版。");
+        else if (peer->desktop == DesktopAccess::Unspecified)
+            hint = tr("如果对方收不到连接请求，请确认对方已打开支持远程桌面的 WWMM Remote。");
+    }
+    issue_->setText(hint);
+    issue_->setVisible(!hint.isEmpty());
 }
 
 void DevicesPanel::updateOffer()
@@ -469,13 +481,16 @@ void DevicesPanel::updateOffer()
 
 void DevicesPanel::requestDesktop(bool control)
 {
+    if (desktop_->state() != DesktopSession::Idle)
+        return;
     const auto key = selectedKey();
     const auto &online = discovery_.devicesByKey();
     const auto peer = online.constFind(key);
-    if (desktop_->state() == DesktopSession::Idle && store_.peers().contains(key) && peer != online.cend() &&
-        peer->readonlyDesktop && (!control || peer->keyboardMouse)) {
-        const auto target = *peer;
-        desktop_->view(target, control);
+    if (peer == online.cend()) {
+        showStatus(tr("设备已离线。请在对方电脑上打开 WWMM Remote。"));
+        return;
     }
+    const auto target = *peer;
+    desktop_->view(target, control);
 }
 } // namespace wwmm
