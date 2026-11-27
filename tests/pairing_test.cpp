@@ -610,12 +610,31 @@ class PairTest : public QObject
         DesktopViewer view(nullptr, true, false);
         auto *surface = view.inputSurface();
         QList<InputEvent> sent;
-        connect(surface, &InputWindow::input, &view, [&](const InputEvent &e) { sent << e; });
+        connect(surface, &InputWindow::input, &view, [&](const InputEvent &e) {
+            if (e.kind == InputKind::KeyDown || e.kind == InputKind::KeyUp)
+                sent << e;
+        });
+        view.setWindowFlag(Qt::WindowStaysOnTopHint);
         view.show();
         QTRY_VERIFY(view.windowHandle()->isExposed());
         const auto target = reinterpret_cast<HWND>(surface->winId());
         const auto window = GetAncestor(target, GA_ROOT);
-        view.activateWindow();
+        // Windows may decline programmatic foreground activation. Exercise the same
+        // click into the viewer as a user, only after verifying the hit is our window.
+        RECT bounds{};
+        QVERIFY(GetClientRect(target, &bounds) && bounds.right > 0 && bounds.bottom > 0);
+        POINT point{bounds.right / 2, bounds.bottom / 2};
+        QVERIFY(ClientToScreen(target, &point));
+        QTRY_COMPARE(GetAncestor(WindowFromPoint(point), GA_ROOT), window);
+        QVERIFY(SetCursorPos(point.x, point.y));
+        POINT cursor{};
+        QVERIFY(GetCursorPos(&cursor));
+        QCOMPARE(GetAncestor(WindowFromPoint(cursor), GA_ROOT), window);
+        INPUT click[2]{};
+        click[0].type = click[1].type = INPUT_MOUSE;
+        click[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        click[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        QCOMPARE(SendInput(2, click, sizeof(INPUT)), 2u);
         QTRY_COMPARE(GetForegroundWindow(), window);
         view.focusVideo();
         QTRY_VERIFY(GetFocus() == target || IsChild(target, GetFocus()));
