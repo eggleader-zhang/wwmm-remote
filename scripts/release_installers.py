@@ -41,7 +41,8 @@ def helper_notices(notices, env):
     directory = notices / "update-helper"
     directory.mkdir()
     goroot = Path(run("go", "env", "GOROOT", capture=True).strip())
-    shutil.copyfile(goroot / "LICENSE", directory / "Go-LICENSE")
+    go_license = next(p for p in (goroot / "LICENSE", goroot.parent / "LICENSE") if p.is_file())
+    shutil.copyfile(go_license, directory / "Go-LICENSE")
     mods = run(
         "go",
         "list",

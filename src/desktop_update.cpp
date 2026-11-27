@@ -1,5 +1,6 @@
 #include "desktop_update.h"
 #include "desktop_session.h"
+#include "desktop_tray.h"
 #include "release_version.h"
 #include <QApplication>
 #include <QDir>
@@ -73,6 +74,7 @@ void DesktopUpdate::reset(const QString &error)
 void DesktopUpdate::selectPackage()
 {
     action_->setEnabled(false);
+    showDevicesWindow(window_);
 #ifdef Q_OS_MACOS
     const auto filter = tr("WWMM Remote 磁盘映像 (*.dmg)");
 #else
