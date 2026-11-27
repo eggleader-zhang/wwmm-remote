@@ -215,6 +215,9 @@ def main(target, version):
             or (profile / "displays.ini").read_bytes() != display
         ):
             raise RuntimeError("Upgrade changed pairing, direct access or display preferences")
+        if windows:
+            from release_wizard import check_launch_option
+            check_launch_option(package, "zh" if target == "windows-x64" else "en")
         print(
             f"Verified {target}: ZIP migration, clean install, native {info}, signed offline update and existing profile"
         )

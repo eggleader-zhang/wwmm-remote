@@ -32,4 +32,4 @@ Source: "{#Arm}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs create
 [Icons]
 Name: "{userprograms}\WWMM Remote"; Filename: "{app}\WWMM Remote.exe"
 [Run]
-Filename: "{app}\WWMM Remote.exe"; Description: "打开 WWMM Remote"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\WWMM Remote.exe"; Description: "{cm:LaunchProgram,WWMM Remote}"; Flags: nowait postinstall skipifsilent

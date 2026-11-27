@@ -141,7 +141,7 @@ def win_payload(inputs, work, version):
     iscc = inno_tool()
     # Older runner images omit the official Chinese message file. Install the pinned upstream translation.
     lang = Path(iscc).parent / "Languages/ChineseSimplified.isl"
-    script = (ROOT / "installer/windows/setup.iss").read_text()
+    script = (ROOT / "installer/windows/setup.iss").read_text(encoding="utf-8-sig")
     if not lang.exists():
         lang = work / "ChineseSimplified.isl"
         run(
