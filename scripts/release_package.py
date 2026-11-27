@@ -63,6 +63,7 @@ def package_mac(stage, archive, arch):
     if actual != arch:
         raise ValueError(f"Expected {arch} executable, found {actual}")
     require_file(contents / "Frameworks/QtWidgets.framework/QtWidgets")
+    require_file(contents / "Resources/WWMM.icns")
     require_file(contents / "PlugIns/platforms/libqcocoa.dylib")
     for framework in (contents / "Frameworks").glob("*.framework"):
         subprocess.run(["lipo", framework / framework.stem, "-verify_arch", arch], check=True)
@@ -88,11 +89,12 @@ def main():
     require_file(qt / "lib/cmake/Qt6/Qt6Config.cmake")
     os.environ["PATH"] = str(qt / "bin") + os.pathsep + os.environ["PATH"]
     windows = os_name == "windows"
-    targets = ["wwmm_remote"]
+    targets = ["wwmm_remote", "wwmm_pair_tests", "wwmm_desktop_tests"]
     configure = ["cmake", "-S", ROOT, "-B", build, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-                 f"-DBUILD_TESTING={'ON' if windows else 'OFF'}", f"-DCMAKE_PREFIX_PATH={qt}"]
+                 "-DBUILD_TESTING=ON", f"-DCMAKE_PREFIX_PATH={qt}"]
+    if "GITHUB_RUN_NUMBER" in os.environ:
+        configure.append(f"-DWWMM_BUILD_NUMBER={int(os.environ['GITHUB_RUN_NUMBER'])}")
     if windows:
-        targets.extend(["wwmm_pair_tests", "wwmm_desktop_tests"])
         configure.extend(["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl", "-DCMAKE_INSTALL_BINDIR=.",
                           f"-DQT_HOST_PATH={qt}"])
     else:
@@ -100,11 +102,11 @@ def main():
     subprocess.run(configure, check=True)
     subprocess.run(["cmake", "--build", build, "--target", *targets, "--parallel",
                     str(min(os.cpu_count() or 2, 8))], check=True)
-    if windows:
-        env = dict(os.environ, QT_QPA_PLATFORM="windows", QT_PLUGIN_PATH=str(qt / "plugins"))
-        for binary, case in [("wwmm_pair_tests.exe", "readOnlyRequestButtons"),
-                             ("wwmm_desktop_tests.exe", "controlConsentAndDelivery")]:
-            subprocess.run([build / binary, case], env=env, check=True, timeout=90)
+    env = dict(os.environ, QT_QPA_PLATFORM="windows" if windows else "offscreen", QT_PLUGIN_PATH=str(qt / "plugins"))
+    suffix = ".exe" if windows else ""
+    for binary, cases in [("wwmm_pair_tests", ["readOnlyRequestButtons", "trayLifecycle", "storeAndRevocation"]),
+                          ("wwmm_desktop_tests", ["controlConsentAndDelivery", "rememberedAccess"])]:
+        subprocess.run([build / (binary + suffix), *cases], env=env, check=True, timeout=90)
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
     version = re.search(r"^CMAKE_PROJECT_VERSION:STATIC=([\d.]+)$", cache, re.MULTILINE).group(1)
     output = ROOT / "dist" / version

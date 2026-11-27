@@ -2,6 +2,7 @@
 #include "desktop_session.h"
 #include "desktop_viewer.h"
 #include "native_desktop.h"
+#include "native_input.h"
 #include "video_packets.h"
 #include "../platform/macos/video_encoder.h"
 #include "../platform/macos/video_decoder.h"
@@ -149,7 +150,7 @@ struct Peer {
                            return true;
                        }}};
     LanProbe probe;
-    DesktopSession session{probe, store};
+    DesktopSession session{probe, store, allowRemoteInput};
     Peer(const QList<LanAddress> &links) : probe([links] { return links; }, 0)
     {
         QString e;

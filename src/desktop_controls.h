@@ -37,7 +37,7 @@ class DesktopControls final : public QWidget {
     DesktopSession &session_;
     Discovery &discovery_;
     QLabel *label_;
-    QCheckBox *soundCheck_;
+    QCheckBox *soundCheck_, *rememberAccess_;
     std::shared_ptr<Callbacks> soundCallbacks_;
     std::shared_ptr<AudioStream> audioStream_;
     std::unique_ptr<NativeAudio> audio_;

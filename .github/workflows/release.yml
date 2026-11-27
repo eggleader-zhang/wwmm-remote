@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       number: ${{ steps.version.outputs.number }}
+      tag: ${{ steps.version.outputs.tag }}
       pending: ${{ steps.version.outputs.pending }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -36,23 +37,27 @@ jobs:
           number=$(sed -nE 's/^project\(WWMMRemote VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' CMakeLists.txt)
           test -n "$number"
           echo "number=$number" >> "$GITHUB_OUTPUT"
-          if [[ ! -s "docs/releases/v$number.md" ]]; then
+          tag=$(for note in "docs/releases/v$number.md" "docs/releases/v$number"-r[0-9]*.md; do
+            if [[ -s "$note" ]]; then basename "$note" .md; fi
+          done | sort -V | tail -1)
+          if [[ -z "$tag" ]]; then
             echo "No release notes for v$number." >> "$GITHUB_STEP_SUMMARY"
             if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then exit 1; fi
             exit 0
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
-            jq -r --arg tag "v$number" '.[] | select(.tag_name == $tag and .draft == false) | .id')
+            jq -r --arg tag "$tag" '.[] | select(.tag_name == $tag and .draft == false) | .id')
           if [[ -z "$published" ]]; then
             echo "pending=true" >> "$GITHUB_OUTPUT"
           else
-            echo "v$number is already published." >> "$GITHUB_STEP_SUMMARY"
+            echo "$tag is already published." >> "$GITHUB_STEP_SUMMARY"
           fi
 
   build:
     needs: version
     if: needs.version.outputs.pending == 'true'
-    name: Build ${{ matrix.target }}
+    name: Build ${{ needs.version.outputs.tag }} · ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -126,14 +131,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.number }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
-          tag="v$VERSION"
+          tag="$TAG"
+          release="${tag#v}"
           notes="$RUNNER_TEMP/release-notes.md"
           cp "../docs/releases/$tag.md" "$notes"
           printf '\n## 发布签名\n\n' >> "$notes"
           for target in macos-arm64 macos-x86_64 windows-x64 windows-arm64; do
             test -s "WWMM-Remote-$VERSION-$target.zip"
+            if [[ "$release" != "$VERSION" ]]; then
+              mv "WWMM-Remote-$VERSION-$target.zip" "WWMM-Remote-$release-$target.zip"
+            fi
             test -s "signing-$target.txt"
             cat "signing-$target.txt" >> "$notes"
           done
@@ -145,7 +155,7 @@ jobs:
           releases=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100")
           existing=$(jq -c --arg tag "$tag" 'add[] | select(.tag_name == $tag)' <<< "$releases")
           if [[ -z "$existing" ]]; then
-            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "WWMM Remote $VERSION" --notes-file "$notes"
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "WWMM Remote $release" --notes-file "$notes"
           else
             jq -e --arg sha "$GITHUB_SHA" '.draft and .target_commitish == $sha' <<< "$existing" >/dev/null
           fi

@@ -19,6 +19,7 @@ class DevicesPanel final : public QWidget
     Q_OBJECT
   public:
     DevicesPanel(LanProbe &, Discovery &, Pairing &, DeviceStore &, QWidget *parent = nullptr);
+    DesktopSession &desktopSession() const { return *desktop_; }
 
   private:
     void refreshList();
@@ -39,7 +40,7 @@ class DevicesPanel final : public QWidget
     QLineEdit *code_;
     QPushButton *offer_, *pair_, *primary_;
     QPushButton *more_;
-    QAction *view_, *control_, *repair_, *forget_;
+    QAction *view_, *control_, *directAccess_, *repair_, *forget_;
     QTimer refresh_, countdown_;
     QByteArray actionKey_, repairKey_;
     bool primaryControl_ = false;

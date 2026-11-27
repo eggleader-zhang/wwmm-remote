@@ -23,6 +23,7 @@ auto writable(QByteArray &a) { return reinterpret_cast<uint8_t *>(a.data()); }
 struct OpenedStore {
     QByteArray publicKey, signingKey;
     QMap<QByteArray, QString> peers;
+    QSet<QByteArray> directAccess;
     QString error;
     ~OpenedStore() { OPENSSL_cleanse(signingKey.data(), signingKey.size()); }
 };
@@ -58,7 +59,7 @@ DeviceStore::DeviceStore(QString directory, VaultIO vault)
 
 DeviceStore::~DeviceStore() { OPENSSL_cleanse(signingKey_.data(), signingKey_.size()); }
 
-bool DeviceStore::open(QString &error) { return update({}, {}, false, error); }
+bool DeviceStore::open(QString &error) { return update(Change::Load, {}, {}, error); }
 
 bool DeviceStore::addTlsIdentity(SSL_CTX *context) const
 {
@@ -86,8 +87,9 @@ void DeviceStore::openAsync()
                 publicKey_.swap(snapshot->publicKey);
                 signingKey_.swap(snapshot->signingKey);
             }
-            if (peers_ != snapshot->peers) {
+            if (peers_ != snapshot->peers || directAccess_ != snapshot->directAccess) {
                 peers_.swap(snapshot->peers);
+                directAccess_.swap(snapshot->directAccess);
                 emit changed();
             }
         }
@@ -101,6 +103,7 @@ void DeviceStore::openAsync()
             snapshot->publicKey.swap(reader.publicKey_);
             snapshot->signingKey.swap(reader.signingKey_);
             snapshot->peers.swap(reader.peers_);
+            snapshot->directAccess.swap(reader.directAccess_);
         } else if (snapshot->error.isEmpty()) {
             snapshot->error = tr("无法读取本机设备身份。");
         }
@@ -114,15 +117,21 @@ bool DeviceStore::remember(const QByteArray &key, const QString &name, QString &
         error = tr("设备身份无效。");
         return false;
     }
-    return update(key, name, false, error);
+    return update(Change::Pair, key, name, error);
 }
+
+bool DeviceStore::setDirectAccess(const QByteArray &key, bool allow, QString &error)
+{
+    return update(allow ? Change::AllowDirect : Change::RequireConsent, key, {}, error);
+}
+
 bool DeviceStore::forget(const QByteArray &key, QString &error)
 {
     if (key.size() != 32) {
         error = tr("设备身份无效。");
         return false;
     }
-    if (!update(key, {}, true, error))
+    if (!update(Change::Forget, key, {}, error))
         return false;
     savePreferredDisplay(key, {});
     return true;
@@ -144,7 +153,7 @@ void DeviceStore::savePreferredDisplay(const QByteArray &peer, const QString &di
         settings.setValue(key, display);
 }
 
-bool DeviceStore::update(const QByteArray &key, const QString &name, bool remove, QString &error)
+bool DeviceStore::update(Change change, const QByteArray &key, const QString &name, QString &error)
 {
     if (!QDir().mkpath(directory_)) {
         error = tr("无法创建本机设备数据目录。");
@@ -160,7 +169,7 @@ bool DeviceStore::update(const QByteArray &key, const QString &name, bool remove
     QByteArray record;
     if (!vault_.read(record, error))
         return false;
-    const bool create = record.isEmpty() && publicKey_.isEmpty() && key.isEmpty();
+    const bool create = record.isEmpty() && publicKey_.isEmpty() && change == Change::Load;
     auto obj = QJsonDocument::fromJson(record).object();
     QByteArray priv(64, '\0'), pub(32, '\0');
     struct Wipe {
@@ -187,7 +196,9 @@ bool DeviceStore::update(const QByteArray &key, const QString &name, bool remove
         return false;
     }
     auto peers = obj["peers"].toObject();
+    const auto permissions = obj["directAccess"].toObject();
     QMap<QByteArray, QString> verified;
+    QSet<QByteArray> direct;
     for (auto it = peers.begin(); it != peers.end(); ++it) {
         const auto raw = QByteArray::fromHex(it.key().toLatin1());
         if (raw.size() != 32 || raw.toHex() != it.key().toLatin1() || raw == pub ||
@@ -196,30 +207,48 @@ bool DeviceStore::update(const QByteArray &key, const QString &name, bool remove
             return false;
         }
         verified.insert(raw, it.value().toString());
+        if (permissions.value(it.key()).toBool(false))
+            direct.insert(raw);
     }
-    if (!key.isEmpty()) {
-        const auto id = QString::fromLatin1(key.toHex());
-        if (remove) {
-            peers.remove(id);
-            verified.remove(key);
-        } else {
-            if (!verified.contains(key) && verified.size() >= 128) {
-                error = tr("已保存 128 台设备，请先撤销不用的设备。");
-                return false;
-            }
-            peers.insert(id, name);
-            verified.insert(key, name);
+    const auto id = QString::fromLatin1(key.toHex());
+    if (change == Change::Pair) {
+        if (!verified.contains(key) && verified.size() >= 128) {
+            error = tr("已保存 128 台设备，请先撤销不用的设备。");
+            return false;
         }
-        obj.insert("peers", peers);
+        peers.insert(id, name);
+        verified.insert(key, name);
+        direct.remove(key);
+    } else if (change == Change::Forget) {
+        peers.remove(id);
+        verified.remove(key);
+        direct.remove(key);
+    } else if (change == Change::AllowDirect || change == Change::RequireConsent) {
+        if (!verified.contains(key)) {
+            error = tr("请先与这台设备配对。");
+            return false;
+        }
+        if (change == Change::AllowDirect)
+            direct.insert(key);
+        else
+            direct.remove(key);
     }
-    if ((create || !key.isEmpty()) && !vault_.write(QJsonDocument(obj).toJson(QJsonDocument::Compact), error))
-        return false;
+    if (change != Change::Load || create) {
+        obj.insert("peers", peers);
+        QJsonObject grants;
+        for (const auto &peer : direct)
+            grants.insert(QString::fromLatin1(peer.toHex()), true);
+        obj.insert("directAccess", grants);
+        if (!vault_.write(QJsonDocument(obj).toJson(QJsonDocument::Compact), error))
+            return false;
+    }
     if (publicKey_.isEmpty()) {
         publicKey_ = pub;
         signingKey_ = QByteArray(priv.constData(), priv.size());
     }
-    const bool notify = peers_ != verified;
+    const bool notify = peers_ != verified || directAccess_ != direct;
     peers_ = std::move(verified);
+    directAccess_ = std::move(direct);
     ++revision_;
     lock.unlock();
     if (notify)

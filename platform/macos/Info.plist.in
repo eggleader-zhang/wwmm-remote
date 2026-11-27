@@ -8,16 +8,18 @@
     <key>CFBundleDisplayName</key><string>WWMM Remote</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleIconFile</key><string>WWMM.icns</string>
+    <key>LSUIElement</key><true/>
     <key>CFBundleShortVersionString</key><string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
     <key>CFBundleVersion</key><string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
     <key>LSMinimumSystemVersion</key><string>${CMAKE_OSX_DEPLOYMENT_TARGET}</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>WWMM Remote 在同一局域网发现和配对你选择的电脑，经你同意传输桌面画面和本次授权的键鼠输入。</string>
+    <string>WWMM Remote 在同一局域网发现和配对电脑，并按你为该设备设置的权限共享桌面。</string>
     <key>NSAccessibilityUsageDescription</key>
-    <string>仅在你允许本次远程控制后，WWMM Remote 才会在这台 Mac 上执行对方的键鼠操作。</string>
+    <string>WWMM Remote 为你本次允许控制或已授予免确认访问的设备执行键鼠操作。</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>你同意本次会话后，WWMM Remote 将所选显示器共享给已配对的局域网电脑。双方开启声音后才共享系统播放的声音。</string>
+    <string>WWMM Remote 向你本次允许或已授予免确认访问的局域网设备共享所选显示器。双方开启声音后才共享系统播放的声音。</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>仅在双方开启本次声音共享后，采集电脑播放的系统声音并传给当前局域网设备。</string>
     <key>NSBonjourServices</key>

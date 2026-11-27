@@ -8,6 +8,7 @@
 #include "trusted_channel.h"
 #include <QElapsedTimer>
 #include <QTimer>
+#include <functional>
 
 namespace wwmm {
 class DesktopSession final : public QObject {
@@ -15,7 +16,8 @@ class DesktopSession final : public QObject {
   public:
     enum State { Idle, Connecting, Waiting, Requested, Sharing, Viewing, Interrupted };
 
-    DesktopSession(LanProbe &probe, DeviceStore &store, QObject *parent = nullptr);
+    DesktopSession(LanProbe &probe, DeviceStore &store, std::function<bool(QString &)> allowInput,
+                   QObject *parent = nullptr);
     ~DesktopSession() override;
 
     State state() const { return state_; }
@@ -59,7 +61,7 @@ class DesktopSession final : public QObject {
 
     void sendInput(InputEvent event);
     void reportFocus(InputFocus focus);
-    void accept();
+    void accept(bool rememberDevice = false);
     void stop(const QString &reason = {});
     void interrupt(const QString &reason);
     void sendFrame(QByteArray annexB, quint32 timestamp, bool keyframe);
@@ -91,12 +93,14 @@ class DesktopSession final : public QObject {
     void startDisplay(quint64 id, bool formatOnly = false);
     void drainPaste();
     void handle(const QByteArray &data);
+    void startSharing(bool rememberDevice);
     void setState(State state);
     void check();
     void finishSession(const QString &reason, bool transportLost);
     void receiveInput(const InputEvent &event);
     LanProbe &probe_;
     DeviceStore &store_;
+    std::function<bool(QString &)> allowInput_;
     SessionData data_;
     TrustedChannel *control_ = nullptr;
     std::unique_ptr<Network> network_;
@@ -105,6 +109,7 @@ class DesktopSession final : public QObject {
     Endpoint remote_;
     QByteArray selected_;
     bool host_ = false, received_ = false, rich_ = false, adaptive_ = false, retrying_ = false;
+    bool usingDirectAccess_ = false;
     VideoQuality quality_ = VideoQuality::FullHD, qualityLimit_ = VideoQuality::FullHD;
     VideoQuality hardwareLimit_ = VideoQuality::UHD;
     AdaptiveResolution resolution_;

@@ -3,6 +3,11 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE AND "$ENV{MACOSX_DEPLOYMENT_TAR
     set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS deployment target")
 endif()
 project(WWMMRemote VERSION 1.5.2 LANGUAGES C CXX)
+set(WWMM_BUILD_NUMBER 0 CACHE STRING "Native package build number")
+set(wwmm_bundle_build "${PROJECT_VERSION}")
+if(WWMM_BUILD_NUMBER GREATER 0)
+    set(wwmm_bundle_build "${WWMM_BUILD_NUMBER}")
+endif()
 include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -44,6 +49,7 @@ elseif(APPLE)
 endif()
 
 add_library(wwmm_widgets STATIC src/main_window.cpp src/main_window.h src/devices_panel.cpp src/devices_panel.h
+    src/desktop_tray.cpp src/desktop_tray.h
     src/desktop_controls.cpp src/desktop_controls.h src/desktop_viewer.cpp src/desktop_viewer.h
     src/input_window.cpp src/input_window.h src/transfer_bar.cpp src/transfer_bar.h src/clipboard_images.cpp src/clipboard_images.h)
 target_link_libraries(wwmm_widgets PUBLIC wwmm_lan Qt6::Widgets)
@@ -65,10 +71,17 @@ endif()
 target_link_libraries(wwmm_widgets PRIVATE wwmm_native Qt6::Concurrent)
 
 qt_add_executable(wwmm_remote src/main.cpp)
+qt_add_resources(wwmm_widgets "app_icons" PREFIX "/icons" BASE platform/icons
+    FILES platform/icons/wwmm.png platform/icons/menubar.png platform/icons/menubar@2x.png)
 if(WIN32)
     enable_language(RC)
     configure_file(platform/windows/version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/wwmm-version.rc" @ONLY)
     target_sources(wwmm_remote PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/wwmm-version.rc")
+    set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/wwmm-version.rc" APPEND PROPERTY
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/platform/icons/WWMM.ico")
+elseif(APPLE)
+    set_source_files_properties(platform/icons/WWMM.icns PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(wwmm_remote PRIVATE platform/icons/WWMM.icns)
 endif()
 set_target_properties(wwmm_remote PROPERTIES
     OUTPUT_NAME "WWMM Remote"
@@ -76,7 +89,7 @@ set_target_properties(wwmm_remote PROPERTIES
     MACOSX_BUNDLE TRUE
     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/platform/macos/Info.plist.in"
     MACOSX_BUNDLE_GUI_IDENTIFIER "dev.wwmm.remote"
-    MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${wwmm_bundle_build}"
     MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}")
 target_link_libraries(wwmm_remote PRIVATE wwmm_widgets)
 

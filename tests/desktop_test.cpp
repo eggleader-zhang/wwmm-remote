@@ -44,7 +44,12 @@ struct Node {
                            return true;
                        }}};
     LanProbe probe;
-    DesktopSession session{probe, store};
+    bool inputAllowed = true;
+    DesktopSession session{probe, store, [this](QString &reason) {
+        if (!inputAllowed)
+            reason = "Input permission denied";
+        return inputAllowed;
+    }};
     explicit Node(const QList<LanAddress> &links = loop()) : probe([links] { return links; }, 0)
     {
         QString e;
@@ -503,6 +508,52 @@ class DesktopTest final : public QObject
         QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
         viewer.session.sendInput(key);
         QCOMPARE(received.size(), 5);
+    }
+
+    void rememberedAccess()
+    {
+        Node viewer, host, other;
+        viewer.trust(host);
+        host.trust(viewer);
+        other.trust(host);
+        host.trust(other);
+        auto device = host.target();
+        device.desktop = DesktopAccess::Control;
+        const auto key = viewer.store.publicKey();
+        QString error;
+        QVERIFY(!host.store.allowsDirectAccess(key));
+        viewer.session.view(device, true);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        host.session.accept(true);
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Viewing);
+        QVERIFY(host.store.allowsDirectAccess(key));
+        QVERIFY(!viewer.store.allowsDirectAccess(host.store.publicKey()));
+        host.session.stop();
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+
+        other.session.view(device, true);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        host.session.stop();
+        QTRY_COMPARE(other.session.state(), DesktopSession::Idle);
+        host.inputAllowed = false;
+        viewer.session.view(device, true);
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+        QCOMPARE(host.session.state(), DesktopSession::Idle);
+        host.inputAllowed = true;
+        for (bool control : {false, true}) {
+            viewer.session.view(device, control);
+            QTRY_COMPARE(viewer.session.state(), DesktopSession::Viewing);
+            QCOMPARE(host.session.interactive(), control);
+            if (control)
+                QVERIFY(host.store.setDirectAccess(key, false, error));
+            else
+                host.session.stop();
+            QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
+        }
+        viewer.session.view(device, true);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        host.session.stop();
+        QTRY_COMPARE(viewer.session.state(), DesktopSession::Idle);
     }
 
     void adaptiveResolution()

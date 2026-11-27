@@ -1,6 +1,7 @@
 #include "devices_panel.h"
 #include "desktop_session.h"
 #include "desktop_viewer.h"
+#include "desktop_tray.h"
 #include "input_window.h"
 #include "main_window.h"
 #include <QApplication>
@@ -223,12 +224,23 @@ class PairTest : public QObject
         QVERIFY(reopened.open(error));
         QCOMPARE(reopened.publicKey(), pub);
         QVERIFY(a.store.remember(b.store.publicKey(), "同名电脑", error));
+        QVERIFY(!a.store.setDirectAccess(c.store.publicKey(), true, error));
+        a.vault.writable = false;
+        QVERIFY(!a.store.setDirectAccess(b.store.publicKey(), true, error));
+        QVERIFY(!a.store.allowsDirectAccess(b.store.publicKey()));
+        a.vault.writable = true;
+        QVERIFY(a.store.setDirectAccess(b.store.publicKey(), true, error));
         QVERIFY(reopened.remember(c.store.publicKey(), "同名电脑", error));
         QCOMPARE(reopened.peers().size(), 2);
+        QVERIFY(reopened.allowsDirectAccess(b.store.publicKey()));
+        QVERIFY(!reopened.allowsDirectAccess(c.store.publicKey()));
         QVERIFY(a.store.forget(b.store.publicKey(), error));
         QCOMPARE(a.store.peers().size(), 1);
         QVERIFY(reopened.open(error));
         QCOMPARE(reopened.peers(), a.store.peers());
+        QVERIFY(!reopened.allowsDirectAccess(b.store.publicKey()));
+        QVERIFY(reopened.remember(b.store.publicKey(), "同名电脑", error));
+        QVERIFY(!reopened.allowsDirectAccess(b.store.publicKey()));
         a.vault.writable = false;
         QVERIFY(!a.store.forget(c.store.publicKey(), error));
         QCOMPARE(a.store.peers().size(), 1);
@@ -476,6 +488,15 @@ class PairTest : public QObject
         QVERIFY(a.store.peers().isEmpty());
     }
 
+    void trayLifecycle()
+    {
+        QProcess child;
+        child.start(QCoreApplication::applicationFilePath(), {"--qa-tray"});
+        QVERIFY(child.waitForFinished(10000));
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(child.exitCode(), 0);
+    }
+
     void readOnlyRequestButtons()
     {
         Node a("查看端"), b("共享端");
@@ -494,6 +515,14 @@ class PairTest : public QObject
         auto *view = left.findChild<QAction *>("viewDesktop");
         auto *allow = right.findChild<QPushButton *>("allowDesktop");
         auto *decline = right.findChild<QPushButton *>("endDesktop");
+        auto *remember = right.findChild<QCheckBox *>("rememberAccess");
+        auto *permission = right.findChild<QAction *>("directAccess");
+        QVERIFY(remember && permission);
+        QVERIFY(permission->isEnabled() && !permission->isChecked());
+        permission->trigger();
+        QVERIFY(b.store.allowsDirectAccess(a.store.publicKey()));
+        permission->trigger();
+        QVERIFY(!b.store.allowsDirectAccess(a.store.publicKey()));
         auto *hint = left.findChild<QLabel *>("connectionHint");
         QVERIFY(primary && view && allow && decline && hint);
         QVERIFY(primary->isVisible() && !primary->isEnabled());
@@ -509,10 +538,16 @@ class PairTest : public QObject
         emit one->resolved(ad.local.link.interfaceIndex, ad.instance, ad.local.port, legacy);
         QTRY_VERIFY(primary->isVisible() && primary->isEnabled());
         QCOMPARE(primary->text(), QStringLiteral("连接并控制"));
+        right.close();
+        QVERIFY(!right.isVisible());
         QTest::mouseClick(primary, Qt::LeftButton);
         QTRY_VERIFY(allow->isVisible());
+        QVERIFY(remember->isVisible() && !remember->isChecked());
         QCOMPARE(allow->text(), QStringLiteral("允许本次控制"));
+        remember->setChecked(true);
+        QCOMPARE(allow->text(), QStringLiteral("允许并记住"));
         QTest::mouseClick(decline, Qt::LeftButton);
+        QVERIFY(!b.store.allowsDirectAccess(a.store.publicKey()));
         QTRY_VERIFY(primary->isEnabled());
         legacy = ad.fields;
         legacy.remove("input");
@@ -525,6 +560,7 @@ class PairTest : public QObject
         view->trigger();
         QTRY_VERIFY(allow->isVisible());
         QCOMPARE(allow->text(), QStringLiteral("允许本次查看"));
+        QVERIFY(!remember->isVisible());
         QVERIFY(decline->isVisible());
         QCOMPARE(decline->text(), QString("拒绝"));
         QTest::mouseClick(decline, Qt::LeftButton);
@@ -681,6 +717,27 @@ class PairTest : public QObject
 int main(int argc, char **argv)
 {
     QApplication app(argc, argv);
+    if (app.arguments().contains("--qa-tray")) {
+        QWidget home;
+        DesktopTray tray(home);
+        home.show();
+        auto *icon = home.findChild<QSystemTrayIcon *>();
+        if (!icon || icon->icon().isNull() || !icon->isVisible() || !icon->contextMenu())
+            return 2;
+        auto actions = icon->contextMenu()->actions();
+        bool reopened = false;
+        QTimer::singleShot(0, &home, &QWidget::close);
+        QTimer::singleShot(100, &home, [&] {
+            if (home.isHidden()) {
+                actions.first()->trigger();
+                reopened = home.isVisible();
+            }
+            actions.last()->trigger();
+        });
+        QTimer::singleShot(3000, [] { QCoreApplication::exit(3); });
+        const int code = app.exec();
+        return reopened ? code : 4;
+    }
     if (app.arguments().size() == 3 && app.arguments()[1] == "--qa-lan-peer")
         return serveTestPeer(app, app.arguments()[2]);
     PairTest test;

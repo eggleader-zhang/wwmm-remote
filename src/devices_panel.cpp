@@ -1,5 +1,6 @@
 #include "devices_panel.h"
 #include "desktop_controls.h"
+#include "desktop_tray.h"
 #include "main_window.h"
 #include <QApplication>
 #include <QHBoxLayout>
@@ -90,6 +91,7 @@ QPushButton *menuButton(const QString &title, QWidget *parent)
 QWidget *createDevicesPage(LanProbe &probe, DeviceStore &store)
 {
     auto *page = new QWidget;
+    auto *tray = new DesktopTray(*page);
     auto *layout = new QVBoxLayout(page);
     layout->setContentsMargins(0, 0, 0, 0);
     auto *loading = new QWidget(page);
@@ -127,6 +129,7 @@ QWidget *createDevicesPage(LanProbe &probe, DeviceStore &store)
         auto *discovery = new Discovery(probe, store.publicKey(), name);
         auto *pairing = new Pairing(probe, store, name);
         auto *panel = new DevicesPanel(probe, *discovery, *pairing, store, page);
+        tray->watch(panel->desktopSession());
         discovery->setParent(panel);
         pairing->setParent(panel);
         layout->addWidget(panel);
@@ -146,7 +149,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
                            QWidget *parent)
     : QWidget(parent), recentSetting_(QStringLiteral("desktop/recent/") + store.publicKey().toHex()),
       probe_(probe), discovery_(discovery), pairing_(pairing), store_(store),
-      desktop_(new DesktopSession(probe, store, this))
+      desktop_(new DesktopSession(probe, store, allowRemoteInput, this))
 {
     recent_ = QSettings().value(recentSetting_).toStringList().mid(0, 5);
     auto *layout = new QVBoxLayout(this);
@@ -216,6 +219,10 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     view_->setObjectName("viewDesktop");
     control_ = more_->menu()->addAction(tr("控制桌面"));
     control_->setObjectName("controlDesktop");
+    more_->menu()->addSeparator();
+    directAccess_ = more_->menu()->addAction(tr("允许此设备免确认查看和控制本机"));
+    directAccess_->setObjectName("directAccess");
+    directAccess_->setCheckable(true);
     repair_ = more_->menu()->addAction(tr("重新配对…"));
     forget_ = more_->menu()->addAction(tr("撤销本机信任"));
     forget_->setObjectName("forgetDevice");
@@ -249,6 +256,12 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     connect(primary_, &QPushButton::clicked, this, [this] { requestDesktop(primaryControl_); });
     connect(view_, &QAction::triggered, this, [this] { requestDesktop(false); });
     connect(control_, &QAction::triggered, this, [this] { requestDesktop(true); });
+    connect(directAccess_, &QAction::triggered, this, [this](bool allow) {
+        QString error;
+        if (!store_.setDirectAccess(selectedKey(), allow, error))
+            showStatus(error);
+        updateActions();
+    });
     connect(repair_, &QAction::triggered, this, [this] {
         repairKey_ = repairKey_.isEmpty() ? selectedKey() : QByteArray{};
         code_->clear();
@@ -443,6 +456,9 @@ void DevicesPanel::updateActions()
     repair_->setVisible(trusted && present);
     repair_->setText(repairing ? tr("取消重新配对") : tr("重新配对…"));
     forget_->setEnabled(trusted);
+    directAccess_->setChecked(store_.allowsDirectAccess(key));
+    const bool beingControlled = desktop_->state() == DesktopSession::Sharing && desktop_->interactive();
+    directAccess_->setEnabled(trusted && (!beingControlled || directAccess_->isChecked()));
     code_->setVisible(pairable && !busy);
     pair_->setVisible(pairable || busy);
     pair_->setText(busy ? tr("取消配对") : tr("配对"));

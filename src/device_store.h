@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QMap>
 #include <QObject>
+#include <QSet>
 #include <functional>
 #include <openssl/base.h>
 
@@ -29,6 +30,8 @@ class DeviceStore final : public QObject
     void openAsync();
     bool remember(const QByteArray &key, const QString &name, QString &error);
     bool forget(const QByteArray &key, QString &error);
+    bool allowsDirectAccess(const QByteArray &key) const { return directAccess_.contains(key); }
+    bool setDirectAccess(const QByteArray &key, bool allow, QString &error);
     QString preferredDisplay(const QByteArray &peer) const;
     void savePreferredDisplay(const QByteArray &peer, const QString &display) const;
     const QByteArray &publicKey() const { return publicKey_; }
@@ -41,12 +44,14 @@ class DeviceStore final : public QObject
     void openFinished(const QString &error);
 
   private:
-    bool update(const QByteArray &key, const QString &name, bool remove, QString &error);
+    enum class Change { Load, Pair, Forget, AllowDirect, RequireConsent };
+    bool update(Change change, const QByteArray &key, const QString &name, QString &error);
     QString directory_;
     VaultIO vault_;
     QByteArray publicKey_;
     QByteArray signingKey_;
     QMap<QByteArray, QString> peers_;
+    QSet<QByteArray> directAccess_;
     quint64 revision_ = 0;
     bool opening_ = false;
 };

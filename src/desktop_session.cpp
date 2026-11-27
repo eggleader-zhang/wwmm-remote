@@ -63,8 +63,9 @@ struct DesktopSession::Network {
     }
 };
 
-DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, QObject *parent)
-    : QObject(parent), probe_(probe), store_(store), data_(store, this)
+DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, std::function<bool(QString &)> allowInput,
+                               QObject *parent)
+    : QObject(parent), probe_(probe), store_(store), allowInput_(std::move(allowInput)), data_(store, this)
 {
     connect(&probe, &LanProbe::desktopRequested, this, [this](QTcpSocket *socket, const LanAddress &link) {
         if (state_ != Idle || store_.peers().isEmpty() || !probe_.receiving() ||
@@ -387,7 +388,12 @@ void DesktopSession::handle(const QByteArray &data)
         interactive_ = controlOffer;
         if (interactive_)
             peerOS_ = DesktopOS(quint8(data[3]));
-        setState(Requested);
+        if (store_.allowsDirectAccess(selected_)) {
+            usingDirectAccess_ = true;
+            startSharing(false);
+        } else {
+            setState(Requested);
+        }
     } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ && adaptiveOffer == adaptive_ &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
@@ -401,13 +407,26 @@ void DesktopSession::handle(const QByteArray &data)
         stop(tr("桌面请求状态已改变。"));
 }
 
-void DesktopSession::accept()
+void DesktopSession::accept(bool rememberDevice)
 {
-    if (state_ != Requested)
-        return;
-    if (!probe_.receiving() || !probe_.links().contains(link_) || !store_.peers().contains(selected_) ||
-        !prepareNetwork() || !startNetwork())
+    if (state_ == Requested)
+        startSharing(rememberDevice && interactive_);
+}
+
+void DesktopSession::startSharing(bool rememberDevice)
+{
+    if (!probe_.receiving() || !probe_.links().contains(link_) || !store_.peers().contains(selected_))
         return stop(tr("无法在当前局域网共享桌面。"));
+    QString reason;
+    if (interactive_ && !allowInput_(reason))
+        return stop(reason);
+    if (!prepareNetwork() || !startNetwork())
+        return stop(tr("无法在当前局域网共享桌面。"));
+    if (rememberDevice) {
+        if (!store_.setDirectAccess(selected_, true, reason))
+            return stop(reason);
+        usingDirectAccess_ = true;
+    }
     const char op = interactive_ ? (extended_ ? 'a' : 'A') : (extended_ ? 'y' : 'Y');
     auto reply = portMessage(op, network_->port);
     if (interactive_)
@@ -599,6 +618,8 @@ void DesktopSession::refreshVideo()
 
 void DesktopSession::check()
 {
+    if (usingDirectAccess_ && !store_.allowsDirectAccess(selected_))
+        return stop(tr("已撤销此设备的免确认访问，本次共享已结束。"));
     if ((!selected_.isEmpty() && !store_.peers().contains(selected_)) || (host_ && !probe_.receiving()))
         return stop(tr("设备信任或接收开关已改变。"));
     if (!control_)
@@ -658,6 +679,7 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
         channel->finish(last);
     }
     ++epoch_;
+    usingDirectAccess_ = false;
     timer_.stop();
     pasteTimer_.stop();
     stillFrame_.stop();

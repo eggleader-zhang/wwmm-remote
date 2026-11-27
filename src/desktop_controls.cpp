@@ -1,5 +1,6 @@
 #include "desktop_controls.h"
 #include "desktop_viewer.h"
+#include "desktop_tray.h"
 #include "input_window.h"
 #include "transfer_bar.h"
 #include <QScreen>
@@ -84,17 +85,17 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     });
     row->addWidget(yes_);
     row->addWidget(stop_);
+    rememberAccess_ = new QCheckBox(tr("以后允许此设备免确认查看和控制本机"), this);
+    rememberAccess_->setObjectName("rememberAccess");
+    column_->addWidget(rememberAccess_);
+    connect(rememberAccess_, &QCheckBox::toggled, this, [this](bool remember) {
+        yes_->setText(remember ? tr("允许并记住") : tr("允许本次控制"));
+    });
     focusTimer_ = new QTimer(this);
     focusTimer_->setInterval(200);
     connect(focusTimer_, &QTimer::timeout, this, &DesktopControls::refreshInputFocus);
     connect(yes_, &QPushButton::clicked, this, [this] {
-        if (session_.state() != DesktopSession::Requested)
-            return;
-        QString reason;
-        if (session_.interactive() && !allowRemoteInput(reason))
-            session_.stop(reason);
-        else
-            session_.accept();
+        session_.accept(rememberAccess_->isChecked());
     });
     connect(stop_, &QPushButton::clicked, this, [this] { session_.stop(); });
     connect(&session, &DesktopSession::changed, this, &DesktopControls::updateState);
@@ -299,7 +300,7 @@ void DesktopControls::updateReconnect()
     if (!viewer_ || session_.state() != DesktopSession::Interrupted)
         return;
     const bool online = reconnectPeer().has_value();
-    const auto text = online ? tr("%1 已上线。重新连接后，对方需要再次同意。")
+    const auto text = online ? tr("%1 已上线，可以重新连接。")
                              : tr("正在等待 %1 回到局域网…");
     viewer_->showInterrupted(text.arg(session_.peerName()), online);
 }
@@ -310,6 +311,8 @@ void DesktopControls::updateState()
     const bool control = session_.interactive();
     setVisible(s != DesktopSession::Idle);
     yes_->setVisible(s == DesktopSession::Requested);
+    rememberAccess_->setVisible(s == DesktopSession::Requested && control);
+    rememberAccess_->setChecked(false);
     soundCheck_->setVisible(s == DesktopSession::Sharing && session_.richMedia());
     yes_->setText(control ? tr("允许本次控制") : tr("允许本次查看"));
     stop_->setText(s == DesktopSession::Requested ? tr("拒绝")
@@ -343,6 +346,7 @@ void DesktopControls::updateState()
                             : tr("%1 请求查看桌面并切换显示器。"))
                  : (control ? tr("%1 请求查看主屏幕并使用键鼠。") : tr("%1 请求查看主屏幕。")))
                 .arg(name));
+        showDevicesWindow(*window());
         QApplication::alert(window());
         break;
     }
