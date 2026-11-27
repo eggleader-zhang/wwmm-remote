@@ -1,12 +1,9 @@
 """Exercise the exact offline installer on a disposable native Actions runner."""
 
 import base64
-import ctypes
-import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -160,7 +157,8 @@ def main(target, version):
             run("codesign", "--verify", "--strict", "--deep", "--all-architectures", dest)
             exe = dest / "Contents/MacOS" / APP
             hp = dest / "Contents/Helpers/wwmm-update"
-            run("lipo", exe, "-verify_arch", "arm64", "x86_64")
+            if set(subprocess.check_output(["lipo", "-archs", exe], text=True).split()) != {"arm64", "x86_64"}:
+                raise RuntimeError("Installed app is missing a native architecture")
         info = json.loads(subprocess.check_output([exe, "--installation-info"]))
         expected = "arm64" if target.endswith("arm64") else "x86_64"
         if (info["Build"], info["CPU"], info["Version"]) != (build, expected, version):

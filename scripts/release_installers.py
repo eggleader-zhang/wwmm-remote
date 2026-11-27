@@ -101,7 +101,8 @@ def mac_payload(inputs, work, version):
                 source = thin
             slices.append(source)
         run("lipo", "-create", *slices, "-output", app / rel)
-        run("lipo", app / rel, "-verify_arch", "arm64", "x86_64")
+        if set(run("lipo", "-archs", app / rel, capture=True).split()) != {"arm64", "x86_64"}:
+            raise ValueError(f"Missing native slice in {rel}")
     with apple_identity() as (identity, opts, auth):
         for p in sorted(paths):
             apple_sign(app / p, identity, opts)

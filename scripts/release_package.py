@@ -1,5 +1,6 @@
 """Build, deploy and verify one native WWMM Remote release archive."""
 import argparse
+import ctypes
 import os
 from pathlib import Path
 import re
@@ -33,18 +34,33 @@ def windows_machine(path):
         return struct.unpack("<H", binary.read(2))[0]
 
 
+def supports_windows_arch(path, arch):
+    machine = windows_machine(path)
+    if machine == {"x64": 0x8664, "arm64": 0xaa64}[arch]:
+        return True
+    if arch != "arm64" or path.suffix.lower() != ".dll":
+        return False
+    # ARM64X images can have an x64 PE header. Ask the native OS loader which
+    # architectures the image actually contains, including the native ARM slice.
+    query = ctypes.windll.ntdll.RtlGetImageFileMachines
+    query.argtypes = (ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32))
+    query.restype = ctypes.c_long
+    flags = ctypes.c_uint32()
+    status = query(str(path.resolve()), ctypes.byref(flags))
+    if status != 0:
+        raise ValueError(f"Cannot inspect {path.name} (PE 0x{machine:04x}, NTSTATUS 0x{status & 0xffffffff:08x})")
+    return bool(flags.value & (1 << 3))
+
+
 def package_windows(stage, archive, arch):
     required = [f"{APP}.exe", "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll", "Qt6Network.dll",
                 "plugins/platforms/qwindows.dll", "wwmm-update.exe", "vcruntime140.dll", "msvcp140.dll"]
     for name in required:
         require_file(stage / name)
-    machine = {"x64": 0x8664, "arm64": 0xaa64}[arch]
-    binaries = [stage / required[0], *stage.rglob("*.dll")]
+    binaries = [stage / required[0], stage / "wwmm-update.exe", *stage.rglob("*.dll")]
     for binary in binaries:
-        actual = windows_machine(binary)
-        hybrid_dll = arch == "arm64" and binary.suffix.lower() == ".dll" and actual == 0xa64e
-        if actual != machine and not hybrid_dll:
-            raise ValueError(f"{binary.name} has the wrong architecture for {arch}")
+        if not supports_windows_arch(binary, arch):
+            raise ValueError(f"{binary.name} (PE 0x{windows_machine(binary):04x}) cannot run natively on {arch}")
     # Template-only uses of QtConcurrent can be fully inlined. Check the linked imports.
     imports = subprocess.check_output(["dumpbin", "/nologo", "/dependents", *binaries],
                                       text=True, errors="replace")
@@ -136,7 +152,11 @@ def main():
             redist = Path(os.environ["VCToolsRedistDir"]) / arch
             crt = next(redist.glob("Microsoft.VC*.CRT"))
             for dll in crt.glob("*.dll"):
-                shutil.copy2(dll, stage / dll.name)
+                # ARM redist also ships DLLs used exclusively by x64/ARM64EC code.
+                if supports_windows_arch(dll, arch):
+                    shutil.copy2(dll, stage / dll.name)
+                else:
+                    (stage / dll.name).unlink(missing_ok=True)
             for setup in stage.glob("vc_redist.*.exe"):
                 setup.unlink()
             (stage / "wwmm-install.id").write_bytes(b"dev.wwmm.remote\n")
