@@ -18,8 +18,9 @@ MacVideoEncoder::~MacVideoEncoder()
     }
 }
 
-bool MacVideoEncoder::open(QSize size, int bitrate)
+bool MacVideoEncoder::open(QSize size, int bitrate, int fps)
 {
+    pendingLimit_ = fps > videoFps ? 3 : 2;
     NSDictionary *spec = @{
         (__bridge NSString *)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder : @YES,
         (__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl : @YES
@@ -31,9 +32,9 @@ bool MacVideoEncoder::open(QSize size, int bitrate)
         NSDictionary *properties = @{
             (__bridge NSString *)kVTCompressionPropertyKey_RealTime : @YES,
             (__bridge NSString *)kVTCompressionPropertyKey_AllowFrameReordering : @NO,
-            (__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate : @(videoFps),
+            (__bridge NSString *)kVTCompressionPropertyKey_ExpectedFrameRate : @(fps),
             (__bridge NSString *)kVTCompressionPropertyKey_AverageBitRate : @(bitrate),
-            (__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval : @(videoFps),
+            (__bridge NSString *)kVTCompressionPropertyKey_MaxKeyFrameInterval : @(fps),
             (__bridge NSString *)
             kVTCompressionPropertyKey_ProfileLevel : (__bridge NSString *)kVTProfileLevel_H264_Main_AutoLevel,
             (__bridge NSString *)kVTCompressionPropertyKey_ColorPrimaries :
@@ -60,7 +61,7 @@ void MacVideoEncoder::setBitrate(int rate)
 }
 bool MacVideoEncoder::encode(CVPixelBufferRef image, qint64 us, bool force)
 {
-    if (!encoder_ || pending_.load() >= 2)
+    if (!encoder_ || pending_.load() >= pendingLimit_)
         return false;
     ++pending_;
     VTEncodeInfoFlags flags = 0;

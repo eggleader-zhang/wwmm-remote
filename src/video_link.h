@@ -23,7 +23,7 @@ public:
     ~VideoLink() override;
     quint16 bind(const LanAddress &link);
     bool connectPeer(const Endpoint &peer, const QByteArray &keys, const QByteArray &audioKey = {});
-    void setQuality(VideoQuality quality, bool keepEstimate = false);
+    void setQuality(VideoQuality quality, bool keepEstimate = false, int fps = videoFps);
     void setAudio(std::shared_ptr<AudioStream> stream);
     void submit(const QByteArray &annexB, quint32 timestamp);
     void requestKeyframe();
@@ -35,7 +35,7 @@ signals:
     void bitrateChanged(int bitsPerSecond);
     void receptionSample(qint64 nowMs, int loss256, int jitterMs, bool queued);
     void receptionStats(const wwmm::VideoReceptionStats &stats);
-    void failed(const QString &reason);
+    void failed(const QString &reason, quint32 timestamp);
     void transportLost(const QString &reason);
 
 private:

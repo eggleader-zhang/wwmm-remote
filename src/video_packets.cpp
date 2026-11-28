@@ -16,18 +16,22 @@ webrtc::ArrayView<const uint8_t> bytes(QByteArrayView data)
 constexpr char start[] = {0, 0, 0, 1};
 } // namespace
 
-int qualityBitrate(VideoQuality quality)
+bool validFrameRate(int fps)
 {
-    switch (quality) {
-    case VideoQuality::HD:
-        return 9000000;
-    case VideoQuality::QHD:
-        return 32000000;
-    case VideoQuality::UHD:
-        return 50000000;
-    default:
-        return videoBitrate;
-    }
+    return fps == 30 || fps == 60 || fps == 120;
+}
+
+int qualityBitrate(VideoQuality quality, int fps)
+{
+    // 每行依次为 720p、1080p、1440p 和 4K 的码率上限。
+    constexpr int rates[][4] = {
+        {6000000, 13000000, 21000000, 32000000},
+        {9000000, videoBitrate, 32000000, 50000000},
+        {14000000, 30000000, 48000000, 70000000},
+    };
+    if (quality < VideoQuality::HD || quality > VideoQuality::UHD)
+        quality = VideoQuality::FullHD;
+    return rates[fps == 30 ? 0 : fps == 120 ? 2 : 1][int(quality) - int(VideoQuality::HD)];
 }
 
 VideoQuality AdaptiveResolution::observe(VideoQuality current, VideoQuality limit, qint64 now,

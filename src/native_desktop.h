@@ -37,10 +37,13 @@ public:
     virtual ~DesktopPlayer() = default;
     virtual void push(const QByteArray &annexB, quint32 timestamp) = 0;
     virtual void setViewport(VideoViewport viewport) = 0;
+    // 返回值表示当前显示表面能否继续用于新帧率。
+    virtual bool setFrameRate(int) { return true; }
 };
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError failure, quint64 display = 0,
                                                VideoQuality quality = VideoQuality::FullHD, bool showCursor = true,
-                                               std::function<void()> cursorUnavailable = {});
+                                               std::function<void()> cursorUnavailable = {}, int fps = videoFps,
+                                               std::function<void(int, QString)> frameRateFallback = {});
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr nativeView, PresentedFrame presented, MediaError failure);
 } // namespace wwmm

@@ -19,6 +19,7 @@ struct ConnectionStats {
     qint64 mediaBytesPerSecond = 0, videoBitsPerSecond = 0;
     VideoQuality quality = VideoQuality::FullHD;
     int framesPerSecond = 0;
+    int targetFrameRate = videoFps, frameRateLimit = videoFps;
     QSize frameSize;
     std::optional<DesktopOS> peerOS;
     bool audioEnabled = false;
@@ -54,6 +55,13 @@ class DesktopSession final : public QObject {
 
     void chooseQuality(VideoQuality quality);
     bool reduceQuality();
+
+    bool frameRateProtocol() const { return frameRateProtocol_; }
+    int frameRate() const { return frameRate_; }
+    int frameRateLimit() const { return frameRateLimit_; }
+    void chooseFrameRate(int fps);
+    bool reduceFrameRate(const QString &reason = {});
+    void reportFrameRateFallback(int activeFps, const QString &reason = {});
 
     bool localSound() const { return localSound_ != 0; }
 
@@ -100,6 +108,7 @@ class DesktopSession final : public QObject {
     void displaySwitched(bool formatOnly);
     void beforePaste();
     void qualityChanged();
+    void frameRateChanged();
     void soundChanged();
     void connectionStatsChanged();
     void notice(const QString &message);
@@ -122,6 +131,9 @@ class DesktopSession final : public QObject {
     void appendMediaOptions(QByteArray &message) const;
     void probeRtt();
     void applyQuality(VideoQuality quality, bool keepEstimate = false);
+    void updateVideoBitrate(bool keepEstimate = false);
+    void applyFrameRate(int fps, bool restartCapture = true);
+    void retryDisplayFrameRate(bool formatOnly);
     void syncSound();
     void attachSound();
     void startDisplay(quint64 id, bool formatOnly = false);
@@ -157,6 +169,9 @@ class DesktopSession final : public QObject {
     bool cursorProtocol_ = false, cursorUnavailable_ = false;
     bool preferCursor_ = true, captureCursor_ = true;
     bool rttProtocol_ = false;
+    bool frameRateProtocol_ = false, frameRateFallbackPending_ = false;
+    int frameRate_ = videoFps, frameRateLimit_ = videoFps, hardwareFrameRateLimit_ = 120;
+    DesktopDisplay frameRateDisplay_;
     QTimer rttTimer_;
     QElapsedTimer rttClock_;
     std::optional<quint32> pendingRttToken_;

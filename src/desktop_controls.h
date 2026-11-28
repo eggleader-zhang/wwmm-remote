@@ -68,7 +68,8 @@ class DesktopControls final : public QWidget {
     QTimer *focusTimer_;
     QTimer settleMotion_, topology_, frameTimer_;
     QElapsedTimer lastPolish_, frameClock_;
-    int frameRate_ = 0;
+    int presentedFps_ = 0;
+    VideoQuality playerQuality_ = VideoQuality::FullHD;
     bool dragging_ = false, viewerHasPicture_ = false, macHintShown_ = false;
     std::optional<InputFocus> lastFocus_;
     bool focusPending_ = false;

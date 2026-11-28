@@ -176,9 +176,9 @@ bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys, const 
     return configured;
 }
 
-void VideoLink::setQuality(VideoQuality quality, bool keepEstimate)
+void VideoLink::setQuality(VideoQuality quality, bool keepEstimate, int fps)
 {
-    const auto ceiling = qualityBitrate(quality);
+    const auto ceiling = qualityBitrate(quality, fps);
     if (ceiling == p_->ceiling)
         return;
     p_->ceiling = ceiling;
@@ -234,7 +234,7 @@ void VideoLink::submit(const QByteArray &annexB, quint32 timestamp)
         return;
     bool key = false;
     if (!validAccessUnit(annexB, key)) {
-        emit failed(tr("硬件编码器返回了无效或不支持的 H.264 画面。"));
+        emit failed(tr("硬件编码器返回了无效或不支持的 H.264 画面。"), timestamp);
         return;
     }
     // Limit queued motion to a short burst. Complete an in-flight reference picture before

@@ -367,6 +367,7 @@ class PairTest : public QObject
         auto ad = bus->advertisements.first();
         auto fields = ad.fields;
         QCOMPARE(fields.value("rtt"), QStringLiteral("1"));
+        QCOMPARE(fields.value("fps"), QStringLiteral("1"));
         const auto index = ad.local.link.interfaceIndex;
         emit bus->resolved(index, "ours", ad.local.port, fields);
         QVERIFY(find.devices().isEmpty());
@@ -380,12 +381,17 @@ class PairTest : public QObject
         const quint16 otherPort = ad.local.port == 1 ? 2 : ad.local.port - 1;
         auto legacy = fields;
         legacy.remove("rtt");
+        legacy.remove("fps");
         emit bus->resolved(index, "one", otherPort, legacy);
         QCOMPARE(find.devices().size(), 1);
         QVERIFY(!find.devices().first().rttProbe);
+        QVERIFY(!find.devices().first().frameRateControl);
         emit bus->resolved(index, "two", ad.local.port, fields);
         QCOMPARE(find.devices().size(), 1);
         QVERIFY(find.devices().first().rttProbe);
+        legacy["rtt"] = "1";
+        emit bus->resolved(index, "one", otherPort, legacy);
+        QVERIFY(find.devices().first().frameRateControl);
         QCOMPARE(find.devices().first().endpoint.port, ad.local.port);
         auto partial = fields;
         partial.remove("desk");
@@ -1118,7 +1124,7 @@ class PairTest : public QObject
         for (const QString &value : {QStringLiteral("TLS 1.3 + SRTP/UDP · 局域网 IPv4"),
                                      QStringLiteral("192.168.1.42:52183"), stats.cipherSuite,
                                      QStringLiteral("1.42 MB/s"), QStringLiteral("11.4 Mbps · 1440p"),
-                                     QStringLiteral("60 fps · 1920 × 1080"),
+                                     QStringLiteral("60 fps / 60 fps · 1920 × 1080"),
                                      QStringLiteral("2.3 ms / 38.0 ms / 0.25%"),
                                      QStringLiteral("H.264 硬编 (Media Foundation)"),
                                      QStringLiteral("Opus 48kHz (SRTP)")})
@@ -1370,6 +1376,79 @@ class PairTest : public QObject
         QSignalSpy accepted(&dialog, &QDialog::accepted);
         QTest::mouseClick(end, Qt::LeftButton);
         QCOMPARE(accepted.size(), 1);
+    }
+
+    void viewerFrameRateControls()
+    {
+        const IsolatedViewerSettings settings;
+        QVERIFY(settings.isValid());
+        DesktopViewer dialog(nullptr, false, true);
+        auto *menu = dialog.sessionMenu()->findChild<QMenu *>("frameRateMenu");
+        auto *center = dialog.findChild<QPushButton *>("controlCenterButton");
+        auto *popup = dialog.findChild<QWidget *>("controlCenterPopup");
+        auto *overlay = dialog.findChild<QWidget *>("statsOverlay");
+        auto *toggle = dialog.findChild<QAction *>("toggleStatsOverlay");
+        QVERIFY(menu && center && popup && overlay && toggle);
+        QCOMPARE(menu->title(), QStringLiteral("帧率上限"));
+        auto *row = popup->findChild<QWidget *>("frameRateSection");
+        auto *notice = popup->findChild<QLabel *>("frameRateFallbackNotice");
+        QVERIFY(row && notice);
+        QVERIFY(!menu->menuAction()->isVisible() && row->isHidden());
+        dialog.showDesktop(true, true);
+        dialog.pictureShown();
+        dialog.show();
+        toggle->setChecked(true);
+        QTest::mouseClick(center, Qt::LeftButton);
+        QTRY_VERIFY(popup->isVisible() && row->isVisible());
+        QVERIFY(menu->menuAction()->isVisible() && notice->isHidden());
+        QCOMPARE(menu->actions().size(), 3);
+        QSignalSpy requests(&dialog, &DesktopViewer::frameRateRequested);
+        int index = 0;
+        for (int fps : {30, 60, 120}) {
+            auto *action = menu->actions().at(index++);
+            auto *button = row->findChild<QPushButton *>(QStringLiteral("frameRate%1").arg(fps));
+            QVERIFY(button && button->isCheckable() && action->isCheckable());
+            QCOMPARE(action->data().toInt(), fps);
+            QCOMPARE(button->text(), QStringLiteral("%1 fps").arg(fps));
+            if (fps == 60)
+                action->trigger();
+            else
+                QTest::mouseClick(button, Qt::LeftButton);
+            QVERIFY(button->isChecked() && action->isChecked());
+            QCOMPARE(requests.size(), index);
+            QCOMPARE(requests.last().first().toInt(), fps);
+            for (auto *other : row->findChildren<QPushButton *>())
+                QCOMPARE(other->isChecked(), other == button);
+        }
+
+        ConnectionStats stats;
+        stats.frameSize = {1920, 1080};
+        stats.framesPerSecond = 118;
+        stats.targetFrameRate = stats.frameRateLimit = 120;
+        auto shows = [overlay](const QString &text) {
+            for (auto *label : overlay->findChildren<QLabel *>())
+                if (label->text() == text)
+                    return true;
+            return false;
+        };
+        dialog.setConnectionStats(stats);
+        QVERIFY(shows(QStringLiteral("118 fps / 120 fps · 1920 × 1080")));
+        dialog.showFrameRate(120, 60, true);
+        QCOMPARE(menu->actions().last()->text(), QStringLiteral("120 fps（当前 60 fps）"));
+        QVERIFY(menu->actions().last()->isChecked());
+        QVERIFY(notice->isVisible());
+        QCOMPARE(notice->text(), QStringLiteral("已自动回退至 60 fps"));
+        stats.framesPerSecond = 59;
+        stats.targetFrameRate = 60;
+        dialog.setConnectionStats(stats);
+        QVERIFY(shows(QStringLiteral("59 fps / 60 fps · 上限 120 fps · 1920 × 1080")));
+        stats.frameRateLimit = 60;
+        stats.framesPerSecond = 0;
+        dialog.setConnectionStats(stats);
+        QVERIFY(shows(QStringLiteral("0 fps（静止保持） · 上限 60 fps · 1920 × 1080")));
+        dialog.showFrameRate(60, 60, false);
+        QVERIFY(row->isHidden() && notice->isHidden() && !menu->menuAction()->isVisible());
+        QCOMPARE(requests.size(), 3);
     }
 
     void viewerStatsCornersAndTrend()

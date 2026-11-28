@@ -26,7 +26,7 @@ struct MacCaptureState : std::enable_shared_from_this<MacCaptureState> {
     SCStream *stream = nil;
     WWMMScreenOutput *sink = nil;
     std::unique_ptr<MacVideoEncoder> encoder;
-    int requestedRate = 0;
+    int actualFps = videoFps, bitrateLimit = videoBitrate, requestedRate = videoBitrate;
     CVPixelBufferRef latest = nullptr;
     std::atomic_bool stopped{false};
     bool force = true, dirty = false, retryScheduled = false;
@@ -43,7 +43,7 @@ struct MacCaptureState : std::enable_shared_from_this<MacCaptureState> {
         // Keep the last edit on a static screen even when all encoder slots were busy.
         retryScheduled = true;
         auto s = shared_from_this();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_MSEC), queue, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (actualFps > videoFps ? 2 : 6) * NSEC_PER_MSEC), queue, ^{
           s->retryScheduled = false;
           s->submitLatest();
         });
@@ -71,11 +71,14 @@ class MacCapture final : public DesktopCapture
     std::shared_ptr<MacCaptureState> s_ = std::make_shared<MacCaptureState>();
 
   public:
-    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected, VideoQuality quality, bool showCursor)
+    MacCapture(EncodedFrame output, MediaError failure, CGDirectDisplayID selected, VideoQuality quality,
+               bool showCursor, int actualFps)
     {
         auto s = s_;
         s->output = std::move(output);
         s->failure = std::move(failure);
+        s->actualFps = actualFps;
+        s->requestedRate = s->bitrateLimit = qualityBitrate(quality, actualFps);
         [SCShareableContent
             getShareableContentExcludingDesktopWindows:NO
                                    onScreenWindowsOnly:YES
@@ -109,16 +112,16 @@ class MacCapture final : public DesktopCapture
                                          auto cfg = [SCStreamConfiguration new];
                                          cfg.width = size.width();
                                          cfg.height = size.height();
-                                         cfg.minimumFrameInterval = CMTimeMake(1, videoFps);
+                                         cfg.minimumFrameInterval = CMTimeMake(1, actualFps);
                                          cfg.captureResolution = SCCaptureResolutionBest;
-                                         cfg.queueDepth = 3;
+                                         cfg.queueDepth = actualFps > videoFps ? 4 : 3;
                                          cfg.showsCursor = showCursor;
                                          cfg.capturesAudio = NO;
                                          cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
                                          cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
                                          s->encoder =
                                              std::make_unique<MacVideoEncoder>(s->output, s->failure);
-                                         if (!s->encoder->open(size, s->requestedRate ? s->requestedRate : qualityBitrate(quality)))
+                                         if (!s->encoder->open(size, s->requestedRate, actualFps))
                                              return;
                                          s->sink = [WWMMScreenOutput new];
                                          s->sink->owner = s;
@@ -147,9 +150,9 @@ class MacCapture final : public DesktopCapture
     {
         auto s = s_;
         dispatch_async(s->queue, ^{
-          s->requestedRate = rate;
+          s->requestedRate = qMin(rate, s->bitrateLimit);
           if (!s->stopped && s->encoder)
-              s->encoder->setBitrate(rate);
+              s->encoder->setBitrate(s->requestedRate);
         });
     }
     void refresh() override
@@ -203,11 +206,38 @@ QList<DesktopDisplay> desktopDisplays()
     return displays;
 }
 
-std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
-                                               VideoQuality quality, bool showCursor, std::function<void()>)
+static double displayRefreshRate(CGDirectDisplayID display)
 {
-    return std::make_unique<MacCapture>(std::move(output), std::move(error),
-                                        display ? CGDirectDisplayID(display) : CGMainDisplayID(), quality, showCursor);
+    // AppKit 在主线程上提供可变刷新率屏幕的上限，其他线程直接读取 Core Graphics 模式。
+    if (NSThread.isMainThread) {
+        for (NSScreen *screen in NSScreen.screens)
+            if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == display &&
+                screen.maximumFramesPerSecond > 0)
+                return double(screen.maximumFramesPerSecond);
+    }
+    auto mode = CGDisplayCopyDisplayMode(display);
+    if (!mode)
+        return 0;
+    const double hz = CGDisplayModeGetRefreshRate(mode);
+    CGDisplayModeRelease(mode);
+    return hz;
+}
+
+std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
+                                               VideoQuality quality, bool showCursor, std::function<void()>,
+                                               int fps, std::function<void(int, QString)> frameRateFallback)
+{
+    const auto selected = display ? CGDirectDisplayID(display) : CGMainDisplayID();
+    int actualFps = validFrameRate(fps) ? fps : videoFps;
+    if (actualFps > videoFps) {
+        const auto refreshHz = displayRefreshRate(selected);
+        if (refreshHz > 0 && refreshHz < 90) {
+            actualFps = videoFps;
+            if (frameRateFallback)
+                frameRateFallback(actualFps, QStringLiteral("当前显示器刷新率为 %1 Hz，已自动回退至 60 fps。").arg(refreshHz));
+        }
+    }
+    return std::make_unique<MacCapture>(std::move(output), std::move(error), selected, quality, showCursor, actualFps);
 }
 } // namespace wwmm
 @implementation WWMMScreenOutput

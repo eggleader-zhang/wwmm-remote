@@ -358,14 +358,14 @@ class ControlCenterPopup final : public QWidget {
     Q_DECLARE_TR_FUNCTIONS(ControlCenterPopup)
   public:
     struct Actions {
-        QMenu *quality, *shortcuts;
+        QMenu *quality, *frameRate, *shortcuts;
         QAction *fit, *original, *fullscreen, *sound, *localCursor, *remoteCursor, *macKeys, *stats, *end;
     };
 
     ControlCenterPopup(DesktopViewer *viewer, QPushButton *anchor, const Actions &actions)
         : QWidget(viewer, Qt::Popup | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint),
           viewer_(viewer), anchor_(anchor), menu_(viewer->sessionMenu()), quality_(actions.quality),
-          shortcuts_(actions.shortcuts), stats_(actions.stats)
+          frameRate_(actions.frameRate), shortcuts_(actions.shortcuts), stats_(actions.stats)
     {
         setObjectName("controlCenterPopup");
         setAccessibleName(tr("控制中心"));
@@ -390,6 +390,21 @@ class ControlCenterPopup final : public QWidget {
         qualityNotice_->setObjectName("adaptiveQualityNotice");
         qualityNotice_->hide();
         qualityLayout->addWidget(qualityNotice_);
+
+        auto *frameRateLayout = addSection(column, tr("帧率"), false);
+        frameRateSection_ = frameRateLayout->parentWidget();
+        frameRateSection_->setObjectName("frameRateSection");
+        auto *rates = addSegments(frameRateLayout);
+        for (auto *action : frameRate_->actions()) {
+            auto *button = addButton(rates->parentWidget());
+            button->setObjectName(QStringLiteral("frameRate%1").arg(action->data().toInt()));
+            rates->addWidget(button, 1);
+            bind({button, action, action->text()});
+        }
+        frameRateNotice_ = new QLabel(frameRateSection_);
+        frameRateNotice_->setObjectName("frameRateFallbackNotice");
+        frameRateNotice_->hide();
+        frameRateLayout->addWidget(frameRateNotice_);
 
         auto *display = addSection(column, tr("显示"), false);
         auto *displayRow = new QHBoxLayout;
@@ -466,7 +481,7 @@ class ControlCenterPopup final : public QWidget {
         column->addWidget(end);
         bind({.button = end, .action = actions.end, .dismiss = true});
 
-        for (auto *menu : {menu_, quality_, shortcuts_})
+        for (auto *menu : {menu_, quality_, frameRate_, shortcuts_})
             if (menu)
                 menu->installEventFilter(this);
         syncActions();
@@ -515,6 +530,12 @@ class ControlCenterPopup final : public QWidget {
         cornerGroup_->button(int(corner))->setChecked(true);
     }
 
+    void setFrameRate(int limit, int active)
+    {
+        frameRateNotice_->setText(active < limit ? tr("已自动回退至 %1 fps").arg(active) : QString{});
+        frameRateNotice_->setVisible(active < limit);
+    }
+
     void setDark(bool dark)
     {
         dark_ = dark;
@@ -523,6 +544,7 @@ class ControlCenterPopup final : public QWidget {
             QLabel { color: %1; }
             QLabel#popupSectionTitle { color: %2; font-weight: 600; }
             QLabel#adaptiveQualityNotice { color: %2; padding-left: 4px; }
+            QLabel#frameRateFallbackNotice { color: %2; padding-left: 4px; font-size: 11px; }
             QFrame#popupDivider { background: %3; }
             QWidget#popupSegments { background: %4; border-radius: 9px; }
             QPushButton { color: %1; background: %4; border: 1px solid %3; border-radius: 7px; padding: 3px 6px; }
@@ -679,15 +701,16 @@ class ControlCenterPopup final : public QWidget {
         }
         qualitySection_->setVisible(quality_->menuAction()->isVisible());
         qualitySection_->setEnabled(quality_->menuAction()->isEnabled());
+        frameRateSection_->setVisible(frameRate_->menuAction()->isVisible());
         cornerGroup_->buttons().constFirst()->parentWidget()->setVisible(stats_->isVisible());
     }
 
     DesktopViewer *viewer_;
     QPushButton *anchor_;
-    QMenu *menu_, *quality_, *shortcuts_;
+    QMenu *menu_, *quality_, *frameRate_, *shortcuts_;
     QAction *stats_;
-    QWidget *qualitySection_;
-    QLabel *qualityNotice_;
+    QWidget *qualitySection_, *frameRateSection_;
+    QLabel *qualityNotice_, *frameRateNotice_;
     QButtonGroup *cornerGroup_;
     QList<ActionControl> controls_;
     QList<PopupSwitch *> switches_;
@@ -902,8 +925,16 @@ class StatsOverlay final : public QWidget {
             else if (stats.peer.address.protocol() == QAbstractSocket::IPv6Protocol)
                 protocol += tr(" · 局域网 IPv6");
         }
-        auto frameRate = stats.framesPerSecond == 0 && pictureShown
-                             ? tr("0 fps（静止保持）") : tr("%1 fps").arg(stats.framesPerSecond);
+        const bool still = stats.framesPerSecond == 0 && pictureShown;
+        auto frameRate = still ? tr("0 fps（静止保持）") : tr("%1 fps").arg(stats.framesPerSecond);
+        if (stats.targetFrameRate > 0) {
+            if (!still)
+                frameRate += tr(" / %1 fps").arg(stats.targetFrameRate);
+            else if (stats.targetFrameRate != stats.frameRateLimit)
+                frameRate += tr(" · 当前目标 %1 fps").arg(stats.targetFrameRate);
+            if (stats.frameRateLimit > 0 && (still || stats.targetFrameRate != stats.frameRateLimit))
+                frameRate += tr(" · 上限 %1 fps").arg(stats.frameRateLimit);
+        }
         if (!stats.frameSize.isEmpty())
             frameRate += tr(" · %1 × %2").arg(stats.frameSize.width()).arg(stats.frameSize.height());
         QString encoder = tr("H.264 硬件编码");
@@ -1134,6 +1165,19 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich, const
         emit qualityRequested(VideoQuality(action->data().toInt()));
         focusVideo();
     });
+    frameRate_ = menu->addMenu(tr("帧率上限"));
+    frameRate_->setObjectName("frameRateMenu");
+    auto *rates = new QActionGroup(frameRate_);
+    for (int fps : {30, 60, 120}) {
+        auto *action = frameRate_->addAction(tr("%1 fps").arg(fps));
+        action->setCheckable(true);
+        action->setData(fps);
+        rates->addAction(action);
+    }
+    connect(frameRate_, &QMenu::triggered, this, [this](QAction *action) {
+        emit frameRateRequested(action->data().toInt());
+        focusVideo();
+    });
     auto *scale = new QActionGroup(menu);
     fit_ = menu->addAction(tr("适应窗口"));
     original_ = menu->addAction(tr("原始像素（1:1）"));
@@ -1205,7 +1249,8 @@ DesktopViewer::DesktopViewer(QWidget *parent, bool interactive, bool rich, const
     connect(end, &QAction::triggered, this, &QDialog::accept);
 
     popup_ = new ControlCenterPopup(this, controlCenter_, {
-        .quality = quality_, .shortcuts = shortcuts_, .fit = fit_, .original = original_, .fullscreen = fullScreen_,
+        .quality = quality_, .frameRate = frameRate_, .shortcuts = shortcuts_,
+        .fit = fit_, .original = original_, .fullscreen = fullScreen_,
         .sound = sound_, .localCursor = cursorActions.value(0), .remoteCursor = cursorActions.value(1),
         .macKeys = interactive ? macKeysAction : nullptr, .stats = stats_, .end = end});
     connect(controlCenter_, &QPushButton::clicked, popup_, &ControlCenterPopup::open);
@@ -1589,6 +1634,7 @@ void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
     displayTabs_->setEnabled(false);
     displays_->menuAction()->setVisible(false);
     quality_->menuAction()->setVisible(false);
+    frameRate_->menuAction()->setVisible(false);
     sound_->setVisible(false);
     collaboration_->setVisible(false);
     monitoring_->setVisible(false);
@@ -1605,7 +1651,19 @@ void DesktopViewer::showInterrupted(const QString &message, bool canRetry)
     setConnectionStats({});
 }
 
-void DesktopViewer::showDesktop(bool rich)
+void DesktopViewer::showFrameRate(int limit, int active, bool supported)
+{
+    frameRate_->menuAction()->setVisible(supported);
+    for (auto *action : frameRate_->actions()) {
+        const int fps = action->data().toInt();
+        action->setText(fps == limit && active != limit ? tr("%1 fps（当前 %2 fps）").arg(fps).arg(active)
+                                                         : tr("%1 fps").arg(fps));
+        action->setChecked(fps == limit);
+    }
+    popup_->setFrameRate(limit, active);
+}
+
+void DesktopViewer::showDesktop(bool rich, bool frameRateControl)
 {
     pages_->setCurrentIndex(0);
     displayTabs_->setEnabled(true);
@@ -1615,6 +1673,7 @@ void DesktopViewer::showDesktop(bool rich)
     collaboration_->setVisible(rich);
     sound_->setVisible(rich);
     showQuality(VideoQuality::FullHD, VideoQuality::FullHD);
+    showFrameRate(videoFps, videoFps, rich && frameRateControl);
     setDisplays({}, 0);
     showSound(false, false);
     preedit_.clear();

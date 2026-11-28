@@ -16,11 +16,14 @@
 #include <wmcodecdsp.h>
 #include <wrl/client.h>
 #include <QtEndian>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <utility>
 
 namespace wwmm
 {
@@ -52,14 +55,14 @@ struct Runtime {
         RoUninitialize();
     }
 };
-ComPtr<IMFMediaType> videoType(GUID subtype, QSize size)
+ComPtr<IMFMediaType> videoType(GUID subtype, QSize size, int fps = videoFps)
 {
     ComPtr<IMFMediaType> mt;
     check(MFCreateMediaType(&mt), "创建视频格式失败");
     check(mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "设置视频格式失败");
     check(mt->SetGUID(MF_MT_SUBTYPE, subtype), "设置视频子类型失败");
     check(MFSetAttributeSize(mt.Get(), MF_MT_FRAME_SIZE, size.width(), size.height()), "设置视频尺寸失败");
-    MFSetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, videoFps, 1);
+    check(MFSetAttributeRatio(mt.Get(), MF_MT_FRAME_RATE, UINT32(fps), 1), "设置视频帧率失败");
     MFSetAttributeRatio(mt.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
     mt->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     mt->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
@@ -94,6 +97,7 @@ struct Gpu {
     ComPtr<ID3D11VideoProcessorEnumerator> modes;
     ComPtr<ID3D11VideoProcessor> processor;
     QSize inSize, outSize;
+    int processorFps = 0;
 
     explicit Gpu(bool capturing, quint64 display = 0)
     {
@@ -157,17 +161,18 @@ struct Gpu {
     }
     void blit(ID3D11Texture2D *src, UINT slice, QSize input, ID3D11Texture2D *dst, QSize outputSize,
               bool encoding, DXGI_MODE_ROTATION rotation = DXGI_MODE_ROTATION_IDENTITY, UINT dstSlice = 0,
-              VideoViewport viewport = {})
+              VideoViewport viewport = {}, int fps = videoFps)
     {
-        if (input != inSize || outputSize != outSize) {
+        if (input != inSize || outputSize != outSize || fps != processorFps) {
             processor.Reset();
             modes.Reset();
             inSize = input;
             outSize = outputSize;
+            processorFps = fps;
             D3D11_VIDEO_PROCESSOR_CONTENT_DESC d{};
             d.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
-            d.InputFrameRate = {60, 1};
-            d.OutputFrameRate = {60, 1};
+            d.InputFrameRate = {UINT(fps), 1};
+            d.OutputFrameRate = d.InputFrameRate;
             d.InputWidth = input.width();
             d.InputHeight = input.height();
             d.OutputWidth = outSize.width();
@@ -226,13 +231,13 @@ struct Gpu {
         check(vctx->VideoProcessorBlt(processor.Get(), ov.Get(), 0, 1, &stream), "GPU 视频转换失败");
     }
 };
-ComPtr<IMFSample> makeSample(IMFMediaBuffer *buf, LONGLONG time)
+ComPtr<IMFSample> makeSample(IMFMediaBuffer *buf, LONGLONG time, int fps = videoFps)
 {
     ComPtr<IMFSample> s;
     check(MFCreateSample(&s), "创建视频样本失败");
     check(s->AddBuffer(buf), "添加视频缓冲失败");
     s->SetSampleTime(time);
-    s->SetSampleDuration(10000000 / videoFps);
+    s->SetSampleDuration(10000000 / fps);
     return s;
 }
 struct Transform {
@@ -409,7 +414,7 @@ QByteArray parameterSets(IMFTransform *mft, DWORD id, int &lengthSize)
     return out;
 }
 
-std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size, int bitrate)
+std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size, int bitrate, int fps = videoFps)
 {
     MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12},
         output{MFMediaType_Video, MFVideoFormat_H264};
@@ -426,12 +431,12 @@ std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size, int bitrate)
                 try {
                     auto t = std::make_unique<Transform>();
                     t->setup(candidate.Get(), gpu);
-                    auto compressed = videoType(MFVideoFormat_H264, size);
+                    auto compressed = videoType(MFVideoFormat_H264, size, fps);
                     compressed->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
                     compressed->SetUINT32(MF_MT_MPEG2_PROFILE, 77);
-                    auto raw = videoType(MFVideoFormat_NV12, size);
+                    auto raw = videoType(MFVideoFormat_NV12, size, fps);
                     codecValue(candidate.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-                    codecValue(candidate.Get(), CODECAPI_AVEncMPVGOPSize, 60);
+                    codecValue(candidate.Get(), CODECAPI_AVEncMPVGOPSize, ULONG(fps));
                     check(candidate->SetOutputType(t->outID, compressed.Get(), 0), "H.264 输出格式不可用");
                     check(candidate->SetInputType(t->inID, raw.Get(), 0), "硬件 NV12 输入不可用");
                     t->start();
@@ -448,7 +453,7 @@ std::unique_ptr<Transform> hardwareEncoder(Gpu &gpu, QSize size, int bitrate)
         throw Failure{QStringLiteral("当前显卡没有可用的 D3D11 H.264 硬件编码器。请检查显卡驱动。")};
     return result;
 }
-ComPtr<IMFVideoSampleAllocatorEx> encoderSurfaces(Gpu &gpu, Transform &encoder, QSize size)
+ComPtr<IMFVideoSampleAllocatorEx> encoderSurfaces(Gpu &gpu, Transform &encoder, QSize size, int fps = videoFps)
 {
     ComPtr<IMFVideoSampleAllocatorEx> pool;
     check(MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&pool)), "创建编码纹理池失败");
@@ -459,7 +464,7 @@ ComPtr<IMFVideoSampleAllocatorEx> encoderSurfaces(Gpu &gpu, Transform &encoder, 
         hints->GetUINT32(MF_SA_D3D11_BINDFLAGS, &flags);
     check(MFCreateAttributes(&attrs, 1), "创建编码纹理属性失败");
     check(attrs->SetUINT32(MF_SA_D3D11_BINDFLAGS, flags | D3D11_BIND_RENDER_TARGET), "设置编码纹理属性失败");
-    auto raw = videoType(MFVideoFormat_NV12, size);
+    auto raw = videoType(MFVideoFormat_NV12, size, fps);
     check(pool->InitializeSampleAllocatorEx(2, 8, attrs.Get(), raw.Get()), "分配 NV12 编码纹理失败");
     return pool;
 }
@@ -471,6 +476,8 @@ class WinCapture final : public DesktopCapture
     VideoQuality quality_;
     bool showCursor_;
     std::function<void()> cursorUnavailable_;
+    int fps_;
+    std::function<void(int, QString)> frameRateFallback_;
     std::atomic_bool stopped_{false}, refresh_{true};
     std::atomic_int requestedRate_{0};
     std::atomic<qint64> responsiveUntil_{0};
@@ -479,6 +486,16 @@ class WinCapture final : public DesktopCapture
     {
         Runtime runtime;
         Gpu gpu(true, display_);
+        int actualFps = fps_;
+        DEVMODEW mode{};
+        mode.dmSize = WORD(sizeof(mode));
+        if (actualFps > videoFps && EnumDisplaySettingsW(gpu.screen.DeviceName, ENUM_CURRENT_SETTINGS, &mode) &&
+            mode.dmDisplayFrequency > 1 && mode.dmDisplayFrequency < 90) {
+            actualFps = videoFps;
+            if (frameRateFallback_)
+                frameRateFallback_(actualFps, QStringLiteral("当前显示器刷新率为 %1 Hz，已自动回退至 60 fps。")
+                                                  .arg(mode.dmDisplayFrequency));
+        }
         ComPtr<IDXGIOutputDuplication> dup;
         CursorlessCapture cursorless;
         ComPtr<ID3D11Texture2D> desktop;
@@ -500,8 +517,9 @@ class WinCapture final : public DesktopCapture
         auto rect = gpu.screen.DesktopCoordinates;
         auto size = desktopSize({int(rect.right - rect.left), int(rect.bottom - rect.top)}, quality_);
         DesktopPointer pointer(gpu.device.Get(), gpu.context.Get(), gpu.screen.Rotation);
-        auto encoder = hardwareEncoder(gpu, size, qualityBitrate(quality_));
-        auto pool = encoderSurfaces(gpu, *encoder, size);
+        const int bitrateLimit = qualityBitrate(quality_, actualFps);
+        auto encoder = hardwareEncoder(gpu, size, bitrateLimit, actualFps);
+        auto pool = encoderSurfaces(gpu, *encoder, size, actualFps);
         int lengthSize = 4;
         auto params = parameterSets(encoder->mft.Get(), encoder->outID, lengthSize);
         auto encoded = [&](IMFSample *sample) {
@@ -528,16 +546,17 @@ class WinCapture final : public DesktopCapture
             output_(std::move(data), rtpTime(time / 10), idr);
         };
         qint64 next = 0;
+        const qint64 interval = 1000000 / actualFps;
         bool dirty = false, havePicture = false;
         while (!stopped_) {
             if (int rate = requestedRate_.exchange(0))
-                codecValue(encoder->mft.Get(), CODECAPI_AVEncCommonMeanBitRate, ULONG(rate));
+                codecValue(encoder->mft.Get(), CODECAPI_AVEncCommonMeanBitRate, ULONG(std::min(rate, bitrateLimit)));
             encoder->poll();
             encoder->drain([] { throw Failure{QStringLiteral("硬件编码输出格式已变化，请重新共享。")}; },
                            encoded);
             const bool idle = next && !dirty && !refresh_.load() && videoClockUs() - next > 100000;
             const bool responding = videoClockUs() < responsiveUntil_.load(std::memory_order_relaxed);
-            const DWORD timeout = responding ? 1 : (idle ? 32 : 4);
+            const DWORD timeout = responding || (!idle && actualFps > videoFps) ? 1 : (idle ? 32 : 4);
             DXGI_OUTDUPL_FRAME_INFO info{};
             ComPtr<IDXGIResource> resource;
             auto hr = showCursor_ ? dup->AcquireNextFrame(timeout, &info, &resource)
@@ -584,18 +603,17 @@ class WinCapture final : public DesktopCapture
             if (showCursor_)
                 check(pointer.draw(desktop.Get()), "绘制桌面指针失败");
             const auto rotation = showCursor_ ? gpu.screen.Rotation : DXGI_MODE_ROTATION_IDENTITY;
-            gpu.blit(desktop.Get(), 0, inputSize, nv12.Get(), size, true, rotation, slice);
+            gpu.blit(desktop.Get(), 0, inputSize, nv12.Get(), size, true, rotation, slice, {}, actualFps);
             if (showCursor_)
                 pointer.restore(desktop.Get());
             check(buf->SetCurrentLength(DWORD(size.width() * size.height() * 3 / 2)),
                   "设置 NV12 视频长度失败");
             check(sample->SetSampleTime(now * 10), "设置视频时间失败");
-            check(sample->SetSampleDuration(10000000 / videoFps), "设置视频时长失败");
+            check(sample->SetSampleDuration(10000000 / actualFps), "设置视频时长失败");
             const bool key = refresh_.exchange(false);
             if (key)
                 codecValue(encoder->mft.Get(), CODECAPI_AVEncVideoForceKeyFrame, 1);
             if (encoder->submit(sample.Get())) {
-                constexpr qint64 interval = 1000000 / videoFps;
                 next = next && now - next < interval ? next + interval : now + interval;
                 dirty = false;
             } else if (key)
@@ -605,9 +623,10 @@ class WinCapture final : public DesktopCapture
 
   public:
     WinCapture(EncodedFrame output, MediaError failure, quint64 display, VideoQuality quality, bool showCursor,
-               std::function<void()> cursorUnavailable)
+               std::function<void()> cursorUnavailable, int fps, std::function<void(int, QString)> frameRateFallback)
         : output_(std::move(output)), failure_(std::move(failure)), display_(display), quality_(quality),
           showCursor_(showCursor), cursorUnavailable_(std::move(cursorUnavailable)),
+          fps_(validFrameRate(fps) ? fps : videoFps), frameRateFallback_(std::move(frameRateFallback)),
           thread_([this] {
               try {
                   run();
@@ -646,19 +665,40 @@ class WinPlayer final : public DesktopPlayer
     std::deque<Frame> queue_;
     bool stopped_ = false, needIdr_ = true;
     bool repaint_ = false;
+    std::atomic_int fps_{videoFps};
+    std::atomic_bool failed_{false};
     VideoViewport viewport_;
     std::thread thread_;
     void run()
     {
         Runtime runtime;
         Gpu gpu(false);
-        ComPtr<IMFTransform> codec;
-        check(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&codec)),
-              "系统 H.264 解码器不可用");
-        Transform decoder;
-        decoder.setup(codec.Get(), gpu);
-        QSize picture, display;
+        QSize display;
         ComPtr<IDXGISwapChain1> swap;
+        int decoderFps = fps_.load();
+        for (;;) {
+            try {
+                decode(gpu, swap, display, decoderFps);
+                return;
+            } catch (const Failure &error) {
+                if (decoderFps <= videoFps)
+                    throw;
+                if (decoderFps == fps_)
+                    failure_(error.text);
+                // 等待共享端确认降帧。交换链在重试期间继续显示最后一帧。
+                std::unique_lock lock(mutex_);
+                available_.wait(lock, [&] { return stopped_ || fps_ != decoderFps; });
+                if (stopped_)
+                    return;
+                decoderFps = fps_.load();
+            }
+        }
+    }
+    void decode(Gpu &gpu, ComPtr<IDXGISwapChain1> &swap, QSize &display, int &decoderFps)
+    {
+        ComPtr<IMFTransform> codec;
+        Transform decoder;
+        QSize picture;
         auto nv12 = [&] {
             for (DWORD i = 0;; ++i) {
                 ComPtr<IMFMediaType> mt;
@@ -698,7 +738,7 @@ class WinPlayer final : public DesktopPlayer
                 desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
                 desc.SampleDesc.Count = 1;
                 desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-                desc.BufferCount = 2;
+                desc.BufferCount = 3;
                 desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
                 check(gpu.factory->CreateSwapChainForHwnd(gpu.device.Get(), view_, &desc, nullptr, nullptr,
                                                           &swap),
@@ -709,7 +749,8 @@ class WinPlayer final : public DesktopPlayer
             display = output;
             ComPtr<ID3D11Texture2D> surface;
             check(swap->GetBuffer(0, IID_PPV_ARGS(&surface)), "无法获取显示面");
-            gpu.blit(tex.Get(), slice, picture, surface.Get(), output, false, DXGI_MODE_ROTATION_IDENTITY, 0, viewport);
+            gpu.blit(tex.Get(), slice, picture, surface.Get(), output, false, DXGI_MODE_ROTATION_IDENTITY, 0,
+                     viewport, decoderFps);
             auto hr = swap->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
             if (hr == DXGI_ERROR_WAS_STILL_DRAWING || hr == DXGI_STATUS_OCCLUDED)
                 return;
@@ -756,11 +797,20 @@ class WinPlayer final : public DesktopPlayer
                 continue;
             }
             auto size = h264PictureSize(pending->data);
-            if (size.isValid() && size != picture) {
-                if (picture.isValid())
+            const int fps = fps_.load();
+            if (size.isValid() && (size != picture || fps != decoderFps)) {
+                if (picture.isValid() && size != picture)
                     throw Failure{QStringLiteral("远端显示尺寸已改变，请重新请求桌面。")};
+                // 在新关键帧处重建解码格式，保留交换链上的上一幅画面。
+                decoderFps = fps;
+                latest.Reset();
+                decoder = {};
+                codec.Reset();
+                check(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&codec)),
+                      "系统 H.264 解码器不可用");
+                decoder.setup(codec.Get(), gpu);
                 picture = size;
-                auto input = videoType(MFVideoFormat_H264, picture);
+                auto input = videoType(MFVideoFormat_H264, picture, decoderFps);
                 QByteArray config;
                 for (auto unit : h264Units(pending->data))
                     if ((quint8(unit[0]) & 31) == 7 || (quint8(unit[0]) & 31) == 8)
@@ -786,7 +836,7 @@ class WinPlayer final : public DesktopPlayer
             buf->Unlock();
             buf->SetCurrentLength(DWORD(pending->data.size()));
             // Convert the 90 kHz RTP timestamp to Media Foundation's 100 ns timebase.
-            auto sample = makeSample(buf.Get(), (LONGLONG(pending->stamp) * 1000 + 8) / 9);
+            auto sample = makeSample(buf.Get(), (LONGLONG(pending->stamp) * 1000 + 8) / 9, decoderFps);
             if (decoder.submit(sample.Get()))
                 pending.reset();
             decoder.poll();
@@ -801,10 +851,18 @@ class WinPlayer final : public DesktopPlayer
               try {
                   run();
               } catch (const Failure &e) {
+                  failed_ = true;
                   failure_(e.text);
               }
           })
     {
+    }
+    bool setFrameRate(int fps) override
+    {
+        std::lock_guard lock(mutex_);
+        fps_ = fps;
+        available_.notify_one();
+        return !failed_;
     }
     void setViewport(VideoViewport viewport) override
     {
@@ -877,10 +935,11 @@ QList<DesktopDisplay> desktopDisplays()
 }
 
 std::unique_ptr<DesktopCapture> captureDesktop(EncodedFrame output, MediaError error, quint64 display,
-                                               VideoQuality quality, bool showCursor, std::function<void()> cursorUnavailable)
+                                               VideoQuality quality, bool showCursor, std::function<void()> cursorUnavailable,
+                                               int fps, std::function<void(int, QString)> frameRateFallback)
 {
     return std::make_unique<WinCapture>(std::move(output), std::move(error), display, quality, showCursor,
-                                        std::move(cursorUnavailable));
+                                        std::move(cursorUnavailable), fps, std::move(frameRateFallback));
 }
 std::unique_ptr<DesktopPlayer> playDesktop(quintptr view, PresentedFrame present, MediaError failure)
 {

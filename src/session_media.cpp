@@ -6,7 +6,7 @@ namespace wwmm {
 void DesktopSession::appendMediaOptions(QByteArray &message) const
 {
     if (cursorProtocol_) {
-        message.append(char(rttProtocol_ ? 17 : 16));
+        message.append(char(frameRateProtocol_ ? 18 : rttProtocol_ ? 17 : 16));
         message.append(char(captureCursor_));
     } else if (rich_) {
         message.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
@@ -82,6 +82,60 @@ bool DesktopSession::reduceQuality()
     return true;
 }
 
+void DesktopSession::chooseFrameRate(int fps)
+{
+    if (state_ == Viewing && frameRateProtocol_ && validFrameRate(fps) &&
+        !control_->send(QByteArray("G") + char(fps)))
+        interrupt(tr("帧率设置连接已断开。"));
+}
+
+void DesktopSession::applyFrameRate(int fps, bool restartCapture)
+{
+    const int active = qMin(fps, hardwareFrameRateLimit_);
+    const bool changed = active != frameRate_;
+    frameRate_ = active;
+    if (!control_->send(QByteArray("g") + char(active) + char(frameRateLimit_)))
+        return interrupt(tr("帧率设置连接已断开。"));
+    if (changed)
+        updateVideoBitrate();
+    emit frameRateChanged();
+    emit connectionStatsChanged();
+    if (changed && restartCapture && display_)
+        startDisplay(display_, adaptive_ && displayReady_);
+}
+
+bool DesktopSession::reduceFrameRate(const QString &reason)
+{
+    if (!frameRateProtocol_ || frameRate_ <= videoFps || (state_ != Sharing && state_ != Viewing))
+        return false;
+    if (state_ == Sharing) {
+        hardwareFrameRateLimit_ = videoFps;
+        applyFrameRate(videoFps);
+        if (state_ == Sharing)
+            emit notice(reason.isEmpty() ? tr("当前硬件或显示器不支持 120 fps，已自动回退至 60 fps。") : reason);
+    } else if (!frameRateFallbackPending_) {
+        frameRateFallbackPending_ = true;
+        stateClock_.restart();
+        if (!control_->send(QByteArray("h") + char(frameRate_)))
+            interrupt(tr("帧率设置连接已断开。"));
+        else
+            emit notice(reason.isEmpty() ? tr("当前硬件无法显示 120 fps，已请求回退至 60 fps。") : reason);
+    }
+    return true;
+}
+
+void DesktopSession::reportFrameRateFallback(int activeFps, const QString &reason)
+{
+    if (state_ != Sharing || !frameRateProtocol_ || !validFrameRate(activeFps) || activeFps >= frameRate_)
+        return;
+    const int previous = frameRate_;
+    hardwareFrameRateLimit_ = activeFps;
+    applyFrameRate(activeFps, false);
+    if (state_ == Sharing)
+        emit notice(reason.isEmpty() ? tr("当前硬件或显示器不支持 %1 fps，已自动回退至 %2 fps。")
+                                          .arg(previous).arg(activeFps) : reason);
+}
+
 void DesktopSession::enableSound(bool enable)
 {
     if (!rich_ || (state_ != Viewing && state_ != Sharing) || enable == localSound())
@@ -115,6 +169,40 @@ void DesktopSession::syncSound()
 
 bool DesktopSession::mediaMessage(const QByteArray &data)
 {
+    if (frameRateProtocol_ && data.size() >= 2) {
+        const int fps = quint8(data[1]);
+        if (state_ == Sharing && data.size() == 2 && validFrameRate(fps)) {
+            if (data[0] == 'G') {
+                hardwareFrameRateLimit_ = 120;
+                frameRateLimit_ = fps;
+                applyFrameRate(fps);
+                return true;
+            }
+            if (data[0] == 'h') {
+                if (fps == frameRate_)
+                    reduceFrameRate();
+                return true;
+            }
+        }
+        if (state_ == Viewing && data.size() == 3 && data[0] == 'g') {
+            const int limit = quint8(data[2]);
+            if (!validFrameRate(fps) || !validFrameRate(limit) || fps > limit)
+                return false;
+            const bool fallback = fps < limit && !frameRateFallbackPending_ &&
+                                  (fps != frameRate_ || limit != frameRateLimit_);
+            if (fps != frameRate_ && !received_)
+                stateClock_.restart();
+            frameRate_ = fps;
+            frameRateLimit_ = limit;
+            if (fps <= videoFps)
+                frameRateFallbackPending_ = false;
+            emit frameRateChanged();
+            emit connectionStatsChanged();
+            if (fallback)
+                emit notice(tr("已自动回退至 %1 fps。").arg(fps));
+            return true;
+        }
+    }
     if (rttProtocol_ && data.size() == 5) {
         if (state_ == Sharing && data[0] == 'k') {
             auto reply = data;

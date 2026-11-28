@@ -66,7 +66,12 @@ struct Node {
     }
     NearbyDevice target()
     {
-        auto ep = probe.endpoints().first();
+        const auto endpoints = probe.endpoints();
+        if (endpoints.isEmpty()) {
+            QTest::qFail(qPrintable(probe.listenIssue()), __FILE__, __LINE__);
+            return {};
+        }
+        const auto &ep = endpoints.first();
         return {store.publicKey(), "Peer", localOS(), {ep.link.address, ep.port}, ep.link};
     }
 };
@@ -693,6 +698,191 @@ class DesktopTest final : public QObject
         for (int ms = 30500; ms <= 50000; ms += 500)
             tier = policy.observe(tier, VideoQuality::FullHD, ms, 0, 3, false);
         QCOMPARE(tier, VideoQuality::FullHD);
+    }
+
+    void frameRateBitrates()
+    {
+        for (int fps : {-1, 0, 24, 59, 90, 121, 240})
+            QVERIFY(!validFrameRate(fps));
+        for (int fps : {30, 60, 120})
+            QVERIFY(validFrameRate(fps));
+        struct Caps {
+            VideoQuality quality;
+            int at30, at60, at120;
+        };
+        const Caps caps[] = {{VideoQuality::HD, 6000000, 9000000, 14000000},
+                             {VideoQuality::FullHD, 13000000, 20000000, 30000000},
+                             {VideoQuality::QHD, 21000000, 32000000, 48000000},
+                             {VideoQuality::UHD, 32000000, 50000000, 70000000}};
+        VideoLink link(true);
+        QSignalSpy bitrates(&link, &VideoLink::bitrateChanged);
+        for (const auto &cap : caps) {
+            QCOMPARE(qualityBitrate(cap.quality, 30), cap.at30);
+            QCOMPARE(qualityBitrate(cap.quality, 60), cap.at60);
+            QCOMPARE(qualityBitrate(cap.quality), cap.at60);
+            QCOMPARE(qualityBitrate(cap.quality, 90), cap.at60);
+            QCOMPARE(qualityBitrate(cap.quality, 120), cap.at120);
+            bitrates.clear();
+            link.setQuality(cap.quality, false, 120);
+            link.setQuality(cap.quality, true, 30);
+            link.setQuality(cap.quality, true, 60);
+            QCOMPARE(bitrates.size(), 3);
+            QCOMPARE(bitrates.at(0).first().toInt(), cap.at120);
+            QCOMPARE(bitrates.at(1).first().toInt(), cap.at30);
+            QCOMPARE(bitrates.at(2).first().toInt(), cap.at30);
+        }
+    }
+
+    void frameRateNegotiationAndFallback_data()
+    {
+        QTest::addColumn<bool>("withInput");
+        QTest::addColumn<bool>("supportsFps");
+        QTest::newRow("v18-view") << false << true;
+        QTest::newRow("v18-control") << true << true;
+        QTest::newRow("v17-view") << false << false;
+        QTest::newRow("v17-control") << true << false;
+    }
+
+    void frameRateNegotiationAndFallback()
+    {
+        QFETCH(bool, withInput);
+        QFETCH(bool, supportsFps);
+        Node viewer, host;
+        QVERIFY(!viewer.probe.endpoints().isEmpty() && !host.probe.endpoints().isEmpty());
+        viewer.trust(host);
+        host.trust(viewer);
+        auto peer = host.target();
+        peer.extendedDesktop = peer.richMedia = peer.adaptiveVideo = peer.cursorVisibility = peer.rttProbe = true;
+        peer.frameRateControl = supportsFps;
+        auto &view = viewer.session;
+        auto &share = host.session;
+        view.setRemoteCursorVisible(false);
+        view.view(peer, withInput);
+        QTRY_COMPARE(share.state(), DesktopSession::Requested);
+        auto *viewerChannel = view.findChild<TrustedChannel *>();
+        auto *hostChannel = share.findChild<TrustedChannel *>();
+        QVERIFY(viewerChannel && hostChannel);
+        QSignalSpy replies(viewerChannel, &TrustedChannel::message);
+        QSignalSpy requests(hostChannel, &TrustedChannel::message);
+        share.accept();
+        const QList<DesktopDisplay> screens{{1, "Main", {1920, 1080}, true, "screen-a"},
+                                            {2, "Side", {2560, 1440}, false, "screen-b"}};
+        share.updateHostDisplays(screens);
+        QTRY_COMPARE(view.displayId(), 1u);
+        QCOMPARE(view.state(), DesktopSession::Viewing);
+        QCOMPARE(share.frameRateProtocol(), supportsFps);
+        QCOMPARE(view.frameRateProtocol(), supportsFps);
+        QVERIFY(view.supportsRttProbe() && share.supportsRttProbe());
+        QVERIFY(view.canSetRemoteCursor() && !share.captureCursorVisible());
+        QVERIFY(!replies.isEmpty());
+        const auto reply = replies.first().first().toByteArray();
+        QCOMPARE(reply.size(), withInput ? 6 : 5);
+        QCOMPARE(reply.front(), withInput ? 'a' : 'y');
+        QCOMPARE(reply[reply.size() - 2], char(supportsFps ? 18 : 17));
+        QCOMPARE(reply.back(), char(0));
+        QCOMPARE(view.frameRate(), videoFps);
+        QCOMPARE(view.frameRateLimit(), videoFps);
+        QVERIFY(!share.reduceFrameRate() && !view.reduceFrameRate());
+        QSignalSpy frames(&view, &DesktopSession::frame);
+        const auto idr = fixture();
+        share.sendFrame(idr, rtpTime(videoClockUs()), true);
+        QTRY_COMPARE(frames.size(), 1);
+        view.picturePresented();
+
+        if (supportsFps) {
+            QSignalSpy restarts(&share, &DesktopSession::displaySwitched);
+            QSignalSpy hostNotices(&share, &DesktopSession::notice);
+            QSignalSpy viewerNotices(&view, &DesktopSession::notice);
+            view.chooseFrameRate(90);
+            view.chooseFrameRate(30);
+            QTRY_COMPARE(view.frameRate(), 30);
+            QCOMPARE(share.frameRateLimit(), 30);
+            QCOMPARE(view.connectionStats().targetFrameRate, 30);
+            QCOMPARE(restarts.size(), 1);
+            QVERIFY(restarts.last().first().toBool());
+            QCOMPARE(requests.count({QByteArray("G") + char(90)}), 0);
+            QCOMPARE(requests.count({QByteArray("G") + char(30)}), 1);
+
+            QSignalSpy bitrates(&share, &DesktopSession::bitrateChanged);
+            view.chooseQuality(VideoQuality::QHD);
+            QTRY_COMPARE(view.quality(), VideoQuality::QHD);
+            QTRY_VERIFY(bitrates.contains({21000000}));
+            view.chooseQuality(VideoQuality::FullHD);
+            QTRY_COMPARE(view.quality(), VideoQuality::FullHD);
+            QTRY_VERIFY(bitrates.contains({13000000}));
+            view.chooseFrameRate(120);
+            QTRY_COMPARE(view.frameRate(), 120);
+            if (withInput) {
+                share.sendFrame("invalid", rtpTime(videoClockUs()), true);
+                QTRY_COMPARE(share.frameRate(), 60);
+            } else
+                QVERIFY(share.reduceFrameRate());
+            QVERIFY(!share.reduceFrameRate());
+            QTRY_COMPARE(view.frameRate(), 60);
+            QCOMPARE(view.frameRateLimit(), 120);
+            QCOMPARE(share.connectionStats().targetFrameRate, 60);
+            QCOMPARE(view.connectionStats().frameRateLimit, 120);
+            QCOMPARE(replies.count({QByteArray("g") + char(60) + char(120)}), 1);
+            QCOMPARE(hostNotices.size(), 1);
+
+            view.chooseFrameRate(120);
+            QTRY_COMPARE(view.frameRate(), 120);
+            viewerNotices.clear();
+            QVERIFY(view.reduceFrameRate());
+            QVERIFY(view.reduceFrameRate());
+            QTRY_COMPARE(view.frameRate(), 60);
+            QCOMPARE(requests.count({QByteArray("h") + char(120)}), 1);
+            QCOMPARE(viewerNotices.size(), 1);
+            QCOMPARE(share.frameRate(), 60);
+            QCOMPARE(share.frameRateLimit(), 120);
+            view.chooseFrameRate(60);
+            QTRY_COMPARE(view.frameRateLimit(), 60);
+
+            view.chooseFrameRate(120);
+            QTRY_COMPARE(view.frameRate(), 120);
+            const auto before = restarts.size();
+            const auto reason = QStringLiteral("当前显示器刷新率为 75 Hz，已自动回退至 60 fps。");
+            share.reportFrameRateFallback(60, reason);
+            share.reportFrameRateFallback(60, reason);
+            QTRY_COMPARE(view.frameRate(), 60);
+            QCOMPARE(restarts.size(), before);
+            QCOMPARE(share.frameRateLimit(), 120);
+            QCOMPARE(hostNotices.count({reason}), 1);
+
+            view.chooseDisplay(2);
+            QTRY_COMPARE(view.displayId(), 2u);
+            QTRY_COMPARE(view.frameRate(), 120);
+            QCOMPARE(restarts.size(), before + 1);
+            share.reportFrameRateFallback(60, reason);
+            QTRY_COMPARE(view.frameRate(), 60);
+            share.updateHostDisplays({screens.first()});
+            QTRY_COMPARE(view.displayId(), 1u);
+            QTRY_COMPARE(view.frameRate(), 120);
+            if (!withInput) {
+                QTRY_COMPARE_WITH_TIMEOUT(view.frameRate(), 60, 9500);
+                QCOMPARE(view.frameRateLimit(), 120);
+                QCOMPARE(view.quality(), VideoQuality::FullHD);
+            }
+            share.sendFrame(idr, rtpTime(videoClockUs()), true);
+            QTRY_COMPARE(frames.size(), 2);
+        } else {
+            view.chooseFrameRate(120);
+            share.reportFrameRateFallback(30);
+            view.chooseQuality(VideoQuality::QHD);
+            QTRY_COMPARE(view.quality(), VideoQuality::QHD);
+            QCOMPARE(requests.count({QByteArray("G") + char(120)}), 0);
+            QCOMPARE(view.frameRate(), videoFps);
+            QCOMPARE(share.frameRate(), videoFps);
+        }
+        QCOMPARE(share.state(), DesktopSession::Sharing);
+        QCOMPARE(view.state(), DesktopSession::Viewing);
+        QSignalSpy reset(&view, &DesktopSession::frameRateChanged);
+        view.stop();
+        QTRY_COMPARE(share.state(), DesktopSession::Idle);
+        QCOMPARE(reset.size(), supportsFps ? 1 : 0);
+        QVERIFY(!view.frameRateProtocol() && !share.frameRateProtocol());
+        QCOMPARE(view.frameRateLimit(), videoFps);
+        QCOMPARE(share.frameRate(), videoFps);
     }
 
     void desktopRttUpdates_data()

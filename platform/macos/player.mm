@@ -55,7 +55,7 @@ struct Render {
     CAMetalLayer *layer;
     CVMetalTextureCacheRef textures = nullptr;
     dispatch_queue_t queue = dispatch_queue_create("dev.wwmm.present", DISPATCH_QUEUE_SERIAL);
-    dispatch_semaphore_t drawablesAvailable = dispatch_semaphore_create(2);
+    dispatch_semaphore_t drawablesAvailable = dispatch_semaphore_create(3);
     std::atomic_bool stopped{false};
     std::mutex callbackMutex;
     std::mutex pictureMutex;
@@ -75,7 +75,7 @@ struct Render {
     {
         if (!device || CVMetalTextureCacheCreate(nullptr, nullptr, device, nullptr, &textures))
             return false;
-        commands = [device newCommandQueueWithMaxCommandBufferCount:2];
+        commands = [device newCommandQueueWithMaxCommandBufferCount:3];
         NSString *code = @R"metal(
 #include <metal_stdlib>
 using namespace metal;
@@ -181,18 +181,37 @@ void scheduleDisplay(std::shared_ptr<Render> r)
 }
 class MacPlayer final : public DesktopPlayer
 {
-    WWMMMetalView *view_;
+    WWMMMetalView *view_ = nil;
     std::shared_ptr<Render> render_ = std::make_shared<Render>();
     std::unique_ptr<MacVideoDecoder> decoder_;
+    MediaError failure_;
+    std::atomic_bool decoderFailed_{false};
+    int fps_ = videoFps;
+
+    void openDecoder()
+    {
+        decoder_ = std::make_unique<MacVideoDecoder>([r = render_](CVPixelBufferRef image, quint32 stamp) {
+            std::lock_guard guard(r->pictureMutex);
+            if (r->latest)
+                CVPixelBufferRelease(r->latest);
+            r->latest = CVPixelBufferRetain(image);
+            r->stamp = stamp;
+            r->dirty = true;
+            scheduleDisplay(r);
+        }, [this](QString error) {
+            if (!decoderFailed_.exchange(true))
+                failure_(std::move(error));
+        });
+    }
 
   public:
-    MacPlayer(quintptr native, PresentedFrame presented, MediaError error)
+    MacPlayer(quintptr native, PresentedFrame presented, MediaError error) : failure_(std::move(error))
     {
         auto *host = (__bridge NSView *)reinterpret_cast<void *>(native);
         auto r = render_;
         r->presented = std::move(presented);
         if (!host || !r->open()) {
-            error(QStringLiteral("无法创建 Metal 视频显示器。"));
+            failure_(QStringLiteral("无法创建 Metal 视频显示器。"));
             return;
         }
         view_ = [[WWMMMetalView alloc] initWithFrame:host.bounds];
@@ -203,21 +222,26 @@ class MacPlayer final : public DesktopPlayer
         r->layer.device = r->device;
         r->layer.opaque = YES;
         r->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        r->layer.maximumDrawableCount = 2;
+        r->layer.maximumDrawableCount = 3;
         r->layer.displaySyncEnabled = NO;
         r->layer.framebufferOnly = YES;
         r->layer.allowsNextDrawableTimeout = YES;
         [view_ updateDrawable];
-        decoder_ = std::make_unique<MacVideoDecoder>([r](CVPixelBufferRef image, quint32 stamp) {
-            std::lock_guard guard(r->pictureMutex);
-            if (r->latest)
-                CVPixelBufferRelease(r->latest);
-            r->latest = CVPixelBufferRetain(image);
-            r->stamp = stamp;
-            r->dirty = true;
-            scheduleDisplay(r);
-        }, std::move(error));
+        openDecoder();
     }
+    bool setFrameRate(int fps) override
+    {
+        if (!decoder_)
+            return false;
+        if (fps_ != fps && decoderFailed_) {
+            decoder_.reset();
+            decoderFailed_ = false;
+            openDecoder();
+        }
+        fps_ = fps;
+        return true;
+    }
+
     void setViewport(VideoViewport viewport) override
     {
         std::lock_guard guard(render_->pictureMutex);

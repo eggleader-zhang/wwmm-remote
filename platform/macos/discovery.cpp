@@ -128,7 +128,8 @@ private:
             return;
         }
         ServiceFields fields;
-        for (auto key : {"v", "pk", "name", "addr", "os", "desk", "input", "office", "media", "adapt", "mackeys", "cursor"}) {
+        for (auto key : {"v", "pk", "name", "addr", "os", "desk", "input", "office", "media", "adapt",
+                         "mackeys", "cursor", "rtt", "fps"}) {
             uint8_t size = 0;
             auto data = static_cast<const char *>(TXTRecordGetValuePtr(length, txt, key, &size));
             if (data)

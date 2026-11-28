@@ -1,6 +1,7 @@
 #include "desktop_session.h"
 #include "video_link.h"
 #include "video_packets.h"
+#include <algorithm>
 #include <utility>
 #include <QThread>
 #include <QMutex>
@@ -95,6 +96,7 @@ DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, std::functio
     connect(&store, &DeviceStore::changed, this, &DesktopSession::check);
     connect(&probe, &LanProbe::endpointsChanged, this, &DesktopSession::check);
     connect(&probe, &LanProbe::receivingChanged, this, &DesktopSession::check);
+    connect(this, &DesktopSession::displaySwitched, this, &DesktopSession::retryDisplayFrameRate);
     stillFrame_.setSingleShot(true);
     stillFrame_.setInterval(140);
     connect(&stillFrame_, &QTimer::timeout, this, [this] {
@@ -136,6 +138,8 @@ ConnectionStats DesktopSession::connectionStats() const
 {
     auto stats = stats_;
     stats.quality = quality_;
+    stats.targetFrameRate = frameRate_;
+    stats.frameRateLimit = frameRateLimit_;
     stats.adaptiveReduced = quality_ < qualityLimit_;
     if (state_ == Viewing) {
         stats.peerOS = peerOS();
@@ -156,6 +160,8 @@ void DesktopSession::setState(State s)
         });
     }
     emit changed();
+    if (frameRateProtocol_ && (s == Sharing || s == Viewing))
+        emit frameRateChanged();
 }
 
 void DesktopSession::view(const NearbyDevice &peer, bool withInput)
@@ -187,6 +193,7 @@ void DesktopSession::view(const NearbyDevice &peer, bool withInput)
     adaptive_ = rich_ && peer.adaptiveVideo;
     cursorProtocol_ = adaptive_ && peer.cursorVisibility;
     rttProtocol_ = cursorProtocol_ && peer.rttProbe;
+    frameRateProtocol_ = rttProtocol_ && peer.frameRateControl;
     captureCursor_ = !cursorProtocol_ || preferCursor_;
     macKeyboardProtocol_ = adaptive_ && withInput && localOS() == DesktopOS::windows &&
                            peer.os == DesktopOS::macOS && (peer.macKeyboard || cursorProtocol_);
@@ -210,6 +217,7 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
     host_ = expected.isEmpty();
     interactive_ = withInput;
     if (host_) {
+        frameRateProtocol_ = false;
         rttProtocol_ = cursorProtocol_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
         captureCursor_ = true;
     }
@@ -312,9 +320,13 @@ bool DesktopSession::prepareNetwork()
         Qt::QueuedConnection);
     connect(
         n->link, &VideoLink::failed, this,
-        [this, e](const QString &error) {
-            if (epoch_ == e)
-                stop(error);
+        [this, e](const QString &error, quint32 stamp) {
+            if (epoch_ != e)
+                return;
+            if (frameRateProtocol_ && ((display_ && qint32(stamp - boundary_) < 0) ||
+                                       reduceFrameRate() || reduceQuality()))
+                return;
+            stop(error);
         },
         Qt::QueuedConnection);
     connect(n->link, &VideoLink::transportLost, this, [this, e](const QString &reason) {
@@ -424,7 +436,8 @@ void DesktopSession::handle(const QByteArray &data)
     const bool controlOffer = op == 'C' || op == 'A' || op == 'c' || op == 'a';
     const int baseSize = controlOffer ? 4 : 3;
     const bool cursorOptions = modern && data.size() == baseSize + 2 && quint8(data.back()) <= 1;
-    const bool rttOffer = cursorOptions && data[baseSize] == 17;
+    const bool frameRateOffer = cursorOptions && data[baseSize] == 18;
+    const bool rttOffer = frameRateOffer || (cursorOptions && data[baseSize] == 17);
     const bool cursorOffer = rttOffer || (cursorOptions && data[baseSize] == 16);
     const bool v15 = modern && data.size() == baseSize + 1 && data.back() == 15;
     const bool macKeysOffer = (cursorOffer || v15) && controlOffer &&
@@ -447,6 +460,7 @@ void DesktopSession::handle(const QByteArray &data)
         macKeyboardProtocol_ = macKeysOffer;
         cursorProtocol_ = cursorOffer;
         rttProtocol_ = rttOffer;
+        frameRateProtocol_ = frameRateOffer;
         captureCursor_ = !cursorOffer || data.back() != 0;
         interactive_ = controlOffer;
         if (interactive_)
@@ -459,7 +473,7 @@ void DesktopSession::handle(const QByteArray &data)
         }
     } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ && adaptiveOffer == adaptive_ &&
                macKeysOffer == macKeyboardProtocol_ && cursorOffer == cursorProtocol_ && rttOffer == rttProtocol_ &&
-               (!cursorOffer || (data.back() != 0) == captureCursor_) &&
+               frameRateOffer == frameRateProtocol_ && (!cursorOffer || (data.back() != 0) == captureCursor_) &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
         if (interactive_)
@@ -682,12 +696,34 @@ void DesktopSession::applyQuality(VideoQuality quality, bool keepEstimate)
         return interrupt(tr("画质连接已断开。"));
     emit qualityChanged();
     if (changed || !adaptive_) {
-        auto *link = network_->link;
-        QMetaObject::invokeMethod(link, [link, quality, keepEstimate] { link->setQuality(quality, keepEstimate); },
-                                  Qt::QueuedConnection);
+        updateVideoBitrate(keepEstimate);
         startDisplay(display_, adaptive_ && displayReady_);
     }
     emit connectionStatsChanged();
+}
+
+void DesktopSession::updateVideoBitrate(bool keepEstimate)
+{
+    auto *link = network_->link;
+    QMetaObject::invokeMethod(link, [link, quality = quality_, fps = frameRate_, keepEstimate] {
+        link->setQuality(quality, keepEstimate, fps);
+    }, Qt::QueuedConnection);
+}
+
+void DesktopSession::retryDisplayFrameRate(bool formatOnly)
+{
+    if (state_ != Sharing || !frameRateProtocol_ || formatOnly)
+        return;
+    const auto screen = std::find_if(displays_.cbegin(), displays_.cend(),
+                                     [this](const auto &d) { return d.id == display_; });
+    if (screen == displays_.cend() ||
+        (screen->id == frameRateDisplay_.id && screen->persistentId == frameRateDisplay_.persistentId))
+        return;
+    // 切屏已经触发采集启动，在新屏幕上重试用户上限时只需同步参数。
+    frameRateDisplay_ = *screen;
+    hardwareFrameRateLimit_ = 120;
+    if (frameRate_ != frameRateLimit_)
+        applyFrameRate(frameRateLimit_, false);
 }
 
 void DesktopSession::refreshVideo()
@@ -726,9 +762,9 @@ void DesktopSession::check()
     }
     if (state_ == Viewing && !received_) {
         refreshVideo();
-        if (rich_ && quality_ > (adaptive_ ? VideoQuality::HD : VideoQuality::FullHD) && stateClock_.elapsed() > 6500) {
+        if (stateClock_.elapsed() > 6500 &&
+            ((!frameRateFallbackPending_ && reduceFrameRate()) || reduceQuality())) {
             stateClock_.restart();
-            reduceQuality();
             return;
         }
         if (stateClock_.elapsed() > 15000)
@@ -776,6 +812,11 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     announced_.clear();
     display_ = 0;
     rememberOnPresent_.clear();
+    const bool hadFrameRateControl = frameRateProtocol_;
+    frameRateProtocol_ = frameRateFallbackPending_ = false;
+    frameRate_ = frameRateLimit_ = videoFps;
+    hardwareFrameRateLimit_ = 120;
+    frameRateDisplay_ = {};
     rttProtocol_ = cursorProtocol_ = cursorUnavailable_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
     displayReady_ = needDisplayIdr_ = listing_ = false;
     captureCursor_ = true;
@@ -793,6 +834,8 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     }
     retrying_ = resume;
     setState(resume ? Interrupted : Idle);
+    if (hadFrameRateControl)
+        emit frameRateChanged();
     if (!resume)
         emit ended(targetUnreachable);
     emit notice(reason.isEmpty() ? tr("本次桌面会话已结束。") : reason);

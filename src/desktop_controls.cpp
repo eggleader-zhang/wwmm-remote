@@ -298,6 +298,8 @@ struct DesktopControls::Callbacks {
     std::atomic<quint32> displayedStamp{0};
     std::optional<quint32> receivedStamp, capturedStamp;
     std::atomic_bool needsIdr{false}, firstPicture{true};
+    int failedFrameRate = 0;
+    QElapsedTimer presentationStall;
 
     explicit Callbacks(DesktopControls *target) : target(target) {}
 
@@ -319,8 +321,11 @@ struct DesktopControls::Callbacks {
     static MediaError error(std::shared_ptr<Callbacks> gate)
     {
         return [gate](QString error) {
-            post(gate, [error](DesktopControls *ui) {
-                if (!ui->session_.reduceQuality())
+            post(gate, [gate, error](DesktopControls *ui) {
+                if (gate->failedFrameRate)
+                    return;
+                gate->failedFrameRate = ui->session_.frameRate();
+                if (!ui->session_.reduceFrameRate() && !ui->session_.reduceQuality())
                     ui->session_.stop(error);
             });
         };
@@ -381,6 +386,23 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     connect(&session, &DesktopSession::qualityChanged, this, [this] {
         if (viewer_)
             viewer_->showQuality(session_.qualityLimit(), session_.quality());
+    });
+    connect(&session, &DesktopSession::frameRateChanged, this, [this] {
+        if (viewer_)
+            viewer_->showFrameRate(session_.frameRateLimit(), session_.frameRate(), session_.frameRateProtocol());
+        if (player_) {
+            const int fps = session_.frameRate();
+            const bool usable = player_->setFrameRate(fps);
+            callbacks_->presentationStall.invalidate();
+            if (callbacks_->failedFrameRate && callbacks_->failedFrameRate != fps) {
+                callbacks_->failedFrameRate = 0;
+                if (!usable) {
+                    retireMedia(true);
+                    startPlayer();
+                }
+                session_.refreshVideo();
+            }
+        }
     });
     connect(&session, &DesktopSession::connectionStatsChanged, this, &DesktopControls::updateConnectionStats);
     connect(&session, &DesktopSession::notice, this, [this](const QString &message) {
@@ -446,10 +468,18 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
         }
         const int count = gate->presented.exchange(0);
         const bool outstanding = gate->firstPicture || *gate->receivedStamp != gate->displayedStamp.load();
-        if (!count && outstanding && !viewer_->isMinimized())
+        if (!count && outstanding && !viewer_->isMinimized()) {
             session_.refreshVideo();
+            if (session_.frameRate() > videoFps) {
+                if (!gate->presentationStall.isValid())
+                    gate->presentationStall.start();
+                else if (gate->presentationStall.elapsed() > 6500)
+                    session_.reduceFrameRate();
+            }
+        } else
+            gate->presentationStall.invalidate();
         const auto elapsed = qMax<qint64>(1, frameClock_.restart());
-        frameRate_ = qRound(double(count) * 1000 / double(elapsed));
+        presentedFps_ = qRound(double(count) * 1000 / double(elapsed));
         updateConnectionStats();
         if (!count && !outstanding)
             frameTimer_.stop();
@@ -522,7 +552,7 @@ void DesktopControls::retireMedia(bool keepInput)
     }
     settleMotion_.stop();
     frameTimer_.stop();
-    frameRate_ = 0;
+    presentedFps_ = 0;
     focusPending_ = false;
     if (callbacks_) {
         QMutexLocker lock(&callbacks_->mutex);
@@ -581,7 +611,7 @@ void DesktopControls::updateConnectionStats()
     if (!viewer_ || session_.state() != DesktopSession::Viewing)
         return;
     auto stats = session_.connectionStats();
-    stats.framesPerSecond = frameRate_;
+    stats.framesPerSecond = presentedFps_;
     stats.frameSize = viewer_->inputSurface()->pictureSize();
     viewer_->setConnectionStats(stats);
 }
@@ -742,6 +772,10 @@ void DesktopControls::updateHostDisplays()
 
 void DesktopControls::switchDisplay(bool formatOnly)
 {
+    // 只改变帧率时保留原生显示表面的最后一帧，等待新编码器的关键帧。
+    if (formatOnly && session_.frameRateProtocol() && player_ && !callbacks_->failedFrameRate &&
+        playerQuality_ == session_.quality())
+        return;
     retireMedia(formatOnly);
     if (session_.state() == DesktopSession::Sharing) {
         if (privacyBar_)
@@ -825,7 +859,7 @@ void DesktopControls::startCapture()
         [gate](QString error) {
             Callbacks::post(gate, [gate, error](DesktopControls *ui) {
                 QTimer::singleShot(280, ui, [ui, gate, error] {
-                    if (ui->callbacks_ != gate)
+                    if (ui->callbacks_ != gate || ui->session_.reduceFrameRate())
                         return;
                     const auto displays = desktopDisplays();
                     if (ui->session_.extended() && displays != ui->session_.displays())
@@ -837,6 +871,10 @@ void DesktopControls::startCapture()
         },
         session_.displayId(), session_.quality(), session_.captureCursorVisible(), [gate] {
             Callbacks::post(gate, [](DesktopControls *ui) { ui->session_.reportCursorUnavailable(); });
+        }, session_.frameRate(), [gate](int activeFps, QString reason) {
+            Callbacks::post(gate, [activeFps, reason](DesktopControls *ui) {
+                ui->session_.reportFrameRateFallback(activeFps, reason);
+            });
         });
 }
 
@@ -848,7 +886,7 @@ void DesktopControls::openViewer()
     if (viewer_) {
         viewer_->setPeerIdentity(session_.peerKey());
         viewer_->inputSurface()->setMacKeyboard(session_.usesMacKeyboard());
-        viewer_->showDesktop(session_.richMedia());
+        viewer_->showDesktop(session_.richMedia(), session_.frameRateProtocol());
         viewer_->setPeerName(name);
         viewer_->setWindowTitle(title);
         updateConnectionStats();
@@ -861,12 +899,14 @@ void DesktopControls::openViewer()
                                 mapsMacKeys ? macKeysAction_ : nullptr);
     viewer_->setPeerIdentity(session_.peerKey());
     viewer_->setLocalCursorVisible(localCursor_->isChecked());
+    viewer_->showFrameRate(session_.frameRateLimit(), session_.frameRate(), session_.frameRateProtocol());
     connect(viewer_, &DesktopViewer::reconnectRequested, this, [this] {
         if (session_.state() == DesktopSession::Interrupted)
             if (auto peer = reconnectPeer())
                 session_.view(*peer, session_.interactive());
     });
     connect(viewer_, &DesktopViewer::qualityRequested, &session_, &DesktopSession::chooseQuality);
+    connect(viewer_, &DesktopViewer::frameRateRequested, &session_, &DesktopSession::chooseFrameRate);
     connect(viewer_, &DesktopViewer::soundRequested, &session_, &DesktopSession::enableSound);
     viewer_->setPeerName(name);
     viewer_->setWindowTitle(title);
@@ -922,6 +962,7 @@ void DesktopControls::sendRemoteShortcut(RemoteShortcut shortcut)
 
 void DesktopControls::startPlayer()
 {
+    playerQuality_ = session_.quality();
     auto gate = callbacks_ = std::make_shared<Callbacks>(this);
     player_ = playDesktop(
         viewer_->videoView(),
@@ -941,6 +982,7 @@ void DesktopControls::startPlayer()
                 });
         },
         Callbacks::error(gate));
+    player_->setFrameRate(session_.frameRate());
     player_->setViewport(viewer_->inputSurface()->viewport());
 }
 } // namespace wwmm

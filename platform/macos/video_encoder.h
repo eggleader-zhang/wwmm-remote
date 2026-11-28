@@ -11,7 +11,7 @@ class MacVideoEncoder
   public:
     MacVideoEncoder(EncodedFrame output, MediaError failure);
     ~MacVideoEncoder();
-    bool open(QSize size, int bitrate = videoBitrate);
+    bool open(QSize size, int bitrate = videoBitrate, int fps = videoFps);
     void setBitrate(int rate);
     bool encode(CVPixelBufferRef image, qint64 timeUs, bool force);
 
@@ -21,5 +21,6 @@ class MacVideoEncoder
     MediaError failure_;
     VTCompressionSessionRef encoder_ = nullptr;
     std::atomic_int pending_{0};
+    int pendingLimit_ = 2;
 };
 } // namespace wwmm

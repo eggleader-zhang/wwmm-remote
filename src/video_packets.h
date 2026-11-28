@@ -22,7 +22,8 @@ constexpr int maxAccessUnit = 4 * 1024 * 1024;
 constexpr int maxFragments = 4096;
 constexpr quint32 videoSsrc = 0x57564d33, viewerSsrc = 0x57565233;
 
-int qualityBitrate(VideoQuality quality);
+bool validFrameRate(int fps);
+int qualityBitrate(VideoQuality quality, int fps = videoFps);
 QSize desktopSize(QSize source, VideoQuality quality = VideoQuality::FullHD);
 QList<QByteArrayView> h264Units(const QByteArray &annexB);
 QSize h264PictureSize(const QByteArray &annexB);

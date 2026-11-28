@@ -49,8 +49,9 @@ class DesktopViewer final : public QDialog {
     QMenu *sessionMenu() const { return menu_; }
     void insertSessionAction(QAction *action);
     void showQuality(VideoQuality limit, VideoQuality active);
+    void showFrameRate(int limit, int active, bool supported = true);
     void showInterrupted(const QString &message, bool canRetry);
-    void showDesktop(bool rich);
+    void showDesktop(bool rich, bool frameRateControl = false);
     void showSound(bool local, bool peer);
     void setDisplays(const QList<DesktopDisplay> &list, quint64 selected);
     void addTools(QWidget *tools);
@@ -60,6 +61,7 @@ class DesktopViewer final : public QDialog {
     void remoteShortcutRequested(wwmm::RemoteShortcut shortcut);
     void displayRequested(quint64 id);
     void qualityRequested(wwmm::VideoQuality quality);
+    void frameRateRequested(int fps);
     void soundRequested(bool enable);
     void fileDropped(const QString &path);
     void filesDropped(const QStringList &paths);
@@ -112,7 +114,7 @@ class DesktopViewer final : public QDialog {
     QTabBar *displayTabs_;
     QLabel *shield_, *networkSignal_, *sessionTime_;
     StatsOverlay *statsOverlay_;
-    QMenu *menu_, *displays_, *quality_;
+    QMenu *menu_, *displays_, *quality_, *frameRate_;
     QAction *fit_, *original_, *fullScreen_, *sound_, *collaboration_, *monitoring_, *stats_;
     QMenu *shortcuts_ = nullptr;
     QList<DesktopDisplay> displayList_;
