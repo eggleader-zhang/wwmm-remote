@@ -5,10 +5,12 @@
 
 class QAction;
 class QCheckBox;
+class QFrame;
 class QHideEvent;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QProgressBar;
 class QPushButton;
 
 namespace wwmm
@@ -31,6 +33,7 @@ class DevicesPanel final : public QWidget
     void refreshList();
     void updateActions();
     void updateOffer();
+    void connectSelectedDevice();
     void requestDesktop(bool control);
     void rememberTarget(const QByteArray &key, bool control);
     void tryAutoConnect(bool timerDue = false);
@@ -44,13 +47,15 @@ class DevicesPanel final : public QWidget
     DeviceStore &store_;
     DesktopSession *desktop_;
     QListWidget *list_;
-    QLabel *empty_, *issue_, *localCode_, *status_;
+    QFrame *pairCodeCard_;
+    QLabel *empty_, *issue_, *localCode_, *pairCodeDetails_, *status_;
     QLineEdit *code_;
     QCheckBox *pairAccess_;
-    QPushButton *offer_, *pair_, *primary_;
+    QProgressBar *pairCountdownBar_;
+    QPushButton *offer_, *copyCode_, *pair_, *primary_;
     QPushButton *more_;
     QAction *view_, *control_, *directAccess_, *repair_, *forget_, *autoConnect_;
-    QTimer refresh_, countdown_, autoDial_;
+    QTimer refresh_, countdown_, copyFeedback_, autoDial_;
     QByteArray actionKey_, repairKey_, pendingPeer_;
     int retryDelayMs_ = 0;
     bool primaryControl_ = false, pendingControl_ = false, asleep_ = false;

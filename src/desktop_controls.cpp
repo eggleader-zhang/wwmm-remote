@@ -3,24 +3,294 @@
 #include "desktop_tray.h"
 #include "input_window.h"
 #include "transfer_bar.h"
-#include <QScreen>
-#include <QVBoxLayout>
 #include "video_packets.h"
+#include <QAction>
 #include <QApplication>
 #include <QCheckBox>
-#include <QSignalBlocker>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QMutex>
-#include <QSettings>
+#include <QPainter>
+#include <QPointer>
 #include <QPushButton>
+#include <QScreen>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QTimer>
-#include <QFutureWatcher>
+#include <QVBoxLayout>
 #include <QtConcurrentRun>
 #include <atomic>
+#include <cmath>
+#ifdef Q_OS_MACOS
+#include <CoreGraphics/CGDirectDisplay.h>
+#include <CoreGraphics/CGDisplayConfiguration.h>
+#elif defined(Q_OS_WIN)
+#include <QtGui/qscreen_platform.h>
+#endif
 
 namespace wwmm {
+namespace {
+constexpr quint8 leftControl = 224, leftGui = 227, tab = 43;
+
+bool isWindowsTaskViewKey(const InputEvent &event)
+{
+    return event.kind == InputKind::KeyDown && event.key == tab && event.mods == modifierBit(leftGui);
+}
+
+QScreen *screenForDisplay(quint64 id)
+{
+    if (id) {
+#ifdef Q_OS_MACOS
+        const auto display = CGDirectDisplayID(id);
+        if (CGDisplayIsActive(display)) {
+            const auto bounds = CGDisplayBounds(display);
+            if (auto *screen = QGuiApplication::screenAt({qRound(CGRectGetMidX(bounds)), qRound(CGRectGetMidY(bounds))}))
+                return screen;
+        }
+#elif defined(Q_OS_WIN)
+        const auto monitor = reinterpret_cast<HMONITOR>(quintptr(id));
+        for (auto *screen : QGuiApplication::screens()) {
+            const auto *native = screen->nativeInterface<QNativeInterface::QWindowsScreen>();
+            if (native && native->handle() == monitor)
+                return screen;
+        }
+#endif
+    }
+    return QGuiApplication::primaryScreen();
+}
+} // 匿名命名空间
+
+class HostPrivacyBar final : public QWidget {
+    Q_DECLARE_TR_FUNCTIONS(HostPrivacyBar)
+  public:
+    explicit HostPrivacyBar(DesktopSession &session)
+        : QWidget(nullptr, Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+                              Qt::WindowDoesNotAcceptFocus | Qt::NoDropShadowWindowHint),
+          interactive_(session.interactive())
+    {
+        setObjectName("hostPrivacyBar");
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setAttribute(Qt::WA_QuitOnClose, false);
+#ifdef Q_OS_MACOS
+        setAttribute(Qt::WA_MacAlwaysShowToolWindow);
+#endif
+        setFocusPolicy(Qt::NoFocus);
+        setCursor(Qt::SizeHorCursor);
+        setStyleSheet(QStringLiteral(R"(
+            QLabel { color: #F1F4FA; font-weight: 600; }
+            QPushButton { color: #E4EBF5; background: #3A4556; border: none;
+                border-radius: 9px; min-height: 20px; padding: 1px 7px; }
+            QPushButton:hover { background: #4C5A70; }
+            QPushButton:checked { color: #A9E8DB; background: #30554F; }
+            QPushButton#hostPrivacyStop { color: #FFD1D6; background: #643941; }
+            QPushButton#hostPrivacyStop:hover { background: #86454F; }
+            QPushButton#hostPrivacyCollapse { color: #E4EBF5; background: transparent; }
+            QPushButton#hostPrivacyCollapse:hover { background: #4C5A70; }
+        )"));
+
+        auto *row = new QHBoxLayout(this);
+        row->setContentsMargins(25, 4, 5, 4);
+        row->setSpacing(5);
+        row->setSizeConstraint(QLayout::SetFixedSize);
+        const auto name = session.peerName();
+        message_ = (interactive_ ? tr("正在被 %1 控制") : tr("正在向 %1 共享")).arg(name);
+        setAccessibleName(message_);
+        setToolTip(message_);
+        label_ = new QLabel(this);
+        label_->setObjectName("hostPrivacyStatus");
+        label_->setTextFormat(Qt::PlainText);
+        label_->setAttribute(Qt::WA_TransparentForMouseEvents);
+        row->addWidget(label_);
+
+        sound_ = new QPushButton(this);
+        sound_->setObjectName("hostPrivacySound");
+        sound_->setCheckable(true);
+        stop_ = new QPushButton(tr("停止"), this);
+        stop_->setObjectName("hostPrivacyStop");
+        collapse_ = new QPushButton(this);
+        collapse_->setObjectName("hostPrivacyCollapse");
+        collapse_->setCheckable(true);
+        for (auto *button : {sound_, stop_, collapse_}) {
+            button->setFocusPolicy(Qt::NoFocus);
+            button->setAutoDefault(false);
+            button->setCursor(Qt::PointingHandCursor);
+            row->addWidget(button);
+        }
+        connect(sound_, &QPushButton::clicked, &session, &DesktopSession::enableSound);
+        connect(stop_, &QPushButton::clicked, &session, [&session] { session.stop(); });
+        connect(collapse_, &QPushButton::toggled, this, &HostPrivacyBar::updateContents);
+        updateContents();
+        pulse_.start();
+        connect(&pulseTimer_, &QTimer::timeout, this, [this] { update(7, 0, 14, height()); });
+        pulseTimer_.start(75);
+    }
+
+    void setSound(bool available, bool local, bool peer)
+    {
+        rich_ = available;
+        const QSignalBlocker block(sound_);
+        sound_->setChecked(local);
+        sound_->setText(local ? tr("声音已开") : tr("开启声音"));
+        sound_->setToolTip(local && !peer ? tr("等待对方收听")
+                           : !local && peer ? tr("对方请求系统声音") : tr("共享系统声音"));
+        updateContents();
+    }
+
+    void placeOnScreen(QScreen *screen)
+    {
+        if (screen_ != screen) {
+            screen_ = screen;
+            offset_ = 0;
+            if (screen)
+                setScreen(screen);
+        }
+        layout()->activate();
+        if (screen_) {
+            const auto area = screen_->availableGeometry();
+            placeHorizontally(area.x() + (area.width() - width()) / 2 + offset_);
+        }
+    }
+
+  protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QColor(255, 255, 255, 58));
+        painter.setBrush(QColor(30, 34, 42, 238));
+        const qreal radius = height() / 2.0;
+        painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius);
+        QColor dot(interactive_ ? "#FFAC62" : "#7FD7A5");
+        dot.setAlphaF(float(0.8 + 0.2 * std::cos(double(pulse_.elapsed()) * 0.003)));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(dot);
+        painter.drawEllipse(QPointF(14, radius), 4.5, 4.5);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton) {
+            dragOrigin_ = event->globalPosition().toPoint().x() - x();
+            event->accept();
+        } else
+            QWidget::mousePressEvent(event);
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (dragOrigin_ && event->buttons().testFlag(Qt::LeftButton)) {
+            placeHorizontally(event->globalPosition().toPoint().x() - *dragOrigin_);
+            event->accept();
+        } else
+            QWidget::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (event->button() == Qt::LeftButton && dragOrigin_) {
+            dragOrigin_.reset();
+            event->accept();
+        } else
+            QWidget::mouseReleaseEvent(event);
+    }
+
+  private:
+    void placeHorizontally(int requested)
+    {
+        if (!screen_)
+            return;
+        const auto area = screen_->availableGeometry();
+        const int left = qBound(area.left(), requested, qMax(area.left(), area.right() + 1 - width()));
+        offset_ = left - (area.x() + (area.width() - width()) / 2);
+        move(left, area.y() + 8);
+    }
+
+    void updateContents()
+    {
+        const bool collapsed = collapse_->isChecked();
+        const auto status = collapsed ? (interactive_ ? tr("控制中") : tr("共享中")) : message_;
+        label_->setText(label_->fontMetrics().elidedText(status, Qt::ElideRight, 260));
+        sound_->setVisible(!collapsed && rich_);
+        stop_->setVisible(!collapsed);
+        collapse_->setText(collapsed ? QStringLiteral("▾") : QStringLiteral("▴"));
+        collapse_->setToolTip(collapsed ? tr("展开共享状态") : tr("折叠共享状态"));
+        collapse_->setAccessibleName(collapse_->toolTip());
+        placeOnScreen(screen_);
+    }
+
+    const bool interactive_;
+    bool rich_ = false;
+    QString message_;
+    QLabel *label_;
+    QPushButton *sound_, *stop_, *collapse_;
+    QPointer<QScreen> screen_;
+    QElapsedTimer pulse_;
+    QTimer pulseTimer_;
+    int offset_ = 0;
+    std::optional<int> dragOrigin_;
+};
+
+QList<InputEvent> remoteShortcutEvents(RemoteShortcut shortcut, DesktopOS target)
+{
+    const bool mac = target == DesktopOS::macOS;
+    QList<quint8> keys;
+    switch (shortcut) {
+    case RemoteShortcut::SwitchApp: {
+        InputEvent event;
+        event.kind = InputKind::SwitchApp;
+        return {event};
+    }
+    case RemoteShortcut::LockScreen:
+        keys = mac ? QList<quint8>{leftControl, leftGui, 20} : QList<quint8>{leftGui, 15};
+        break;
+    case RemoteShortcut::Search:
+        keys = {leftGui, quint8(mac ? 44 : 22)};
+        break;
+    case RemoteShortcut::Overview:
+        keys = mac ? QList<quint8>{leftControl, 82} : QList<quint8>{leftGui, tab};
+        break;
+    case RemoteShortcut::ShowDesktop:
+        keys = mac ? QList<quint8>{68} : QList<quint8>{leftGui, 7};
+        break;
+    }
+    QList<InputEvent> events;
+    quint8 mods = 0;
+    for (const quint8 key : keys) {
+        mods |= modifierBit(key);
+        InputEvent event;
+        event.kind = InputKind::KeyDown;
+        event.key = key;
+        event.mods = mods;
+        events.append(event);
+    }
+    for (auto key = keys.crbegin(); key != keys.crend(); ++key) {
+        mods &= ~modifierBit(*key);
+        InputEvent event;
+        event.kind = InputKind::KeyUp;
+        event.key = *key;
+        event.mods = mods;
+        events.append(event);
+    }
+    return events;
+}
+
+bool applyRemoteInput(HostInput &input, InputSink &sink, const InputEvent &event, bool windowsTaskView)
+{
+    if (!windowsTaskView || !isWindowsTaskViewKey(event))
+        return input.apply(event);
+    // v17 的 Mac 查看端使用 SwitchApp 传递日常 Cmd+Tab，Win+Tab 按 Windows 布局注入。
+    input.release();
+    HostInput native(DesktopOS::windows, DesktopOS::windows, sink);
+    for (const auto &key : remoteShortcutEvents(RemoteShortcut::Overview, DesktopOS::windows))
+        if (!native.apply(key))
+            return false;
+    return true;
+}
+
 struct DesktopControls::Callbacks {
     QMutex mutex;
     DesktopControls *target;
@@ -57,8 +327,9 @@ struct DesktopControls::Callbacks {
     }
 };
 
-DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, QMenu *settings, QWidget *parent)
-    : QWidget(parent), session_(session), discovery_(discovery)
+DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, QMenu *settings, QWidget *parent,
+                                 QAction *macKeysAction)
+    : QWidget(parent), session_(session), discovery_(discovery), macKeysAction_(macKeysAction)
 {
     auto cursorAction = [this, settings](const QString &label, const QString &key) {
         auto *action = new QAction(label, this);
@@ -106,10 +377,12 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     row->addWidget(soundCheck_);
     connect(soundCheck_, &QCheckBox::toggled, &session, &DesktopSession::enableSound);
     connect(&session, &DesktopSession::soundChanged, this, &DesktopControls::updateSound);
+    connect(&session, &DesktopSession::macKeyboardChanged, this, &DesktopControls::showMacKeyboardHint);
     connect(&session, &DesktopSession::qualityChanged, this, [this] {
         if (viewer_)
             viewer_->showQuality(session_.qualityLimit(), session_.quality());
     });
+    connect(&session, &DesktopSession::connectionStatsChanged, this, &DesktopControls::updateConnectionStats);
     connect(&session, &DesktopSession::notice, this, [this](const QString &message) {
         if (viewer_)
             viewer_->setStatus(message);
@@ -145,6 +418,7 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     };
     auto watchScreen = [this, topologyChanged](QScreen *screen) {
         connect(screen, &QScreen::geometryChanged, this, topologyChanged);
+        connect(screen, &QScreen::availableGeometryChanged, this, topologyChanged);
         connect(screen, &QScreen::physicalDotsPerInchChanged, this, topologyChanged);
         connect(screen, &QScreen::orientationChanged, this, topologyChanged);
         topologyChanged();
@@ -154,7 +428,7 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
     connect(qApp, &QGuiApplication::screenAdded, this, watchScreen);
     connect(qApp, &QGuiApplication::screenRemoved, this, topologyChanged);
     connect(qApp, &QGuiApplication::primaryScreenChanged, this, topologyChanged);
-    connect(&topology_, &QTimer::timeout, this, [this] { session_.updateHostDisplays(desktopDisplays()); });
+    connect(&topology_, &QTimer::timeout, this, &DesktopControls::updateHostDisplays);
     settleMotion_.setSingleShot(true);
     settleMotion_.setInterval(180);
     connect(&settleMotion_, &QTimer::timeout, this, [this] {
@@ -174,8 +448,9 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
         const bool outstanding = gate->firstPicture || *gate->receivedStamp != gate->displayedStamp.load();
         if (!count && outstanding && !viewer_->isMinimized())
             session_.refreshVideo();
-        if (viewer_)
-            viewer_->setFrameRate(count);
+        const auto elapsed = qMax<qint64>(1, frameClock_.restart());
+        frameRate_ = qRound(double(count) * 1000 / double(elapsed));
+        updateConnectionStats();
         if (!count && !outstanding)
             frameTimer_.stop();
     });
@@ -184,15 +459,19 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
             if (!callbacks_->receivedStamp || !viewer_->inputSurface()->hasPictureSize())
                 viewer_->inputSurface()->setPictureSize(h264PictureSize(frame));
             callbacks_->receivedStamp = time;
-            if (!frameTimer_.isActive())
+            if (!frameTimer_.isActive()) {
+                frameClock_.start();
                 frameTimer_.start();
+            }
             player_->push(frame, time);
         }
     });
     connect(&session, &DesktopSession::inputReceived, this, [this](const InputEvent &event) {
         if (!input_)
             return;
-        if (!input_->apply(event)) {
+        const bool windowsTaskView = session_.supportsRttProbe() && localOS() == DesktopOS::windows &&
+                                     session_.peerOS() == DesktopOS::macOS;
+        if (!applyRemoteInput(*input_, *inputSink_, event, windowsTaskView)) {
             session_.stop(tr("系统未能执行远程输入。请确认输入权限并返回普通桌面后重试。"));
             return;
         }
@@ -224,7 +503,7 @@ DesktopControls::DesktopControls(DesktopSession &session, Discovery &discovery, 
         if (capture_)
             capture_->refresh();
     });
-    hide();
+    updateState();
 }
 
 DesktopControls::~DesktopControls()
@@ -243,6 +522,7 @@ void DesktopControls::retireMedia(bool keepInput)
     }
     settleMotion_.stop();
     frameTimer_.stop();
+    frameRate_ = 0;
     focusPending_ = false;
     if (callbacks_) {
         QMutexLocker lock(&callbacks_->mutex);
@@ -267,14 +547,18 @@ void DesktopControls::closeSound()
 void DesktopControls::updateSound()
 {
     const bool local = session_.localSound(), peer = session_.peerSound();
-    if (viewer_)
+    if (viewer_) {
         viewer_->showSound(local, peer);
+        updateConnectionStats();
+    }
     {
         QSignalBlocker block(soundCheck_);
         soundCheck_->setChecked(local);
         soundCheck_->setText(!local && peer ? tr("对方请求系统声音")
                                             : (local && !peer ? tr("等待对方收听") : tr("共享系统声音")));
     }
+    if (privacyBar_)
+        privacyBar_->setSound(session_.richMedia(), local, peer);
     auto stream = session_.sound();
     if (audioStream_ == stream)
         return;
@@ -292,11 +576,24 @@ void DesktopControls::updateSound()
                              });
 }
 
+void DesktopControls::updateConnectionStats()
+{
+    if (!viewer_ || session_.state() != DesktopSession::Viewing)
+        return;
+    auto stats = session_.connectionStats();
+    stats.framesPerSecond = frameRate_;
+    stats.frameSize = viewer_->inputSurface()->pictureSize();
+    viewer_->setConnectionStats(stats);
+}
+
 void DesktopControls::endMedia(bool keepViewer)
 {
     closeSound();
     retireMedia();
     topology_.stop();
+    viewerHasPicture_ = false;
+    if (!keepViewer)
+        macHintShown_ = false;
     delete transfer_;
     transfer_ = nullptr;
     if (viewer_) {
@@ -346,6 +643,10 @@ void DesktopControls::updateState()
 {
     const auto s = session_.state();
     const bool control = session_.interactive();
+    if (s != DesktopSession::Sharing && privacyBar_) {
+        privacyBar_->hide();
+        privacyBar_.release()->deleteLater();
+    }
     updateCursorAction();
     setVisible(s != DesktopSession::Idle);
     yes_->setVisible(s == DesktopSession::Requested);
@@ -388,10 +689,14 @@ void DesktopControls::updateState()
         break;
     }
     case DesktopSession::Sharing:
+        if (!privacyBar_)
+            privacyBar_ = std::make_unique<HostPrivacyBar>(session_);
         updateSound();
         if (control && session_.extended())
             addTransferBar();
-        session_.updateHostDisplays(desktopDisplays());
+        updateHostDisplays();
+        if (privacyBar_)
+            privacyBar_->show();
         break;
     case DesktopSession::Viewing:
         label_->setText((control ? tr("正在控制 %1 的桌面。") : tr("正在查看 %1 的桌面。")).arg(name));
@@ -406,12 +711,15 @@ void DesktopControls::updateState()
 
 void DesktopControls::addTransferBar()
 {
+    if (transfer_)
+        return;
     auto &data = session_.dataLink();
-    transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this,
-                                viewer_ ? viewer_->sessionMenu() : nullptr);
+    transfer_ = new TransferBar(data, viewer_ ? static_cast<QWidget *>(viewer_) : this, viewer_);
     if (viewer_) {
         viewer_->addTools(transfer_);
-        connect(viewer_, &DesktopViewer::fileDropped, transfer_, [&data](const QString &path) { data.offerFile(path); });
+        connect(viewer_, &DesktopViewer::filesDropped, transfer_, &TransferBar::sendFiles);
+        connect(transfer_, &TransferBar::clipboardSynced, viewer_,
+                [viewer = viewer_](const QString &summary) { viewer->setStatus(summary, 2000); });
         auto updateDrops = [this] {
             auto &link = session_.dataLink();
             if (viewer_)
@@ -423,10 +731,23 @@ void DesktopControls::addTransferBar()
         column_->addWidget(transfer_);
 }
 
+void DesktopControls::updateHostDisplays()
+{
+    // 离屏环境仍显示共享状态，跳过系统录屏与权限请求。
+    if (QGuiApplication::platformName() != "offscreen")
+        session_.updateHostDisplays(desktopDisplays());
+    if (privacyBar_)
+        privacyBar_->placeOnScreen(screenForDisplay(session_.displayId()));
+}
+
 void DesktopControls::switchDisplay(bool formatOnly)
 {
     retireMedia(formatOnly);
     if (session_.state() == DesktopSession::Sharing) {
+        if (privacyBar_)
+            privacyBar_->placeOnScreen(screenForDisplay(session_.displayId()));
+        if (QGuiApplication::platformName() == "offscreen")
+            return;
         QString name;
         for (const auto &d : session_.displays())
             if (d.id == session_.displayId())
@@ -446,6 +767,7 @@ void DesktopControls::switchDisplay(bool formatOnly)
             viewer_->inputSurface()->changeDisplay();
         viewer_->setDisplays(session_.displays(), session_.displayId());
         viewer_->waitForPicture(formatOnly ? tr("正在调整画质…") : tr("正在切换显示器…"));
+        updateConnectionStats();
         startPlayer();
     }
 }
@@ -521,14 +843,23 @@ void DesktopControls::startCapture()
 void DesktopControls::openViewer()
 {
     const bool control = session_.interactive();
+    const auto name = session_.peerName();
+    const auto title = (control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(name);
     if (viewer_) {
+        viewer_->setPeerIdentity(session_.peerKey());
         viewer_->inputSurface()->setMacKeyboard(session_.usesMacKeyboard());
         viewer_->showDesktop(session_.richMedia());
+        viewer_->setPeerName(name);
+        viewer_->setWindowTitle(title);
+        updateConnectionStats();
         if (control)
             viewer_->focusVideo();
         return;
     }
-    viewer_ = new DesktopViewer(this, control, session_.richMedia(), {localCursor_, remoteCursor_});
+    const bool mapsMacKeys = control && localOS() == DesktopOS::windows && session_.peerOS() == DesktopOS::macOS;
+    viewer_ = new DesktopViewer(this, control, session_.richMedia(), {localCursor_, remoteCursor_},
+                                mapsMacKeys ? macKeysAction_ : nullptr);
+    viewer_->setPeerIdentity(session_.peerKey());
     viewer_->setLocalCursorVisible(localCursor_->isChecked());
     connect(viewer_, &DesktopViewer::reconnectRequested, this, [this] {
         if (session_.state() == DesktopSession::Interrupted)
@@ -537,7 +868,8 @@ void DesktopControls::openViewer()
     });
     connect(viewer_, &DesktopViewer::qualityRequested, &session_, &DesktopSession::chooseQuality);
     connect(viewer_, &DesktopViewer::soundRequested, &session_, &DesktopSession::enableSound);
-    viewer_->setWindowTitle((control ? tr("%1 · 控制桌面") : tr("%1 · 只读桌面")).arg(session_.peerName()));
+    viewer_->setPeerName(name);
+    viewer_->setWindowTitle(title);
     connect(viewer_, &DesktopViewer::displayRequested, &session_, &DesktopSession::chooseDisplay);
     connect(viewer_, &DesktopViewer::viewportChanged, this, [this] {
         if (player_)
@@ -547,17 +879,45 @@ void DesktopControls::openViewer()
         auto *surface = viewer_->inputSurface();
         surface->setMacKeyboard(session_.usesMacKeyboard());
         connect(&session_, &DesktopSession::macKeyboardChanged, surface, &InputWindow::setMacKeyboard);
-        connect(surface, &InputWindow::input, this, [this](const InputEvent &e) { session_.sendInput(e); });
-        connect(viewer_, &DesktopViewer::switchRequested, this, [this] {
-            InputEvent event;
-            event.kind = InputKind::SwitchApp;
-            session_.sendInput(event);
+        connect(surface, &InputWindow::input, this, [this](const InputEvent &event) {
+            if (session_.supportsRttProbe() && localOS() == DesktopOS::macOS &&
+                session_.peerOS() == DesktopOS::windows && isWindowsTaskViewKey(event)) {
+                session_.sendInput(InputEvent{});
+                sendRemoteShortcut(RemoteShortcut::SwitchApp);
+            } else {
+                session_.sendInput(event);
+            }
         });
+        connect(viewer_, &DesktopViewer::remoteShortcutRequested, this, &DesktopControls::sendRemoteShortcut);
     }
     connect(viewer_, &QDialog::finished, this, [this] { session_.stop(); });
+    updateConnectionStats();
     viewer_->show();
     if (control)
         viewer_->focusVideo();
+}
+
+void DesktopControls::showMacKeyboardHint()
+{
+    if (viewer_ && viewerHasPicture_ && !macHintShown_ && session_.usesMacKeyboard()) {
+        macHintShown_ = true;
+        viewer_->setStatus(tr("已启用 Mac 键位映射（Alt=⌘，Win=⌥），按 Ctrl+Alt+Shift+F12 释放键盘"), 5000, true);
+    }
+}
+
+void DesktopControls::sendRemoteShortcut(RemoteShortcut shortcut)
+{
+    const auto target = session_.peerOS();
+    if (shortcut == RemoteShortcut::Overview && localOS() == DesktopOS::macOS &&
+        target == DesktopOS::windows && !session_.supportsRttProbe()) {
+        viewer_->setStatus(tr("共享端版本暂不支持发送任务视图快捷键。"));
+        return;
+    }
+    if (shortcut != RemoteShortcut::SwitchApp)
+        session_.sendInput(InputEvent{});
+    // 组合键已使用目标平台的 HID 键码，跳过 Windows 查看 macOS 时的 Alt 与 Win 映射。
+    for (const auto &event : remoteShortcutEvents(shortcut, target))
+        session_.sendInput(event, false);
 }
 
 void DesktopControls::startPlayer()
@@ -571,10 +931,12 @@ void DesktopControls::startPlayer()
             if (gate->firstPicture.exchange(false))
                 Callbacks::post(gate, [](DesktopControls *ui) {
                     ui->session_.picturePresented();
-                    if (ui->viewer_) {
+                    if (ui->viewer_ && ui->session_.state() == DesktopSession::Viewing) {
                         ui->viewer_->pictureShown();
                         if (ui->session_.interactive())
                             ui->viewer_->inputSurface()->presented();
+                        ui->viewerHasPicture_ = true;
+                        ui->showMacKeyboardHint();
                     }
                 });
         },

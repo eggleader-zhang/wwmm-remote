@@ -1,6 +1,7 @@
 #pragma once
 #include "desktop_input.h"
 #include <QHash>
+#include <QStringList>
 #include <QTimer>
 #include <QWindow>
 
@@ -42,6 +43,7 @@ class InputWindow final : public QWindow {
     void keyboardReleaseRequested();
     void keyboardGrabFailed();
     void fileDropped(const QString &path);
+    void filesDropped(const QStringList &paths);
     void pictureSizeChanged();
     void pixelRatioChanged();
 

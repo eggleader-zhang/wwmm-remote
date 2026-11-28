@@ -2,8 +2,17 @@
 #include "desktop_controls.h"
 #include "desktop_tray.h"
 #include "main_window.h"
+#include "native_input.h"
+#include "transfer_bar.h"
+#include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFontDatabase>
+#include <QFrame>
+#include <QGridLayout>
 #include <QHideEvent>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -11,11 +20,14 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QPainter>
+#include <QPainterPath>
+#include <QProgressBar>
 #include <QPushButton>
-#include <QRegularExpressionValidator>
 #include <QScrollBar>
 #include <QSettings>
+#include <QShortcut>
 #include <QSignalBlocker>
+#include <QStyleHints>
 #include <QStyledItemDelegate>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -26,7 +38,22 @@ namespace wwmm
 namespace
 {
 constexpr int detailRole = Qt::UserRole + 1;
+constexpr int osRole = Qt::UserRole + 2;
+constexpr int onlineRole = Qt::UserRole + 3;
+constexpr int accessBadgeRole = Qt::UserRole + 4;
+constexpr int pairCodeLength = 8;
+constexpr int pairCodeLifetime = 120;
 constexpr auto directPairingSetting = "pairing/allowDirectAccess";
+
+bool isPairCodeDigit(QChar ch)
+{
+    return ch >= u'0' && ch <= u'9';
+}
+
+bool isPairCode(const QString &code)
+{
+    return code.size() == pairCodeLength && std::all_of(code.cbegin(), code.cend(), isPairCodeDigit);
+}
 
 QLabel *label(QWidget *parent)
 {
@@ -36,14 +63,14 @@ QLabel *label(QWidget *parent)
     return view;
 }
 
-// Let the platform draw selection and focus. Two text columns need no per-device widgets.
+// 保留系统样式绘制的选中和焦点，图标、状态及徽章由委托绘制。
 class DeviceDelegate final : public QStyledItemDelegate {
 public:
     using QStyledItemDelegate::QStyledItemDelegate;
     QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
     {
         auto size = QStyledItemDelegate::sizeHint(option, index);
-        size.setHeight(qMax(36, size.height() + 12));
+        size.setHeight(qMax(44, size.height() + 12));
         return size;
     }
     void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
@@ -51,21 +78,99 @@ public:
         QStyleOptionViewItem opt(option);
         initStyleOption(&opt, index);
         const QString name = opt.text, detail = index.data(detailRole).toString();
+        const auto badge = index.data(accessBadgeRole).toString();
         opt.text.clear();
+        opt.rect.adjust(1, 2, -1, -2);
         auto *style = opt.widget ? opt.widget->style() : QApplication::style();
-        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
-        const auto rect = opt.rect.adjusted(10, 0, -10, 0);
-        const auto &fm = opt.fontMetrics;
-        const int right = qMin(fm.horizontalAdvance(detail), rect.width() / 2);
         const bool selected = opt.state.testFlag(QStyle::State_Selected);
+        const auto group = !opt.state.testFlag(QStyle::State_Enabled) ? QPalette::Disabled
+                         : opt.state.testFlag(QStyle::State_Active) ? QPalette::Active : QPalette::Inactive;
+        const auto textColor = opt.palette.color(group, selected ? QPalette::HighlightedText : QPalette::Text);
+        const auto detailColor = opt.palette.color(group, selected ? QPalette::HighlightedText : QPalette::PlaceholderText);
+        QPainterPath card;
+        card.addRoundedRect(opt.rect, 8, 8);
         painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        painter->fillPath(card, opt.palette.brush(group, QPalette::AlternateBase));
+        painter->setClipPath(card, Qt::IntersectClip);
+        style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
+
+        const auto rect = opt.rect.adjusted(10, 0, -10, 0);
+        const int y = rect.center().y();
+        paintSystemIcon(*painter, QPoint(rect.left(), y - 8), index.data(osRole).toInt(), textColor);
+        const auto surface = opt.palette.color(group, selected ? QPalette::Highlight : QPalette::AlternateBase);
+        const bool dark = qGray(surface.rgb()) < 128;
+        const auto dot = index.data(onlineRole).toBool() ? QColor(dark ? "#6CD497" : "#237B49")
+                                                       : QColor(dark ? "#A1AAB6" : "#7C8795");
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(dot);
+        painter->drawEllipse(QPointF(rect.left() + 23, y), 3.5, 3.5);
+
+        const auto &fm = opt.fontMetrics;
+        const int right = qMin(fm.horizontalAdvance(detail), qMax(0, rect.width() / 2));
+        const auto nameRect = rect.adjusted(34, 0, -right - 10, 0);
+        auto badgeFont = opt.font;
+        badgeFont.setWeight(QFont::DemiBold);
+        if (badgeFont.pointSizeF() > 8)
+            badgeFont.setPointSizeF(badgeFont.pointSizeF() - 1);
+        const QFontMetrics badgeMetrics(badgeFont);
+        const int badgeWidth = badgeMetrics.horizontalAdvance(badge) + 12;
+        const bool showBadge = !badge.isEmpty() && nameRect.width() >= badgeWidth + 6 + fm.horizontalAdvance(u'…');
+        const auto shownName = fm.elidedText(name, Qt::ElideRight, qMax(0, nameRect.width() - (showBadge ? badgeWidth + 6 : 0)));
         painter->setFont(opt.font);
-        painter->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::Text));
-        painter->drawText(rect.adjusted(0, 0, -right - 10, 0), Qt::AlignVCenter | Qt::AlignLeft,
-                          fm.elidedText(name, Qt::ElideRight, qMax(0, rect.width() - right - 10)));
-        painter->setPen(opt.palette.color(selected ? QPalette::HighlightedText : QPalette::PlaceholderText));
+        painter->setPen(textColor);
+        painter->drawText(nameRect, Qt::AlignVCenter | Qt::AlignLeft, shownName);
+        painter->setPen(detailColor);
         painter->drawText(rect, Qt::AlignVCenter | Qt::AlignRight, fm.elidedText(detail, Qt::ElideRight, right));
+        if (showBadge) {
+            const int height = badgeMetrics.height() + 4;
+            const QRect badgeRect(nameRect.left() + fm.horizontalAdvance(shownName) + 6, y - height / 2, badgeWidth, height);
+            auto fill = textColor;
+            fill.setAlpha(30);
+            painter->setBrush(fill);
+            painter->setPen(Qt::NoPen);
+            painter->drawRoundedRect(badgeRect, 5, 5);
+            painter->setFont(badgeFont);
+            painter->setPen(textColor);
+            painter->drawText(badgeRect, Qt::AlignCenter, badge);
+        }
         painter->restore();
+    }
+
+private:
+    static void paintSystemIcon(QPainter &painter, const QPoint &origin, int os, const QColor &color)
+    {
+        painter.save();
+        painter.translate(origin);
+        if (os == int(DesktopOS::windows)) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(color);
+            painter.drawRect(QRectF(1, 1, 6, 6));
+            painter.drawRect(QRectF(9, 1, 6, 6));
+            painter.drawRect(QRectF(1, 9, 6, 6));
+            painter.drawRect(QRectF(9, 9, 6, 6));
+        } else {
+            painter.setPen(QPen(color, 1.25, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            painter.setBrush(Qt::NoBrush);
+            if (os == int(DesktopOS::macOS)) {
+                painter.drawRoundedRect(QRectF(1, 1, 14, 14), 3, 3);
+                QPainterPath face;
+                face.moveTo(8.5, 1.5);
+                face.lineTo(6.5, 8);
+                face.lineTo(9, 8);
+                face.lineTo(9, 14.5);
+                face.moveTo(4, 10);
+                face.quadTo(8, 13.5, 12, 10);
+                painter.drawPath(face);
+                painter.drawPoint(QPointF(4.5, 5.5));
+                painter.drawPoint(QPointF(11.5, 5.5));
+            } else {
+                painter.drawRoundedRect(QRectF(1, 1.5, 14, 10.5), 2, 2);
+                painter.drawLine(QPointF(8, 12), QPointF(8, 14.5));
+                painter.drawLine(QPointF(5.5, 14.5), QPointF(10.5, 14.5));
+            }
+        }
+        painter.restore();
     }
 };
 
@@ -81,6 +186,83 @@ void showDiagnostics(LanProbe &probe, QWidget *owner)
     diagnostics->showNormal();
     diagnostics->raise();
     diagnostics->activateWindow();
+}
+
+void showPermissions(QWidget *owner)
+{
+    auto *dialog = owner->findChild<QDialog *>("permissionsDialog", Qt::FindDirectChildrenOnly);
+    if (!dialog) {
+        dialog = new QDialog(owner);
+        dialog->setObjectName("permissionsDialog");
+        dialog->setWindowTitle(QObject::tr("权限检查"));
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setMinimumWidth(460);
+        auto *layout = new QVBoxLayout(dialog);
+        auto *rows = new QGridLayout;
+        rows->setColumnStretch(1, 1);
+        rows->setVerticalSpacing(10);
+        layout->addLayout(rows);
+        const auto addStatus = [dialog, rows](int row, const QString &name) {
+            rows->addWidget(new QLabel(name, dialog), row, 0, Qt::AlignTop);
+            auto *status = label(dialog);
+            rows->addWidget(status, row, 1, Qt::AlignTop);
+            return status;
+        };
+        const auto screenTitle = QObject::tr("屏幕录制");
+        const auto accessibilityTitle = QObject::tr("辅助功能");
+        const auto networkTitle = QObject::tr("本地网络");
+        auto *screen = addStatus(0, screenTitle);
+        auto *accessibility = addStatus(1, accessibilityTitle);
+        auto *network = addStatus(2, networkTitle);
+#ifdef Q_OS_MACOS
+        const auto addSettings = [dialog, rows](int row, const QString &name, PermissionKind kind) {
+            auto *open = new QPushButton(QObject::tr("打开系统设置"), dialog);
+            open->setAccessibleName(QObject::tr("打开「%1」系统设置").arg(name));
+            open->setAutoDefault(false);
+            rows->addWidget(open, row, 2, Qt::AlignTop);
+            QObject::connect(open, &QPushButton::clicked, dialog, [kind] { openSystemPermissionSettings(kind); });
+        };
+        addSettings(0, screenTitle, PermissionKind::ScreenRecording);
+        addSettings(1, accessibilityTitle, PermissionKind::Accessibility);
+        addSettings(2, networkTitle, PermissionKind::LocalNetwork);
+        network->setText(QObject::tr("macOS 15 及更新版本请在「隐私与安全性 → 本地网络」中允许 WWMM Remote。"));
+#else
+        network->setText(QObject::tr("发现设备需要两端位于同一局域网，且 Windows 防火墙允许 WWMM Remote 通信。"));
+#endif
+        const auto refresh = [screen, accessibility] {
+            const auto permissions = checkDesktopPermissions();
+#ifdef Q_OS_MACOS
+            const auto update = [](QLabel *status, bool granted) {
+                auto palette = status->palette();
+                const bool dark = qGray(palette.color(QPalette::Window).rgb()) < 128;
+                palette.setColor(QPalette::WindowText, granted ? QColor(dark ? "#67D391" : "#197642")
+                                                               : QColor(dark ? "#FFAF62" : "#995200"));
+                status->setPalette(palette);
+                status->setText(granted ? QObject::tr("已授权") : QObject::tr("未授权"));
+            };
+            update(screen, permissions.screenRecording);
+            update(accessibility, permissions.accessibility);
+#else
+            screen->setText(permissions.screenRecording ? QObject::tr("普通交互桌面可用。") : QObject::tr("不可用。"));
+            accessibility->setText(permissions.accessibility
+                                       ? QObject::tr("可控制普通应用。UAC 安全桌面和高权限窗口受系统限制。")
+                                       : QObject::tr("不可用。"));
+#endif
+        };
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+        auto *recheck = buttons->addButton(QObject::tr("重新检测"), QDialogButtonBox::ActionRole);
+        recheck->setObjectName("refreshPermissions");
+        QObject::connect(recheck, &QPushButton::clicked, dialog, refresh);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+#ifdef Q_OS_MACOS
+        QObject::connect(QApplication::styleHints(), &QStyleHints::colorSchemeChanged, dialog, refresh);
+#endif
+        layout->addWidget(buttons);
+        refresh();
+    }
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 QPushButton *menuButton(const QString &title, QWidget *parent)
@@ -185,6 +367,15 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     autoConnect_->setCheckable(true);
     autoConnect_->setChecked(QSettings().value("desktop/autoConnect", true).toBool());
     autoConnect_->setToolTip(tr("打开应用时连接上次的设备，意外断线后自动重连"));
+    auto *autoClipboard = settings->addAction(tr("连接时自动开启剪贴板同步"));
+    autoClipboard->setObjectName("autoClipboardSetting");
+    autoClipboard->setCheckable(true);
+    autoClipboard->setChecked(TransferBar::autoClipboardSync());
+    connect(settings, &QMenu::aboutToShow, autoClipboard, [autoClipboard] {
+        const QSignalBlocker block(autoClipboard);
+        autoClipboard->setChecked(TransferBar::autoClipboardSync());
+    });
+    connect(autoClipboard, &QAction::toggled, this, &TransferBar::setAutoClipboardSync);
 #ifdef Q_OS_WIN
     auto *macKeys = settings->addAction(tr("自动映射 Mac 按键关系"));
     macKeys->setObjectName("autoMapMacKeys");
@@ -198,20 +389,78 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         desktop_->setAutoMacKeys(enabled);
     });
 #endif
+    auto *permissions = local->menu()->addAction(tr("权限检查…"));
+    permissions->setObjectName("openPermissions");
+    connect(permissions, &QAction::triggered, this, [this] { showPermissions(this); });
     auto *diagnostics = local->menu()->addAction(tr("连接检测…"));
     connect(diagnostics, &QAction::triggered, this, [this] { showDiagnostics(probe_, this); });
-    localCode_ = label(this);
+
+    pairCodeCard_ = new QFrame(this);
+    pairCodeCard_->setObjectName("pairCodeCard");
+    pairCodeCard_->setStyleSheet(QStringLiteral(R"(
+        QFrame#pairCodeCard {
+            background: palette(base); border: 1px solid palette(midlight); border-radius: 10px;
+        }
+        QProgressBar#pairCountdownBar {
+            background: palette(midlight); border: none; border-radius: 3px;
+        }
+        QProgressBar#pairCountdownBar::chunk {
+            background: palette(highlight); border-radius: 3px;
+        }
+    )"));
+    auto *card = new QVBoxLayout(pairCodeCard_);
+    card->setContentsMargins(12, 10, 12, 10);
+    card->setSpacing(6);
+    auto *codeRow = new QHBoxLayout;
+    localCode_ = label(pairCodeCard_);
     localCode_->setObjectName("localPairCode");
+    localCode_->setAccessibleName(tr("本机配对码"));
     localCode_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    layout->addWidget(localCode_);
-    pairAccess_ = new QCheckBox(tr("允许持此配对码的设备以后直接查看和控制本机"), this);
-    layout->addWidget(pairAccess_);
+    localCode_->setWordWrap(false);
+    auto codeFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    codeFont.setPointSize(qMax(20, codeFont.pointSize() + 8));
+    codeFont.setBold(true);
+    codeFont.setLetterSpacing(QFont::AbsoluteSpacing, 3);
+    localCode_->setFont(codeFont);
+    codeRow->addWidget(localCode_, 1);
+    copyCode_ = new QPushButton(tr("复制配对码"), pairCodeCard_);
+    copyCode_->setObjectName("copyPairCode");
+    copyCode_->setMinimumWidth(copyCode_->sizeHint().width());
+    codeRow->addWidget(copyCode_);
+    card->addLayout(codeRow);
+    pairCodeDetails_ = label(pairCodeCard_);
+    card->addWidget(pairCodeDetails_);
+    pairCountdownBar_ = new QProgressBar(pairCodeCard_);
+    pairCountdownBar_->setObjectName("pairCountdownBar");
+    pairCountdownBar_->setAccessibleName(tr("配对码剩余时间"));
+    pairCountdownBar_->setRange(0, pairCodeLifetime);
+    pairCountdownBar_->setTextVisible(false);
+    pairCountdownBar_->setFixedHeight(6);
+    card->addWidget(pairCountdownBar_);
+    pairAccess_ = new QCheckBox(tr("允许持此配对码的设备以后直接查看和控制本机"), pairCodeCard_);
+    card->addWidget(pairAccess_);
+    layout->addWidget(pairCodeCard_);
+    copyFeedback_.setSingleShot(true);
+    copyFeedback_.setInterval(1500);
+    connect(&copyFeedback_, &QTimer::timeout, this, [this] { copyCode_->setText(tr("复制配对码")); });
+    connect(copyCode_, &QPushButton::clicked, this, [this] {
+        const auto code = pairing_.code();
+        if (code.isEmpty() || pairing_.secondsLeft() <= 0)
+            return;
+        QApplication::clipboard()->setText(code);
+        copyCode_->setText(tr("已复制"));
+        copyFeedback_.start();
+    });
     connect(pairAccess_, &QCheckBox::clicked, this, [this](bool allow) {
         QSettings().setValue(directPairingSetting, allow);
         pairing_.setOfferDirectAccess(allow);
     });
 
+#ifdef Q_OS_WIN
+    layout->addWidget(new DesktopControls(*desktop_, discovery, settings, this, macKeys));
+#else
     layout->addWidget(new DesktopControls(*desktop_, discovery, settings, this));
+#endif
     list_ = new QListWidget(this);
     list_->setObjectName("deviceList");
     list_->setAccessibleName(tr("局域网设备"));
@@ -237,8 +486,6 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
     code_->setObjectName("peerCode");
     code_->setAccessibleName(tr("对方的配对码"));
     code_->setPlaceholderText(tr("对方的 8 位配对码"));
-    code_->setMaxLength(8);
-    code_->setValidator(new QRegularExpressionValidator(QRegularExpression("[0-9]{0,8}"), code_));
     actions->addWidget(code_, 1);
     actions->addStretch();
     more_ = menuButton(tr("更多"), this);
@@ -284,7 +531,35 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
             pendingPeer_.clear();
         updateActions();
     });
-    connect(code_, &QLineEdit::textChanged, this, &DevicesPanel::updateActions);
+    connect(list_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
+        if (item == list_->currentItem())
+            connectSelectedDevice();
+    });
+    auto *connectShortcut = new QShortcut(list_);
+    connectShortcut->setKeys({QKeySequence(Qt::Key_Return), QKeySequence(Qt::Key_Enter)});
+    connectShortcut->setContext(Qt::WidgetShortcut);
+    connectShortcut->setAutoRepeat(false);
+    connect(connectShortcut, &QShortcut::activated, this, &DevicesPanel::connectSelectedDevice);
+    connect(code_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        QString clean;
+        clean.reserve(pairCodeLength);
+        const int position = code_->cursorPosition();
+        int cursor = 0;
+        for (qsizetype i = 0; i < text.size() && clean.size() < pairCodeLength; ++i) {
+            const auto digit = text.at(i);
+            if (isPairCodeDigit(digit)) {
+                clean += digit;
+                if (i < position)
+                    ++cursor;
+            }
+        }
+        if (clean != text) {
+            const QSignalBlocker block(code_);
+            code_->setText(clean);
+            code_->setCursorPosition(cursor);
+        }
+        updateActions();
+    });
     connect(code_, &QLineEdit::returnPressed, pair_, &QPushButton::click);
     connect(primary_, &QPushButton::clicked, this, [this] { requestDesktop(primaryControl_); });
     connect(view_, &QAction::triggered, this, [this] { requestDesktop(false); });
@@ -315,8 +590,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
         const auto key = selectedKey();
         const auto &online = discovery_.devicesByKey();
         const auto peer = online.constFind(key);
-        if (peer != online.cend() && (!store_.peers().contains(key) || key == repairKey_) &&
-            code_->text().size() == 8 && code_->hasAcceptableInput()) {
+        if (peer != online.cend() && (!store_.peers().contains(key) || key == repairKey_) && isPairCode(code_->text())) {
             const auto target = *peer;
             pendingPeer_.clear();
             repairKey_.clear();
@@ -336,6 +610,7 @@ DevicesPanel::DevicesPanel(LanProbe &probe, Discovery &discovery, Pairing &pairi
             pairing_.cancelOffer();
     });
     countdown_.setInterval(1000);
+    countdown_.setTimerType(Qt::PreciseTimer);
     connect(&countdown_, &QTimer::timeout, this, &DevicesPanel::updateOffer);
     connect(&pairing, &Pairing::stateChanged, this, [this] {
         updateOffer();
@@ -435,13 +710,13 @@ void DevicesPanel::refreshList()
         }))
         QSettings().setValue(recentSetting_, recent_);
 
-    struct Row { QByteArray key; QString name, detail; int group, recency; };
+    struct Row { QByteArray key; QString name, detail; int group; qsizetype recency; };
     QList<Row> rows;
     QHash<QString, int> names;
     auto append = [&](const QByteArray &key, const QString &name, const QString &detail, int group) {
         const auto hex = key.toHex();
-        const int rank = recent_.indexOf(QStringLiteral("c") + hex);
-        const int recent = rank < 0 ? recent_.indexOf(QStringLiteral("v") + hex) : rank;
+        const auto rank = recent_.indexOf(QStringLiteral("c") + hex);
+        const auto recent = rank < 0 ? recent_.indexOf(QStringLiteral("v") + hex) : rank;
         rows.append({key, name, detail, group, recent < 0 ? 5 : recent});
         ++names[name];
     };
@@ -488,11 +763,19 @@ void DevicesPanel::refreshList()
             list_->insertItem(i, list_->takeItem(list_->row(item)));
         }
         const auto name = names.value(row.name) > 1 ? tr("%1 · %2").arg(row.name, fingerprint(row.key)) : row.name;
-        if (item->text() != name || item->data(detailRole).toString() != row.detail) {
-            item->setText(name);
-            item->setData(detailRole, row.detail);
-            item->setData(Qt::AccessibleTextRole, name + QStringLiteral(" · ") + row.detail);
-        }
+        const auto peer = online.constFind(row.key);
+        const bool present = peer != online.cend();
+        if (present)
+            item->setData(osRole, static_cast<int>(peer->os));
+        const auto badge = store_.allowsDirectAccess(row.key) ? tr("免确认") : QString{};
+        item->setText(name);
+        item->setData(detailRole, row.detail);
+        item->setData(onlineRole, present);
+        item->setData(accessBadgeRole, badge);
+        auto accessible = name + QStringLiteral(" · ") + row.detail;
+        if (!badge.isEmpty())
+            accessible += QStringLiteral(" · ") + badge;
+        item->setData(Qt::AccessibleTextRole, accessible);
     }
     if (!previous.isEmpty())
         list_->setCurrentItem(items.value(previous));
@@ -542,7 +825,7 @@ void DevicesPanel::updateActions()
     code_->setVisible(pairable && !busy);
     pair_->setVisible(pairable || busy);
     pair_->setText(busy ? tr("取消配对") : autoConnect_->isChecked() ? tr("配对并连接") : tr("配对"));
-    pair_->setEnabled(busy || (pairable && code_->text().size() == 8));
+    pair_->setEnabled(busy || (pairable && isPairCode(code_->text())));
     auto hint = discovery_.issue();
     if (hint.isEmpty() && trusted && !repairing && idle && !busy) {
         if (!present)
@@ -560,23 +843,40 @@ void DevicesPanel::updateActions()
 void DevicesPanel::updateOffer()
 {
     const auto code = pairing_.code();
+    const int seconds = pairing_.secondsLeft();
+    const bool active = !code.isEmpty() && seconds > 0;
     offer_->setText(pairing_.preparing() ? tr("正在生成…") : code.isEmpty() ? tr("本机配对码") : tr("取消配对码"));
     const bool controlled = desktop_->state() == DesktopSession::Sharing && desktop_->interactive();
     offer_->setEnabled(!store_.publicKey().isEmpty() && !pairing_.preparing() && probe_.receiving() &&
                        !probe_.endpoints().isEmpty());
     offer_->setToolTip(!probe_.receiving() ? tr("在「本机」菜单中开启局域网发现") : QString{});
-    localCode_->setVisible(!code.isEmpty());
+    pairCodeCard_->setVisible(active);
     pairAccess_->setEnabled(!controlled);
-    pairAccess_->setVisible(!code.isEmpty());
-    if (code.isEmpty()) {
+    if (!active) {
         countdown_.stop();
+        copyFeedback_.stop();
+        copyCode_->setText(tr("复制配对码"));
         localCode_->clear();
-    } else {
-        localCode_->setText(tr("配对码 %1　·　剩余 %2 秒　·　可尝试 %3 次")
-                                .arg(code).arg(pairing_.secondsLeft()).arg(pairing_.attemptsLeft()));
-        if (!countdown_.isActive())
-            countdown_.start();
+        pairCodeDetails_->clear();
+        pairCountdownBar_->setValue(0);
+        return;
     }
+    localCode_->setText(code);
+    pairCodeDetails_->setText(tr("剩余 %1 秒 · 可尝试 %2 次").arg(seconds).arg(pairing_.attemptsLeft()));
+    pairCountdownBar_->setValue(qMin(seconds, pairCodeLifetime));
+    if (!countdown_.isActive())
+        countdown_.start();
+}
+
+void DevicesPanel::connectSelectedDevice()
+{
+    if (desktop_->state() != DesktopSession::Idle || pairing_.busy() || pairing_.preparing() || !pairing_.code().isEmpty())
+        return;
+    const auto key = selectedKey();
+    const auto &online = discovery_.devicesByKey();
+    const auto peer = online.constFind(key);
+    if (key != repairKey_ && store_.peers().contains(key) && peer != online.cend() && peer->canRequestDesktop(primaryControl_))
+        requestDesktop(primaryControl_);
 }
 
 void DevicesPanel::requestDesktop(bool control)

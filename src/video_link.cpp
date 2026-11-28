@@ -70,7 +70,7 @@ struct VideoLink::Impl {
     bool sending;
     QUdpSocket udp;
     QTimer timer, audioTimer;
-    QTimer historyExpiry;
+    QTimer historyExpiry, statsTimer;
     std::shared_ptr<AudioStream> audio;
     srtp_t audioContext = nullptr;
     quint16 audioSequence = quint16(QRandomGenerator::global()->generate());
@@ -86,6 +86,9 @@ struct VideoLink::Impl {
     std::optional<quint32> highest, lastTransit;
     quint32 base = 0, previousExpected = 0, previousCount = 0, receivedCount = 0;
     double jitter = 0;
+    QElapsedTimer statsClock;
+    qint64 mediaBytes = 0, videoBytes = 0;
+    quint32 statsExpected = 0, statsReceived = 0;
     webrtc::IntervalBudget budget{140000, false};
     quint16 sequence = quint16(QRandomGenerator::system()->generate());
     std::deque<QByteArray> pending;
@@ -134,6 +137,8 @@ VideoLink::VideoLink(bool sender, QObject *parent) : QObject(parent), p_(std::ma
     p_->timer.setTimerType(Qt::PreciseTimer);
     p_->timer.setInterval(2);
     connect(&p_->timer, &QTimer::timeout, this, &VideoLink::tick);
+    p_->statsTimer.setInterval(1000);
+    connect(&p_->statsTimer, &QTimer::timeout, this, &VideoLink::sampleReception);
     connect(&p_->udp, &QUdpSocket::readyRead, this, &VideoLink::receive);
 }
 VideoLink::~VideoLink() = default;
@@ -160,9 +165,15 @@ bool VideoLink::connectPeer(const Endpoint &peer, const QByteArray &keys, const 
     if (!audioKey.isEmpty() &&
         (audioKey.size() != 30 || !configure(p_->audioContext, audioKey.constData(), audioSsrc)))
         return false;
-    return configure(p_->outbound, p_->sending ? senderKey : viewerKey,
-                     p_->sending ? videoSsrc : viewerSsrc) &&
-           configure(p_->inbound, p_->sending ? viewerKey : senderKey, p_->sending ? viewerSsrc : videoSsrc);
+    const bool configured = configure(p_->outbound, p_->sending ? senderKey : viewerKey,
+                                      p_->sending ? videoSsrc : viewerSsrc) &&
+                            configure(p_->inbound, p_->sending ? viewerKey : senderKey,
+                                      p_->sending ? viewerSsrc : videoSsrc);
+    if (configured && !p_->sending) {
+        p_->statsClock.start();
+        p_->statsTimer.start();
+    }
+    return configured;
 }
 
 void VideoLink::setQuality(VideoQuality quality, bool keepEstimate)
@@ -306,7 +317,8 @@ void VideoLink::receive()
     QHostAddress source;
     quint16 port = 0;
     for (int i = 0; i < 256 && p_->udp.hasPendingDatagrams(); ++i) {
-        int len = int(p_->udp.readDatagram(wire.data(), wire.size(), &source, &port));
+        const int wireSize = int(p_->udp.readDatagram(wire.data(), wire.size(), &source, &port));
+        int len = wireSize;
         if (!p_->inbound || len < 14 || len > 1350 || port != p_->peer.port ||
             !source.isEqual(p_->peer.address, QHostAddress::ConvertV4MappedToIPv4))
             continue;
@@ -315,6 +327,7 @@ void VideoLink::receive()
                 qFromBigEndian<quint32>(wire.data() + 8) == audioSsrc &&
                 srtp_unprotect(p_->audioContext, wire.data(), &len) == srtp_err_status_ok && len > 20 &&
                 qFromBigEndian<quint64>(wire.data() + 12) == p_->audio->generation()) {
+                p_->mediaBytes += wireSize;
                 p_->audio->receive(qFromBigEndian<quint32>(wire.data() + 4), QByteArray(wire.data() + 20, len - 20));
             }
             continue;
@@ -327,18 +340,20 @@ void VideoLink::receive()
         if (p_->sending)
             onFeedback(data);
         else
-            onRtp(data);
+            onRtp(data, wireSize);
     }
     if (p_->udp.hasPendingDatagrams())
         QTimer::singleShot(0, this, &VideoLink::receive);
 }
 
-void VideoLink::onRtp(QByteArrayView data)
+void VideoLink::onRtp(QByteArrayView data, int wireSize)
 {
     if (data.size() <= 20 || quint8(data[0]) != 0x90 || (quint8(data[1]) & 127) != 96 ||
         qFromBigEndian<quint32>(data.constData() + 8) != videoSsrc ||
         qFromBigEndian<quint32>(data.constData() + 12) != 0xbede0001 || data[16] != 0x10)
         return;
+    p_->mediaBytes += wireSize;
+    p_->videoBytes += data.size() - 20;
     const auto timestamp = qFromBigEndian<quint32>(data.constData() + 4);
     const auto seq = qFromBigEndian<quint16>(data.constData() + 2);
     reportReception(seq, timestamp);
@@ -505,6 +520,28 @@ void VideoLink::reportReception(quint16 seq, quint32 stamp)
     p_->previousExpected = expected;
     p_->reportTime = now;
 }
+
+void VideoLink::sampleReception()
+{
+    const auto elapsed = qMax<qint64>(1, p_->statsClock.restart());
+    VideoReceptionStats stats;
+    stats.mediaBytesPerSecond = p_->mediaBytes * 1000 / elapsed;
+    stats.videoBitsPerSecond = p_->videoBytes * 8000 / elapsed;
+    p_->mediaBytes = p_->videoBytes = 0;
+
+    // 复用 RTCP 接收计数与抖动估算，界面的采样窗口独立于线上的接收报告。
+    const quint32 expected = p_->highest ? *p_->highest - p_->base + 1 : 0;
+    const auto interval = expected - p_->statsExpected;
+    const auto received = p_->receivedCount - p_->statsReceived;
+    if (interval)
+        stats.lossPercent = 100.0 * (interval - qMin(interval, received)) / interval;
+    if (received && p_->receivedCount > 1)
+        stats.jitterMs = p_->jitter / 90.0;
+    p_->statsExpected = expected;
+    p_->statsReceived = p_->receivedCount;
+    emit receptionStats(stats);
+}
+
 // A reduced-size RTCP APP packet shares the authenticated viewer-to-host media socket.
 void VideoLink::sendPointer(const QByteArray &input)
 {

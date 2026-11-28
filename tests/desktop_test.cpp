@@ -1,5 +1,7 @@
 #include "desktop_session.h"
 #include "clipboard_images.h"
+#include "desktop_controls.h"
+#include "desktop_viewer.h"
 #include <QMimeData>
 #include <cmath>
 #include "native_desktop.h"
@@ -262,6 +264,57 @@ class DesktopTest final : public QObject
         QVERIFY(!paste.isPasteShortcut(DesktopOS::windows));
         paste.mods = 12;
         QVERIFY(!paste.isPasteShortcut(DesktopOS::windows));
+    }
+
+    void remoteSystemShortcuts_data()
+    {
+        QTest::addColumn<bool>("macSource");
+        QTest::addColumn<bool>("macTarget");
+        QTest::newRow("mac-to-mac") << true << true;
+        QTest::newRow("windows-to-windows") << false << false;
+        QTest::newRow("windows-to-mac") << false << true;
+        QTest::newRow("mac-to-windows") << true << false;
+    }
+
+    void remoteSystemShortcuts()
+    {
+        QFETCH(bool, macSource);
+        QFETCH(bool, macTarget);
+        const auto source = macSource ? DesktopOS::macOS : DesktopOS::windows;
+        const auto target = macTarget ? DesktopOS::macOS : DesktopOS::windows;
+        using enum RemoteShortcut;
+        const QList<QPair<RemoteShortcut, QList<int>>> shortcuts{
+            {SwitchApp, {macTarget ? 227 : 226, 43, -43, macTarget ? -227 : -226}},
+            {LockScreen, macTarget ? QList<int>{224, 227, 20, -20, -224, -227} : QList<int>{227, 15, -15, -227}},
+            {Search, macTarget ? QList<int>{227, 44, -44, -227} : QList<int>{227, 22, -22, -227}},
+            {Overview, macTarget ? QList<int>{224, 82, -82, -224} : QList<int>{227, 43, -43, -227}},
+            {ShowDesktop, macTarget ? QList<int>{68, -68} : QList<int>{227, 7, -7, -227}}};
+        RecordingSink sink;
+        HostInput host(source, target, sink);
+        host.setFocus(InputFocus::Text);
+        for (const auto &[shortcut, expected] : shortcuts) {
+            if (!macSource && macTarget) {
+                auto mapped = keyEvent(InputKind::KeyUp, 226, 0);
+                mapped.macKeyboard = true;
+                QVERIFY(host.apply(mapped));
+            }
+            for (const auto &event : remoteShortcutEvents(shortcut, target)) {
+                const auto packet = readInput(packInput(event));
+                QVERIFY(packet && !packet->macKeyboard);
+                QVERIFY(applyRemoteInput(host, sink, *packet, macSource && !macTarget));
+            }
+            QCOMPARE(sink.keys, expected);
+            for (const int usage : sink.keys)
+                QVERIFY(nativeKeyCode(target, quint8(qAbs(usage))) >= 0);
+            host.release();
+            QCOMPARE(sink.keys, expected);
+            sink.keys.clear();
+        }
+        if (macSource && !macTarget) {
+            for (const auto &event : remoteShortcutEvents(Overview, target))
+                QVERIFY(applyRemoteInput(host, sink, event, false));
+            QCOMPARE(sink.keys, QList<int>({226, 43, -43, -226}));
+        }
     }
 
     void textAndRelease()
@@ -640,6 +693,66 @@ class DesktopTest final : public QObject
         for (int ms = 30500; ms <= 50000; ms += 500)
             tier = policy.observe(tier, VideoQuality::FullHD, ms, 0, 3, false);
         QCOMPARE(tier, VideoQuality::FullHD);
+    }
+
+    void desktopRttUpdates_data()
+    {
+        QTest::addColumn<bool>("rttProbe");
+        QTest::newRow("v17-live-rtt") << true;
+        QTest::newRow("v16-no-rtt") << false;
+    }
+
+    void desktopRttUpdates()
+    {
+        QFETCH(bool, rttProbe);
+        Node viewer, host;
+        QVERIFY(!viewer.probe.endpoints().isEmpty() && !host.probe.endpoints().isEmpty());
+        viewer.trust(host);
+        host.trust(viewer);
+        auto peer = host.target();
+        peer.extendedDesktop = peer.richMedia = peer.adaptiveVideo = peer.cursorVisibility = true;
+        peer.rttProbe = rttProbe;
+        viewer.session.setRemoteCursorVisible(false);
+        viewer.session.view(peer);
+        QTRY_COMPARE(host.session.state(), DesktopSession::Requested);
+        host.session.accept();
+        host.session.updateHostDisplays({{1, "Main", {1920, 1080}, true, "primary"}});
+        QTRY_COMPARE(viewer.session.displayId(), 1u);
+        QCOMPARE(viewer.session.state(), DesktopSession::Viewing);
+        QVERIFY(viewer.session.canSetRemoteCursor());
+        QVERIFY(!host.session.captureCursorVisible());
+        QCOMPARE(viewer.session.supportsRttProbe(), rttProbe);
+        QCOMPARE(host.session.supportsRttProbe(), rttProbe);
+        QVERIFY(viewer.session.connectionStats().tcpConnectMs);
+        QVERIFY(!viewer.session.connectionStats().adaptiveReduced);
+        QSignalSpy samples(&viewer.session, &DesktopSession::connectionStatsChanged);
+        QVERIFY(host.session.reduceQuality());
+        QTRY_COMPARE(viewer.session.quality(), VideoQuality::HD);
+        QVERIFY(host.session.connectionStats().adaptiveReduced);
+        QVERIFY(viewer.session.connectionStats().adaptiveReduced);
+        QVERIFY(!samples.isEmpty());
+        host.session.sendFrame(fixture(), rtpTime(videoClockUs()), true);
+        QTRY_VERIFY(viewer.session.connectionStats().videoBitsPerSecond > 0);
+        QVERIFY(viewer.session.connectionStats().adaptiveReduced);
+        viewer.session.chooseQuality(VideoQuality::QHD);
+        QTRY_COMPARE(viewer.session.qualityLimit(), VideoQuality::QHD);
+        QVERIFY(!viewer.session.connectionStats().adaptiveReduced);
+
+        if (rttProbe) {
+            QTRY_VERIFY_WITH_TIMEOUT(viewer.session.connectionStats().rttMs, 1500);
+            const auto first = *viewer.session.connectionStats().rttMs;
+            QVERIFY(first >= 0.0);
+            QTRY_VERIFY_WITH_TIMEOUT(viewer.session.connectionStats().rttMs != first, 3500);
+        } else {
+            QTest::qWait(2200);
+            QVERIFY(!viewer.session.connectionStats().rttMs);
+        }
+        QCOMPARE(viewer.session.state(), DesktopSession::Viewing);
+        viewer.session.stop();
+        QTRY_COMPARE(host.session.state(), DesktopSession::Idle);
+        QVERIFY(!viewer.session.supportsRttProbe() && !host.session.supportsRttProbe());
+        const auto reset = viewer.session.connectionStats();
+        QVERIFY(!reset.rttMs && !reset.tcpConnectMs && !reset.adaptiveReduced);
     }
 
     void officeSession()

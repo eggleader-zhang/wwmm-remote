@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Carbon/Carbon.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include "native_input.h"
 #include <algorithm>
 #include <cmath>
@@ -205,6 +206,30 @@ void watchDesktopPower(QObject *context, std::function<void(bool)> callback)
         [center removeObserver:sleep];
         [center removeObserver:wake];
     });
+}
+
+DesktopPermissions checkDesktopPermissions()
+{
+    return {CGPreflightScreenCaptureAccess(), AXIsProcessTrusted() != 0};
+}
+
+bool openSystemPermissionSettings(PermissionKind kind)
+{
+    @autoreleasepool {
+        NSString *address = nil;
+        switch (kind) {
+        case PermissionKind::ScreenRecording:
+            address = @"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+            break;
+        case PermissionKind::Accessibility:
+            address = @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+            break;
+        case PermissionKind::LocalNetwork:
+            address = @"x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork";
+            break;
+        }
+        return address && [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:address]];
+    }
 }
 
 bool allowRemoteInput(QString &reason)

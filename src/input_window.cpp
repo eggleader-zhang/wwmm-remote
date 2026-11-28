@@ -424,11 +424,13 @@ bool InputWindow::event(QEvent *ev)
     if (fileDrops_ &&
         (ev->type() == QEvent::DragEnter || ev->type() == QEvent::DragMove || ev->type() == QEvent::Drop)) {
         auto *drop = static_cast<QDropEvent *>(ev);
-        const auto path = droppedFile(drop->mimeData());
-        if (!path.isEmpty()) {
+        const auto paths = droppedFiles(drop->mimeData());
+        if (!paths.isEmpty()) {
             drop->acceptProposedAction();
-            if (ev->type() == QEvent::Drop)
-                emit fileDropped(path);
+            if (ev->type() == QEvent::Drop) {
+                emit filesDropped(paths);
+                emit fileDropped(paths.first());
+            }
             return true;
         }
     }

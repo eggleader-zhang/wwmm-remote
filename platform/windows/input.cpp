@@ -183,6 +183,16 @@ void watchDesktopPower(QObject *context, std::function<void(bool)> callback)
     new PowerFilter(context, std::move(callback));
 }
 
+DesktopPermissions checkDesktopPermissions()
+{
+    return {true, true};
+}
+
+bool openSystemPermissionSettings(PermissionKind)
+{
+    return false;
+}
+
 bool allowRemoteInput(QString &)
 {
     return true;

@@ -14,6 +14,8 @@ public:
                  Mode mode = Mode::Control);
 
   qint64 pendingBytes() const { return socket_->bytesToWrite(); }
+  QString tlsVersion() const;
+  QString cipherSuite() const;
 
   static constexpr int maxDataFrame = 16384 + 64;
   void start();

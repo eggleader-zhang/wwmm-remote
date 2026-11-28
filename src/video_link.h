@@ -2,11 +2,19 @@
 #include "lan_address.h"
 #include "audio_stream.h"
 #include "video_packets.h"
+#include <QMetaType>
 #include <QObject>
 #include <memory>
+#include <optional>
 
 namespace wwmm
 {
+struct VideoReceptionStats {
+    qint64 mediaBytesPerSecond = 0;
+    qint64 videoBitsPerSecond = 0;
+    std::optional<double> jitterMs, lossPercent;
+};
+
 class VideoLink final : public QObject
 {
     Q_OBJECT
@@ -26,6 +34,7 @@ signals:
     void keyframeNeeded();
     void bitrateChanged(int bitsPerSecond);
     void receptionSample(qint64 nowMs, int loss256, int jitterMs, bool queued);
+    void receptionStats(const wwmm::VideoReceptionStats &stats);
     void failed(const QString &reason);
     void transportLost(const QString &reason);
 
@@ -33,8 +42,9 @@ private:
   void pumpAudio();
   void receive();
   void tick();
-  void onRtp(QByteArrayView data);
+  void onRtp(QByteArrayView data, int wireSize);
   void reportReception(quint16 seq, quint32 stamp);
+  void sampleReception();
   void onFeedback(QByteArrayView data);
   void deliver();
   void sendFeedback(bool pli, quint16 seq = 0, quint16 mask = 0);
@@ -42,3 +52,5 @@ private:
   std::unique_ptr<Impl> p_;
 };
 } // namespace wwmm
+
+Q_DECLARE_METATYPE(wwmm::VideoReceptionStats)

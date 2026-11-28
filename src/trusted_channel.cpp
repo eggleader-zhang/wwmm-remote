@@ -150,6 +150,17 @@ bool TrustedChannel::send(const QByteArray &message)
     return !ended_;
 }
 
+QString TrustedChannel::tlsVersion() const
+{
+    return ready_ ? QString::fromLatin1(SSL_get_version(tls_.get())).replace("TLSv", "TLS ") : QString{};
+}
+
+QString TrustedChannel::cipherSuite() const
+{
+    const auto *cipher = ready_ ? SSL_get_current_cipher(tls_.get()) : nullptr;
+    return cipher ? QString::fromLatin1(SSL_CIPHER_get_name(cipher)) : QString{};
+}
+
 QByteArray TrustedChannel::mediaKeys(bool audio) const
 {
     const QByteArrayView label = audio ? QByteArrayView("EXPORTER-WWMM-system-audio-v1")

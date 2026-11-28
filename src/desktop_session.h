@@ -9,8 +9,22 @@
 #include <QElapsedTimer>
 #include <QTimer>
 #include <functional>
+#include <optional>
 
 namespace wwmm {
+struct ConnectionStats {
+    QString tlsVersion, cipherSuite;
+    Endpoint peer{};
+    std::optional<double> tcpConnectMs, rttMs, jitterMs, lossPercent;
+    qint64 mediaBytesPerSecond = 0, videoBitsPerSecond = 0;
+    VideoQuality quality = VideoQuality::FullHD;
+    int framesPerSecond = 0;
+    QSize frameSize;
+    std::optional<DesktopOS> peerOS;
+    bool audioEnabled = false;
+    bool adaptiveReduced = false;
+};
+
 class DesktopSession final : public QObject {
     Q_OBJECT
   public:
@@ -26,6 +40,7 @@ class DesktopSession final : public QObject {
     void releaseUpdate() { installing_ = false; }
 
     QString peerName() const;
+    ConnectionStats connectionStats() const;
     void view(const NearbyDevice &peer, bool withInput = false);
 
     bool interactive() const { return interactive_; }
@@ -63,6 +78,7 @@ class DesktopSession final : public QObject {
     DesktopOS peerOS() const { return peerOS_; }
 
     bool usesMacKeyboard() const { return state_ == Viewing && macKeyboardProtocol_ && autoMacKeys_; }
+    bool supportsRttProbe() const { return rttProtocol_; }
     void setAutoMacKeys(bool enabled);
     bool canSetRemoteCursor() const { return cursorProtocol_ && !cursorUnavailable_; }
     bool prefersRemoteCursor() const { return preferCursor_; }
@@ -70,7 +86,7 @@ class DesktopSession final : public QObject {
     void setRemoteCursorVisible(bool visible);
     void reportCursorUnavailable();
 
-    void sendInput(InputEvent event);
+    void sendInput(InputEvent event, bool useMacKeyboard = true);
     void reportFocus(InputFocus focus);
     void accept(bool rememberDevice = false);
     void stop(const QString &reason = {});
@@ -85,6 +101,7 @@ class DesktopSession final : public QObject {
     void beforePaste();
     void qualityChanged();
     void soundChanged();
+    void connectionStatsChanged();
     void notice(const QString &message);
     void frame(const QByteArray &annexB, quint32 timestamp);
     void keyframeNeeded();
@@ -103,6 +120,7 @@ class DesktopSession final : public QObject {
     bool displayMessage(const QByteArray &data);
     bool mediaMessage(const QByteArray &data);
     void appendMediaOptions(QByteArray &message) const;
+    void probeRtt();
     void applyQuality(VideoQuality quality, bool keepEstimate = false);
     void syncSound();
     void attachSound();
@@ -125,6 +143,8 @@ class DesktopSession final : public QObject {
     LanAddress link_;
     Endpoint remote_;
     QByteArray selected_;
+    QString peerName_;
+    ConnectionStats stats_;
     bool host_ = false, received_ = false, rich_ = false, adaptive_ = false, retrying_ = false;
     bool usingDirectAccess_ = false;
     VideoQuality quality_ = VideoQuality::FullHD, qualityLimit_ = VideoQuality::FullHD;
@@ -136,6 +156,11 @@ class DesktopSession final : public QObject {
     bool macKeyboardProtocol_ = false, autoMacKeys_ = true;
     bool cursorProtocol_ = false, cursorUnavailable_ = false;
     bool preferCursor_ = true, captureCursor_ = true;
+    bool rttProtocol_ = false;
+    QTimer rttTimer_;
+    QElapsedTimer rttClock_;
+    std::optional<quint32> pendingRttToken_;
+    quint32 rttSequence_ = 0;
     QList<DesktopDisplay> displays_, announced_;
     quint64 display_ = 0;
     QString rememberOnPresent_;

@@ -107,6 +107,8 @@ DesktopSession::DesktopSession(LanProbe &probe, DeviceStore &store, std::functio
     });
     timer_.setInterval(1000);
     connect(&timer_, &QTimer::timeout, this, &DesktopSession::check);
+    rttTimer_.setInterval(2000);
+    connect(&rttTimer_, &QTimer::timeout, this, &DesktopSession::probeRtt);
     settlePointer_.setSingleShot(true);
     settlePointer_.setInterval(35);
     connect(&settlePointer_, &QTimer::timeout, this, [this] {
@@ -127,13 +129,32 @@ DesktopSession::~DesktopSession()
 
 QString DesktopSession::peerName() const
 {
-    return store_.peers().value(selected_);
+    return peerName_.isEmpty() ? store_.peers().value(selected_) : peerName_;
+}
+
+ConnectionStats DesktopSession::connectionStats() const
+{
+    auto stats = stats_;
+    stats.quality = quality_;
+    stats.adaptiveReduced = quality_ < qualityLimit_;
+    if (state_ == Viewing) {
+        stats.peerOS = peerOS();
+        stats.audioEnabled = bool(sound_);
+    }
+    return stats;
 }
 
 void DesktopSession::setState(State s)
 {
     state_ = s;
     stateClock_.start();
+    if (s == Viewing && rttProtocol_) {
+        rttTimer_.start();
+        QTimer::singleShot(400, this, [this, epoch = epoch_] {
+            if (epoch == epoch_)
+                probeRtt();
+        });
+    }
     emit changed();
 }
 
@@ -159,16 +180,27 @@ void DesktopSession::view(const NearbyDevice &peer, bool withInput)
         emit notice(tr("无法在选定的局域网接口请求桌面。"));
         return;
     }
+    peerName_ = peer.name;
+    peerOS_ = peer.os;
     extended_ = peer.extendedDesktop;
     rich_ = extended_ && peer.richMedia;
     adaptive_ = rich_ && peer.adaptiveVideo;
     cursorProtocol_ = adaptive_ && peer.cursorVisibility;
+    rttProtocol_ = cursorProtocol_ && peer.rttProbe;
     captureCursor_ = !cursorProtocol_ || preferCursor_;
     macKeyboardProtocol_ = adaptive_ && withInput && localOS() == DesktopOS::windows &&
                            peer.os == DesktopOS::macOS && (peer.macKeyboard || cursorProtocol_);
     retrying_ = state_ == Interrupted;
     attach(socket, peer.link, peer.key, withInput);
-    connect(socket, &QTcpSocket::connected, control_, &TrustedChannel::start);
+    auto *channel = control_;
+    QElapsedTimer tcpConnect;
+    tcpConnect.start();
+    connect(socket, &QTcpSocket::connected, channel, [this, channel, tcpConnect] {
+        if (control_ != channel)
+            return;
+        stats_.tcpConnectMs = double(tcpConnect.nsecsElapsed()) / 1000000.0;
+        channel->start();
+    });
     socket->connectToHost(socketAddress(peer.endpoint.address, peer.link), peer.endpoint.port);
 }
 
@@ -178,10 +210,11 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
     host_ = expected.isEmpty();
     interactive_ = withInput;
     if (host_) {
-        cursorProtocol_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
+        rttProtocol_ = cursorProtocol_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
         captureCursor_ = true;
     }
     cursorUnavailable_ = false;
+    stats_ = {};
     pointerSequence_ = pointerFence_ = lastPosition_ = 0;
     latestPosition_.reset();
     selected_ = expected;
@@ -199,6 +232,9 @@ void DesktopSession::attach(QTcpSocket *socket, const LanAddress &local, QByteAr
         if (!isOnLink(remote_.address, link_) || !store_.peers().contains(selected_))
             return stop(tr("对方已离开局域网或信任已撤销。"));
         if (!host_) {
+            stats_.peer = {remote_.address, socket->peerPort()};
+            stats_.tlsVersion = control_->tlsVersion();
+            stats_.cipherSuite = control_->cipherSuite();
             if (!prepareNetwork())
                 return stop(tr("无法准备局域网视频接收。"));
             const char op = interactive_ ? (extended_ ? 'c' : 'C') : (extended_ ? 'v' : 'V');
@@ -225,6 +261,16 @@ bool DesktopSession::prepareNetwork()
         return false;
     auto *n = network_.get();
     auto e = epoch_;
+    if (!host_)
+        connect(n->link, &VideoLink::receptionStats, this, [this, e](const VideoReceptionStats &sample) {
+            if (epoch_ != e || state_ != Viewing)
+                return;
+            stats_.mediaBytesPerSecond = sample.mediaBytesPerSecond;
+            stats_.videoBitsPerSecond = sample.videoBitsPerSecond;
+            stats_.jitterMs = sample.jitterMs;
+            stats_.lossPercent = sample.lossPercent;
+            emit connectionStatsChanged();
+        }, Qt::QueuedConnection);
     if (host_ && adaptive_)
         connect(n->link, &VideoLink::receptionSample, this,
                 [this, e](qint64 now, int loss, int jitter, bool queued) {
@@ -377,8 +423,9 @@ void DesktopSession::handle(const QByteArray &data)
     const bool modern = op == 'v' || op == 'y' || op == 'c' || op == 'a';
     const bool controlOffer = op == 'C' || op == 'A' || op == 'c' || op == 'a';
     const int baseSize = controlOffer ? 4 : 3;
-    // v16 carries the initial cursor preference before the first captured frame.
-    const bool cursorOffer = modern && data.size() == baseSize + 2 && data[baseSize] == 16 && quint8(data.back()) <= 1;
+    const bool cursorOptions = modern && data.size() == baseSize + 2 && quint8(data.back()) <= 1;
+    const bool rttOffer = cursorOptions && data[baseSize] == 17;
+    const bool cursorOffer = rttOffer || (cursorOptions && data[baseSize] == 16);
     const bool v15 = modern && data.size() == baseSize + 1 && data.back() == 15;
     const bool macKeysOffer = (cursorOffer || v15) && controlOffer &&
         ((host_ && localOS() == DesktopOS::macOS && quint8(data[3]) == quint8(DesktopOS::windows)) ||
@@ -399,6 +446,7 @@ void DesktopSession::handle(const QByteArray &data)
         adaptive_ = adaptiveOffer;
         macKeyboardProtocol_ = macKeysOffer;
         cursorProtocol_ = cursorOffer;
+        rttProtocol_ = rttOffer;
         captureCursor_ = !cursorOffer || data.back() != 0;
         interactive_ = controlOffer;
         if (interactive_)
@@ -410,7 +458,7 @@ void DesktopSession::handle(const QByteArray &data)
             setState(Requested);
         }
     } else if (!host_ && state_ == Waiting && modern == extended_ && richOffer == rich_ && adaptiveOffer == adaptive_ &&
-               macKeysOffer == macKeyboardProtocol_ && cursorOffer == cursorProtocol_ &&
+               macKeysOffer == macKeyboardProtocol_ && cursorOffer == cursorProtocol_ && rttOffer == rttProtocol_ &&
                (!cursorOffer || (data.back() != 0) == captureCursor_) &&
                ((!interactive_ && (op == 'Y' || op == 'y')) ||
                 (interactive_ && controlOffer && (op == 'A' || op == 'a')))) {
@@ -470,13 +518,13 @@ void DesktopSession::setAutoMacKeys(bool enabled)
     emit macKeyboardChanged(usesMacKeyboard());
 }
 
-void DesktopSession::sendInput(InputEvent input)
+void DesktopSession::sendInput(InputEvent input, bool useMacKeyboard)
 {
     if (state_ != Viewing || !interactive_ || !network_ ||
         (extended_ && !displayReady_ && input.kind != InputKind::Reset))
         return;
     data_.noteActivity();
-    input.macKeyboard = usesMacKeyboard() && input.carriesModifiers();
+    input.macKeyboard = useMacKeyboard && usesMacKeyboard() && input.carriesModifiers();
     if (input.kind == InputKind::Reset) {
         imagePaste_.reset();
         pasteTimer_.stop();
@@ -639,6 +687,7 @@ void DesktopSession::applyQuality(VideoQuality quality, bool keepEstimate)
                                   Qt::QueuedConnection);
         startDisplay(display_, adaptive_ && displayReady_);
     }
+    emit connectionStatsChanged();
 }
 
 void DesktopSession::refreshVideo()
@@ -716,6 +765,9 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     pasteTimer_.stop();
     stillFrame_.stop();
     settlePointer_.stop();
+    rttTimer_.stop();
+    pendingRttToken_.reset();
+    rttClock_.invalidate();
     latestPosition_.reset();
     imagePaste_.reset();
     afterPaste_.clear();
@@ -724,7 +776,7 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     announced_.clear();
     display_ = 0;
     rememberOnPresent_.clear();
-    cursorProtocol_ = cursorUnavailable_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
+    rttProtocol_ = cursorProtocol_ = cursorUnavailable_ = macKeyboardProtocol_ = adaptive_ = rich_ = extended_ = false;
     displayReady_ = needDisplayIdr_ = listing_ = false;
     captureCursor_ = true;
     qualityLimit_ = quality_ = VideoQuality::FullHD;
@@ -733,8 +785,10 @@ void DesktopSession::finishSession(const QString &reason, bool transportLost)
     localSound_ = peerSound_ = 0;
     sound_.reset();
     network_.reset();
+    stats_ = {};
     if (!resume) {
         selected_.clear();
+        peerName_.clear();
         interactive_ = false;
     }
     retrying_ = resume;

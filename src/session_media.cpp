@@ -6,11 +6,24 @@ namespace wwmm {
 void DesktopSession::appendMediaOptions(QByteArray &message) const
 {
     if (cursorProtocol_) {
-        message.append(char(16));
+        message.append(char(rttProtocol_ ? 17 : 16));
         message.append(char(captureCursor_));
     } else if (rich_) {
         message.append(char(macKeyboardProtocol_ ? 15 : adaptive_ ? 14 : 13));
     }
+}
+
+void DesktopSession::probeRtt()
+{
+    if (state_ != Viewing || !rttProtocol_ || !control_)
+        return;
+    const auto token = ++rttSequence_;
+    QByteArray message(5, 'k');
+    qToBigEndian(token, message.data() + 1);
+    pendingRttToken_ = token;
+    rttClock_.start();
+    if (!control_->send(message))
+        interrupt(tr("桌面连接已断开。"));
 }
 
 void DesktopSession::setRemoteCursorVisible(bool visible)
@@ -102,6 +115,23 @@ void DesktopSession::syncSound()
 
 bool DesktopSession::mediaMessage(const QByteArray &data)
 {
+    if (rttProtocol_ && data.size() == 5) {
+        if (state_ == Sharing && data[0] == 'k') {
+            auto reply = data;
+            reply[0] = 'r';
+            if (!control_->send(reply))
+                interrupt(tr("桌面连接已断开。"));
+            return true;
+        }
+        if (state_ == Viewing && data[0] == 'r') {
+            if (pendingRttToken_ == qFromBigEndian<quint32>(data.constData() + 1)) {
+                stats_.rttMs = double(rttClock_.nsecsElapsed()) / 1000000.0;
+                pendingRttToken_.reset();
+                emit connectionStatsChanged();
+            }
+            return true;
+        }
+    }
     if (cursorProtocol_ && state_ == Sharing && data.size() == 2 && data[0] == 'P' && quint8(data[1]) <= 1) {
         const bool visible = data[1] != 0;
         if (!cursorUnavailable_ && captureCursor_ != visible) {
@@ -144,6 +174,7 @@ bool DesktopSession::mediaMessage(const QByteArray &data)
         qualityLimit_ = limit;
         quality_ = quality;
         emit qualityChanged();
+        emit connectionStatsChanged();
         return true;
     }
     return false;
